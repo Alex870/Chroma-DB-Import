@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+chroma_db_import_config.json
+state/
+chroma_db*/

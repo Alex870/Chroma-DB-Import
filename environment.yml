@@ -1,0 +1,8 @@
+name: chroma-db-import
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r chroma_db_import_requirements.txt
