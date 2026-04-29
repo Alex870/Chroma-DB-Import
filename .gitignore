@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.venv/
 .env
 chroma_db_import_config.json
 state/

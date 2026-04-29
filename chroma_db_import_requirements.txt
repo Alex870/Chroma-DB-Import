@@ -1,4 +1,5 @@
 chromadb
+PySide6
 langchain
 langchain-chroma
 langchain-core

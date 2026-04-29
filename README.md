@@ -4,6 +4,36 @@ Imports pre-processed podcast RAG documents into a persistent Chroma collection.
 
 This project intentionally does not call LM Studio and does not perform transcript preprocessing. It expects processed cache files produced by `Podcast-RAG-pipeline` under `processed_data`.
 
+The original CLI remains available. The UI workflow adds folder picking, episode stats, speaker inclusion controls, rebuild/update import modes, and `podcast.json` metadata generation for `PodCast Chat`.
+
+## UI Workflow
+
+```powershell
+.\Run Chroma DB Import UI.ps1
+```
+
+Use the toolbar from left to right:
+
+- `Open`: choose a folder containing `*.processed_documents.json` files, such as `Podcast-RAG-pipeline\processed_data`.
+- `Output`: choose a folder where self-contained exports will be written.
+- `Generate`: rebuilds the selected podcast export from scratch. If the export folder already exists, the UI prompts before deleting it.
+- `Update`: imports only episodes not already listed in the generated `podcast.json`.
+- `Save Plan` / `Load Plan`: persist and restore podcast/output/settings/speaker selections.
+
+The export layout is:
+
+```text
+Selected Output Folder/
+  Podcast Name/
+    chroma.sqlite3
+    podcast.json
+    ...Chroma internal files...
+```
+
+The tree has a single `Global Settings` root node. Episode nodes are ordered by ascending episode date. Speaker checkboxes under `Global Settings` are tri-state: checked means included for every episode where that speaker appears, unchecked means excluded everywhere, and partially checked means included for some episodes but not all.
+
+Excluded speakers are omitted from the generated metadata and their speaker-specific documents are not inserted. Episode-level thesis documents and multi-speaker summary nodes are preserved to keep retrieval context useful.
+
 ## Setup
 
 ```powershell
