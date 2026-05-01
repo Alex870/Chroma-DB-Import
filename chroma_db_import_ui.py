@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -75,6 +76,7 @@ class ImportPlan:
     output_root: Path
     collection_name: str
     embedding_model: str
+    embedding_device: str
     episodes: list[Episode]
     included_speakers_by_episode: dict[str, set[str]]
 
@@ -191,9 +193,15 @@ class MainWindow(QMainWindow):
         self.database_id = QLineEdit("podcast-chat-export")
         self.collection_name = QLineEdit("whisper_rag_v2")
         self.embedding_model = QLineEdit("BAAI/bge-large-en-v1.5")
+        self.embedding_device = QLineEdit("auto")
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(180)
+        self.progress_label = QLabel("Idle")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
 
         self._build_toolbar()
         self.render_global()
@@ -268,7 +276,7 @@ class MainWindow(QMainWindow):
         self.set_action_help(
             settings_action,
             "Return to the Global Settings panel where you can edit Podcast name, Database ID, "
-            "Collection, Embedding model, paths, and global speaker selections.",
+            "Collection, Embedding model/device, paths, and global speaker selections.",
         )
         settings_action.triggered.connect(self.show_global_settings)
         toolbar.addAction(settings_action)
@@ -445,6 +453,14 @@ class MainWindow(QMainWindow):
         )
         self.add_info_row(
             form,
+            "Embedding device",
+            self.embedding_device,
+            "Compute device used by the embedding model. Use auto to choose CUDA when a compatible "
+            "NVIDIA/PyTorch CUDA stack is installed, otherwise CPU. You can also set cpu, cuda, "
+            "or cuda:0 explicitly. Changing this affects import speed, not retrieval semantics.",
+        )
+        self.add_info_row(
+            form,
             "Processed folder",
             QLabel(str(self.processed_data_dir or "Not selected")),
             "Source folder scanned by Open. The app searches this folder and subfolders for "
@@ -499,6 +515,7 @@ class MainWindow(QMainWindow):
             layout.addLayout(row)
 
         layout.addWidget(QLabel("Import log"))
+        self.add_progress_status(layout)
         layout.addWidget(self.log)
         layout.addStretch(1)
         self.set_right_panel(panel)
@@ -591,14 +608,28 @@ class MainWindow(QMainWindow):
         layout.addLayout(speaker_buttons)
 
         layout.addWidget(QLabel("Import log"))
+        self.add_progress_status(layout)
         layout.addWidget(self.log)
         layout.addStretch(1)
         self.set_right_panel(panel)
 
+    def add_progress_status(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self.progress_label)
+        layout.addWidget(self.progress_bar)
+
     def set_right_panel(self, panel: QWidget) -> None:
         old_panel = self.right.takeWidget()
         if old_panel:
-            for widget in (self.podcast_name, self.database_id, self.collection_name, self.embedding_model, self.log):
+            for widget in (
+                self.podcast_name,
+                self.database_id,
+                self.collection_name,
+                self.embedding_model,
+                self.embedding_device,
+                self.progress_label,
+                self.progress_bar,
+                self.log,
+            ):
                 if is_descendant_of(widget, old_panel):
                     widget.setParent(None)
             old_panel.deleteLater()
@@ -639,7 +670,7 @@ class MainWindow(QMainWindow):
             "Create a new vector DB export:\n\n"
             "1. Click Open and choose the processed_data folder from the RAG pipeline output.\n"
             "2. Review the Global Settings, especially Podcast name, Database ID, Collection, "
-            "and Embedding model.\n"
+            "Embedding model, and Embedding device.\n"
             "3. Use the Global Settings speaker checkboxes to include or omit speakers across "
             "all episodes, or select an episode to adjust speakers just for that episode.\n"
             "4. Click Output and choose the parent folder where the self-contained export folder "
@@ -739,6 +770,7 @@ class MainWindow(QMainWindow):
             output_root=self.output_root,
             collection_name=self.collection_name.text().strip() or "whisper_rag_v2",
             embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
+            embedding_device=self.embedding_device.text().strip() or "auto",
             episodes=self.episodes,
             included_speakers_by_episode=self.included_speakers_by_episode,
         )
@@ -778,6 +810,7 @@ class MainWindow(QMainWindow):
             "output_root": str(self.output_root or ""),
             "collection_name": self.collection_name.text(),
             "embedding_model": self.embedding_model.text(),
+            "embedding_device": self.embedding_device.text(),
             "included_speakers_by_episode": {
                 fingerprint: sorted(speakers)
                 for fingerprint, speakers in self.included_speakers_by_episode.items()
@@ -801,6 +834,7 @@ class MainWindow(QMainWindow):
         self.database_id.setText(str(payload.get("database_id") or slugify(self.podcast_name.text())))
         self.collection_name.setText(str(payload.get("collection_name") or "whisper_rag_v2"))
         self.embedding_model.setText(str(payload.get("embedding_model") or "BAAI/bge-large-en-v1.5"))
+        self.embedding_device.setText(str(payload.get("embedding_device") or "auto"))
         self.included_speakers_by_episode = {
             str(fingerprint): set(speakers)
             for fingerprint, speakers in dict(payload.get("included_speakers_by_episode") or {}).items()
@@ -814,6 +848,8 @@ class MainWindow(QMainWindow):
         if self.thread is not None:
             return
         self.log.appendPlainText(f"Starting {mode}: {plan.export_dir}")
+        self.progress_label.setText(f"Starting {mode}...")
+        self.progress_bar.setRange(0, 0)
         self.thread = QThread()
         self.worker = ChromaExportWorker(plan, mode)
         self.worker.moveToThread(self.thread)
@@ -832,16 +868,30 @@ class MainWindow(QMainWindow):
     def handle_progress(self, progress: ImportProgress) -> None:
         prefix = f"[{progress.current}/{progress.total}] " if progress.total else ""
         self.log.appendPlainText(prefix + progress.message)
+        self.progress_label.setText(progress.message)
+        if progress.total:
+            self.progress_bar.setRange(0, progress.total)
+            self.progress_bar.setValue(min(progress.current, progress.total))
+        else:
+            self.progress_bar.setRange(0, 0)
 
     def handle_finished(self, summary: ImportSummary) -> None:
         self.log.appendPlainText(
             f"Complete: imported_episodes={summary.imported_episodes}, "
             f"skipped_episodes={summary.skipped_episodes}, inserted={summary.inserted}"
         )
+        self.progress_label.setText(
+            f"Complete: imported {summary.imported_episodes}, skipped {summary.skipped_episodes}, inserted {summary.inserted}"
+        )
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
         self.rebuild_tree()
 
     def handle_failed(self, message: str) -> None:
         self.log.appendPlainText("Failed: " + message)
+        self.progress_label.setText("Failed")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
         QMessageBox.critical(self, "Import failed", message)
 
     def clear_worker(self) -> None:
@@ -877,22 +927,53 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
             if item.get("source_file")
         }
 
-    embeddings = HuggingFaceEmbeddings(model_name=plan.embedding_model)
+    embedding_device = resolve_embedding_device(plan.embedding_device)
+    emit_progress(ImportProgress(f"Loading embedding model on {embedding_device}...", 0, 0))
+    embeddings = HuggingFaceEmbeddings(
+        model_name=plan.embedding_model,
+        model_kwargs={"device": embedding_device},
+    )
     vectorstore = Chroma(
         embedding_function=embeddings,
         persist_directory=str(plan.export_dir),
         collection_name=plan.collection_name,
     )
 
+    episodes_to_import: list[Episode] = []
+    for episode in plan.episodes:
+        if mode == "update" and (
+            episode.fingerprint in existing_fingerprints or str(episode.path) in existing_source_files
+        ):
+            continue
+        episodes_to_import.append(episode)
+    total_documents_to_import = sum(
+        count_insertable_documents(select_documents_for_episode(episode, plan.included_speakers_by_episode))
+        for episode in episodes_to_import
+    )
+    emit_progress(
+        ImportProgress(
+            f"Ready to embed {total_documents_to_import} document(s) across {len(episodes_to_import)} episode(s).",
+            0,
+            total_documents_to_import,
+        )
+    )
+
     imported_episodes = []
     inserted = 0
     skipped = 0
+    processed_documents = 0
     for index, episode in enumerate(plan.episodes, 1):
         if mode == "update" and (
             episode.fingerprint in existing_fingerprints or str(episode.path) in existing_source_files
         ):
             skipped += 1
-            emit_progress(ImportProgress(f"Skipped already imported: {episode.title}", index, len(plan.episodes)))
+            emit_progress(
+                ImportProgress(
+                    f"Skipped already imported: {episode.title}",
+                    processed_documents,
+                    total_documents_to_import,
+                )
+            )
             continue
 
         selected = select_documents_for_episode(episode, plan.included_speakers_by_episode)
@@ -908,11 +989,32 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
             batch_docs = documents[start : start + 64]
             batch_ids = ids[start : start + 64]
             if batch_docs:
+                emit_progress(
+                    ImportProgress(
+                        f"Embedding {episode.title}: documents {start + 1}-{start + len(batch_docs)} of {len(documents)}",
+                        processed_documents,
+                        total_documents_to_import,
+                    )
+                )
                 vectorstore.add_documents(batch_docs, ids=batch_ids)
                 inserted += len(batch_docs)
+                processed_documents += len(batch_docs)
+                emit_progress(
+                    ImportProgress(
+                        f"Embedded {processed_documents} of {total_documents_to_import} document(s).",
+                        processed_documents,
+                        total_documents_to_import,
+                    )
+                )
 
         imported_episodes.append(episode_metadata_entry(episode, selected))
-        emit_progress(ImportProgress(f"Imported {len(documents)} documents: {episode.title}", index, len(plan.episodes)))
+        emit_progress(
+            ImportProgress(
+                f"Imported {len(documents)} documents: {episode.title}",
+                processed_documents,
+                total_documents_to_import,
+            )
+        )
 
     all_episode_entries = merge_episode_entries(existing_episode_entries, imported_episodes)
     total_documents = sum(int(item.get("document_count") or 0) for item in all_episode_entries)
@@ -948,6 +1050,10 @@ def select_documents_for_episode(
 ) -> list[ProcessedDocument]:
     included_speakers = included_speakers_by_episode.get(episode.fingerprint, set())
     return [doc for doc in episode.documents if should_include_document(doc, included_speakers)]
+
+
+def count_insertable_documents(documents: list[ProcessedDocument]) -> int:
+    return sum(1 for doc in documents if has_text(doc.page_content))
 
 
 def should_include_document(doc: ProcessedDocument, included_speakers: set[str]) -> bool:
@@ -999,6 +1105,7 @@ def write_podcast_metadata(
         "database_id": plan.database_id,
         "collection_name": plan.collection_name,
         "embedding_model": plan.embedding_model,
+        "embedding_device": plan.embedding_device,
         "description": f"Generated from processed RAG output in {plan.processed_data_dir}",
         "date_range": {
             "start": min(dates) if dates else "",
@@ -1054,6 +1161,17 @@ def safe_folder_name(value: str) -> str:
     return safe or "Podcast Export"
 
 
+def resolve_embedding_device(value: str) -> str:
+    device = value.strip().lower()
+    if device and device != "auto":
+        return device
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def is_descendant_of(widget: QWidget, ancestor: QWidget) -> bool:
     parent = widget.parent()
     while parent is not None:
@@ -1101,6 +1219,18 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 6px;
             padding: 8px;
             selection-background-color: #2f6feb;
+        }
+        QProgressBar {
+            background: #0c0f14;
+            border: 1px solid #2b313d;
+            border-radius: 6px;
+            color: #e5e7eb;
+            min-height: 18px;
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background: #2f6feb;
+            border-radius: 5px;
         }
         QPushButton {
             background: #2f6feb;
