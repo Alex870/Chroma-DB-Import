@@ -203,28 +203,71 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
 
         open_action = QAction("Open", self)
+        self.set_action_help(
+            open_action,
+            "Choose the processed RAG output folder containing *.processed_documents.json files. "
+            "Each matching file is treated as one episode.",
+        )
         open_action.triggered.connect(self.open_processed_folder)
         toolbar.addAction(open_action)
 
         output_action = QAction("Output", self)
+        self.set_action_help(
+            output_action,
+            "Choose the parent folder where the app will create a self-contained podcast export "
+            "folder containing the Chroma DB files and podcast.json metadata.",
+        )
         output_action.triggered.connect(self.choose_output_folder)
         toolbar.addAction(output_action)
 
         generate_action = QAction("Generate", self)
+        self.set_action_help(
+            generate_action,
+            "Build the selected podcast export from scratch. If the export folder already exists, "
+            "you will be prompted before it is deleted and rebuilt.",
+        )
         generate_action.triggered.connect(self.generate)
         toolbar.addAction(generate_action)
 
         update_action = QAction("Update", self)
+        self.set_action_help(
+            update_action,
+            "Append only episodes that are not already recorded in the existing podcast.json. "
+            "Previously imported source files are skipped; use Generate to rebuild changed episodes.",
+        )
         update_action.triggered.connect(self.update)
         toolbar.addAction(update_action)
 
         save_plan_action = QAction("Save Plan", self)
+        self.set_action_help(
+            save_plan_action,
+            "Save the current source folder, output folder, podcast settings, and speaker selections "
+            "to a JSON import plan so the same job can be repeated later.",
+        )
         save_plan_action.triggered.connect(self.save_plan)
         toolbar.addAction(save_plan_action)
 
         load_plan_action = QAction("Load Plan", self)
+        self.set_action_help(
+            load_plan_action,
+            "Load a saved import plan to restore paths, database settings, and speaker selections "
+            "for a repeat import or later update.",
+        )
         load_plan_action.triggered.connect(self.load_plan)
         toolbar.addAction(load_plan_action)
+
+        guide_action = QAction("Guide", self)
+        self.set_action_help(
+            guide_action,
+            "Show the common workflows for creating a new vector DB export or updating an existing one.",
+        )
+        guide_action.triggered.connect(self.show_workflow_guide)
+        toolbar.addAction(guide_action)
+
+    def set_action_help(self, action: QAction, text: str) -> None:
+        action.setToolTip(text)
+        action.setStatusTip(text)
+        action.setWhatsThis(text)
 
     def open_processed_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Open processed RAG output folder")
@@ -322,15 +365,72 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
 
         form = QFormLayout()
-        form.addRow("Podcast name", self.podcast_name)
-        form.addRow("Database ID", self.database_id)
-        form.addRow("Collection", self.collection_name)
-        form.addRow("Embedding model", self.embedding_model)
-        form.addRow("Processed folder", QLabel(str(self.processed_data_dir or "Not selected")))
-        form.addRow("Output folder", QLabel(str(self.output_root or "Not selected")))
-        form.addRow("Episodes", QLabel(str(len(self.episodes))))
-        form.addRow("Date range", QLabel(self.global_date_range()))
-        form.addRow("Documents", QLabel(str(sum(len(episode.documents) for episode in self.episodes))))
+        self.add_info_row(
+            form,
+            "Podcast name",
+            self.podcast_name,
+            "User-facing name for this export. It is also used as the child folder name under the "
+            "selected output folder. Changing it for an update points the update at a different "
+            "export folder unless the resulting folder name is the same.",
+        )
+        self.add_info_row(
+            form,
+            "Database ID",
+            self.database_id,
+            "Stable identifier written to podcast.json for the Podcast Chat app. Keep this stable "
+            "for an existing export; changing it makes the export look like a different database "
+            "to downstream tools.",
+        )
+        self.add_info_row(
+            form,
+            "Collection",
+            self.collection_name,
+            "Name of the Chroma collection that receives the imported documents. Podcast Chat reads "
+            "this value from metadata. Changing it for an existing export can create or target a "
+            "different Chroma collection.",
+        )
+        self.add_info_row(
+            form,
+            "Embedding model",
+            self.embedding_model,
+            "Embedding model used while writing vectors into Chroma. The chat/query side must use "
+            "compatible embeddings. If you change this for an existing database, use Generate to "
+            "rebuild the export rather than Update.",
+        )
+        self.add_info_row(
+            form,
+            "Processed folder",
+            QLabel(str(self.processed_data_dir or "Not selected")),
+            "Source folder scanned by Open. The app searches this folder and subfolders for "
+            "*.processed_documents.json files, with one file treated as one episode.",
+        )
+        self.add_info_row(
+            form,
+            "Output folder",
+            QLabel(str(self.output_root or "Not selected")),
+            "Parent folder chosen by Output. The generated podcast folder, Chroma files, and "
+            "podcast.json metadata are written under this location.",
+        )
+        self.add_info_row(
+            form,
+            "Episodes",
+            QLabel(str(len(self.episodes))),
+            "Number of processed episode JSON files currently loaded from the source folder.",
+        )
+        self.add_info_row(
+            form,
+            "Date range",
+            QLabel(self.global_date_range()),
+            "Earliest and latest episode dates found in the loaded source files. This range is "
+            "written to podcast.json so Podcast Chat can describe and filter the export.",
+        )
+        self.add_info_row(
+            form,
+            "Documents",
+            QLabel(str(sum(len(episode.documents) for episode in self.episodes))),
+            "Total processed RAG documents loaded before speaker filtering. Speaker selections "
+            "determine which speaker-scoped documents are inserted.",
+        )
         layout.addLayout(form)
 
         layout.addWidget(QLabel("Speakers"))
@@ -362,15 +462,66 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
 
         form = QFormLayout()
-        form.addRow("Title", QLabel(episode.title))
-        form.addRow("Date", QLabel(episode.episode_date or "Unknown"))
-        form.addRow("File", QLabel(str(episode.path)))
-        form.addRow("Documents", QLabel(str(len(episode.documents))))
-        form.addRow("Leaf chunks", QLabel(str(episode.node_counts.get("leaf_chunk", 0))))
-        form.addRow("Position cards", QLabel(str(episode.node_counts.get("position_card", 0))))
-        form.addRow("Cluster summaries", QLabel(str(episode.node_counts.get("cluster_summary", 0))))
-        form.addRow("Episode thesis", QLabel(str(episode.node_counts.get("episode_thesis", 0))))
-        form.addRow("Included documents", QLabel(str(len(self.selected_documents(episode)))))
+        self.add_info_row(
+            form,
+            "Title",
+            QLabel(episode.title),
+            "Episode title read from the processed RAG output metadata. It is written into "
+            "podcast.json for browsing and update tracking.",
+        )
+        self.add_info_row(
+            form,
+            "Date",
+            QLabel(episode.episode_date or "Unknown"),
+            "Episode date read from the processed documents. It controls tree ordering and "
+            "contributes to the export date range metadata.",
+        )
+        self.add_info_row(
+            form,
+            "File",
+            QLabel(str(episode.path)),
+            "The source *.processed_documents.json file for this episode. Update uses this path "
+            "and its fingerprint to decide whether an episode was already imported.",
+        )
+        self.add_info_row(
+            form,
+            "Documents",
+            QLabel(str(len(episode.documents))),
+            "Total processed documents available in this episode before speaker filtering.",
+        )
+        self.add_info_row(
+            form,
+            "Leaf chunks",
+            QLabel(str(episode.node_counts.get("leaf_chunk", 0))),
+            "Speaker-level or content-level chunks that usually carry the most detailed retrieval text.",
+        )
+        self.add_info_row(
+            form,
+            "Position cards",
+            QLabel(str(episode.node_counts.get("position_card", 0))),
+            "Higher-level viewpoint summaries from the RAG output. Speaker filtering applies when "
+            "the metadata identifies the selected speaker.",
+        )
+        self.add_info_row(
+            form,
+            "Cluster summaries",
+            QLabel(str(episode.node_counts.get("cluster_summary", 0))),
+            "Summary nodes from clustered content. Broad, non-speaker-specific summaries are "
+            "preserved for retrieval quality.",
+        )
+        self.add_info_row(
+            form,
+            "Episode thesis",
+            QLabel(str(episode.node_counts.get("episode_thesis", 0))),
+            "Episode-level summary nodes. These are preserved even when individual speakers are omitted.",
+        )
+        self.add_info_row(
+            form,
+            "Included documents",
+            QLabel(str(len(self.selected_documents(episode)))),
+            "Documents that will be inserted for this episode after applying speaker selections. "
+            "Omitted speaker-specific documents are left out of both Chroma and metadata.",
+        )
         layout.addLayout(form)
 
         layout.addWidget(QLabel("Speakers"))
@@ -397,6 +548,59 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log)
         layout.addStretch(1)
         self.right.setWidget(panel)
+
+    def add_info_row(
+        self,
+        form: QFormLayout,
+        label_text: str,
+        field_widget: QWidget,
+        help_text: str,
+    ) -> None:
+        label_container = QWidget()
+        label_layout = QHBoxLayout(label_container)
+        label_layout.setContentsMargins(0, 0, 0, 0)
+        label_layout.setSpacing(6)
+        label_layout.addWidget(QLabel(label_text))
+
+        info_button = QPushButton("i")
+        info_button.setObjectName("infoButton")
+        info_button.setFixedSize(22, 22)
+        info_button.setToolTip(f"Explain {label_text}")
+        info_button.clicked.connect(
+            lambda _checked=False, title=label_text, text=help_text: self.show_field_help(title, text)
+        )
+        label_layout.addWidget(info_button)
+        label_layout.addStretch(1)
+
+        form.addRow(label_container, field_widget)
+
+    def show_field_help(self, title: str, text: str) -> None:
+        QMessageBox.information(self, title, text)
+
+    def show_workflow_guide(self) -> None:
+        QMessageBox.information(
+            self,
+            "Chroma DB Import Guide",
+            "Create a new vector DB export:\n\n"
+            "1. Click Open and choose the processed_data folder from the RAG pipeline output.\n"
+            "2. Review the Global Settings, especially Podcast name, Database ID, Collection, "
+            "and Embedding model.\n"
+            "3. Use the Global Settings speaker checkboxes to include or omit speakers across "
+            "all episodes, or select an episode to adjust speakers just for that episode.\n"
+            "4. Click Output and choose the parent folder where the self-contained export folder "
+            "should be created.\n"
+            "5. Click Generate. If the target podcast folder already exists, the app asks before "
+            "deleting and rebuilding it.\n\n"
+            "Update an existing export:\n\n"
+            "1. Open the folder containing the latest processed episode JSON files.\n"
+            "2. Choose the same Podcast name and Output folder used by the existing export.\n"
+            "3. Click Update. The app reads the existing podcast.json and skips source files "
+            "already recorded there. New episode files are appended to the existing Chroma DB "
+            "and metadata.\n\n"
+            "Save Plan stores the current paths, database fields, and speaker selections in a "
+            "JSON file. Load Plan restores those choices when you want to repeat a build, continue "
+            "later, or run the same update workflow again.",
+        )
 
     def global_speakers(self) -> list[str]:
         return sorted({speaker for episode in self.episodes for speaker in episode.speakers})
@@ -847,6 +1051,22 @@ def apply_dark_theme(app: QApplication) -> None:
             color: white;
             font-weight: 600;
             padding: 9px 16px;
+        }
+        QPushButton#infoButton {
+            background: #202632;
+            border: 1px solid #2b313d;
+            border-radius: 11px;
+            color: #9ca3af;
+            font-weight: 700;
+            min-width: 22px;
+            max-width: 22px;
+            min-height: 22px;
+            max-height: 22px;
+            padding: 0;
+        }
+        QPushButton#infoButton:hover {
+            background: #2f6feb;
+            color: white;
         }
         QCheckBox {
             spacing: 8px;
