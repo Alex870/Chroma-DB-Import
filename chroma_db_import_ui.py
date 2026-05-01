@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,7 @@ from chroma_db_import import (
 
 ALWAYS_INCLUDE_NODE_TYPES = {"episode_thesis"}
 SUMMARY_NODE_TYPES = {"cluster_summary"}
+TORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 
 
 @dataclass
@@ -169,6 +171,51 @@ class ChromaExportWorker(QObject):
         self.finished.emit(summary)
 
 
+class CudaTorchInstallWorker(QObject):
+    progress = Signal(str)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            "torch",
+            "torchvision",
+            "torchaudio",
+            "--index-url",
+            TORCH_CUDA_INDEX_URL,
+        ]
+        self.progress.emit("Installing CUDA-enabled PyTorch. This can download several GB and may take a while.")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+
+        assert process.stdout is not None
+        for line in process.stdout:
+            text = line.rstrip()
+            if text:
+                self.progress.emit(text)
+        return_code = process.wait()
+        if return_code:
+            self.failed.emit(f"pip exited with code {return_code}")
+            return
+        self.finished.emit("CUDA-enabled PyTorch install completed. Restarting device detection.")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -182,6 +229,8 @@ class MainWindow(QMainWindow):
         self.included_speakers_by_episode: dict[str, set[str]] = {}
         self.thread: QThread | None = None
         self.worker: ChromaExportWorker | None = None
+        self.cuda_thread: QThread | None = None
+        self.cuda_worker: CudaTorchInstallWorker | None = None
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
@@ -210,6 +259,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
+        self.cuda_install_button: QPushButton | None = None
 
         self.populate_embedding_devices()
         self.connect_prerequisite_signals()
@@ -294,6 +344,7 @@ class MainWindow(QMainWindow):
         self.select_embedding_device(selected)
         self.gpu_status.setText(diagnostic)
         self.gpu_status.setWordWrap(True)
+        self.update_action_states()
 
     def select_embedding_device(self, selected: str) -> None:
         value = normalize_embedding_device_value(selected)
@@ -338,6 +389,21 @@ class MainWindow(QMainWindow):
         self.update_action.setToolTip(
             "Append only episodes not already recorded in the existing podcast.json. " + detail
         )
+        if self.cuda_install_button:
+            has_cuda = any(
+                str(self.embedding_device.itemData(index)).startswith("cuda")
+                for index in range(self.embedding_device.count())
+            )
+            install_enabled = (not has_cuda) and self.cuda_thread is None and self.thread is None
+            self.cuda_install_button.setEnabled(install_enabled)
+            if has_cuda:
+                self.cuda_install_button.setToolTip("CUDA is already available to PyTorch in this environment.")
+            elif self.cuda_thread is not None:
+                self.cuda_install_button.setToolTip("CUDA-enabled PyTorch is currently being installed.")
+            else:
+                self.cuda_install_button.setToolTip(
+                    "Install CUDA-enabled PyTorch into this Python environment using the PyTorch CUDA 12.8 wheel index."
+                )
 
     def open_processed_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Open processed RAG output folder")
@@ -571,11 +637,18 @@ class MainWindow(QMainWindow):
         gpu_details = QPushButton("GPU Details")
         gpu_details.setToolTip("Show PyTorch CUDA diagnostics used to decide whether GPU import is available.")
         gpu_details.clicked.connect(self.show_gpu_details)
+        self.cuda_install_button = QPushButton("Install CUDA PyTorch")
+        self.cuda_install_button.setToolTip(
+            "Install CUDA-enabled PyTorch into this Python environment. Enabled only when PyTorch cannot use CUDA."
+        )
+        self.cuda_install_button.clicked.connect(self.install_cuda_torch)
         settings_buttons.addWidget(save_settings)
         settings_buttons.addWidget(load_settings)
         settings_buttons.addWidget(gpu_details)
+        settings_buttons.addWidget(self.cuda_install_button)
         settings_buttons.addStretch(1)
         layout.addLayout(settings_buttons)
+        self.update_action_states()
 
         layout.addWidget(QLabel("Speakers"))
         speaker_buttons = QHBoxLayout()
@@ -774,6 +847,61 @@ class MainWindow(QMainWindow):
     def show_gpu_details(self) -> None:
         _options, diagnostic = embedding_device_options()
         QMessageBox.information(self, "GPU Details", diagnostic)
+
+    def install_cuda_torch(self) -> None:
+        if self.cuda_thread is not None:
+            return
+        response = QMessageBox.question(
+            self,
+            "Install CUDA PyTorch?",
+            "Install CUDA-enabled PyTorch into this app's current Python environment?\n\n"
+            "This can download several GB from download.pytorch.org and may take a few minutes.",
+        )
+        if response != QMessageBox.Yes:
+            return
+        self.log.appendPlainText(f"Installing CUDA PyTorch from {TORCH_CUDA_INDEX_URL}")
+        self.progress_label.setText("Installing CUDA-enabled PyTorch...")
+        self.progress_bar.setRange(0, 0)
+        self.cuda_thread = QThread()
+        self.cuda_worker = CudaTorchInstallWorker()
+        self.cuda_worker.moveToThread(self.cuda_thread)
+        self.cuda_thread.started.connect(self.cuda_worker.run)
+        self.cuda_worker.progress.connect(self.handle_cuda_install_progress)
+        self.cuda_worker.finished.connect(self.handle_cuda_install_finished)
+        self.cuda_worker.failed.connect(self.handle_cuda_install_failed)
+        self.cuda_worker.finished.connect(self.cuda_thread.quit)
+        self.cuda_worker.failed.connect(self.cuda_thread.quit)
+        self.cuda_worker.finished.connect(self.cuda_worker.deleteLater)
+        self.cuda_worker.failed.connect(self.cuda_worker.deleteLater)
+        self.cuda_thread.finished.connect(self.cuda_thread.deleteLater)
+        self.cuda_thread.finished.connect(self.clear_cuda_worker)
+        self.update_action_states()
+        self.cuda_thread.start()
+
+    def handle_cuda_install_progress(self, message: str) -> None:
+        self.log.appendPlainText("[CUDA install] " + message)
+        self.progress_label.setText(message)
+
+    def handle_cuda_install_finished(self, message: str) -> None:
+        self.log.appendPlainText("[CUDA install] " + message)
+        self.populate_embedding_devices(self.selected_embedding_device())
+        _options, diagnostic = embedding_device_options()
+        self.log.appendPlainText("[CUDA install] " + diagnostic)
+        self.progress_label.setText("CUDA PyTorch install complete")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+
+    def handle_cuda_install_failed(self, message: str) -> None:
+        self.log.appendPlainText("[CUDA install failed] " + message)
+        self.progress_label.setText("CUDA PyTorch install failed")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        QMessageBox.critical(self, "CUDA install failed", message)
+
+    def clear_cuda_worker(self) -> None:
+        self.cuda_thread = None
+        self.cuda_worker = None
+        self.update_action_states()
 
     def global_speakers(self) -> list[str]:
         return sorted({speaker for episode in self.episodes for speaker in episode.speakers})

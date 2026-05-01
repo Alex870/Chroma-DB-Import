@@ -151,3 +151,6 @@ except Exception as exc:
         Remove-Item -LiteralPath $cudaCheckPath -Force -ErrorAction SilentlyContinue
     }
 }
+
+Write-Host ""
+Read-Host "Press Enter to close"
