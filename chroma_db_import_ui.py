@@ -390,13 +390,14 @@ class MainWindow(QMainWindow):
             "Append only episodes not already recorded in the existing podcast.json. " + detail
         )
         if self.cuda_install_button:
-            has_cuda = any(
+            has_cuda_option = any(
                 str(self.embedding_device.itemData(index)).startswith("cuda")
                 for index in range(self.embedding_device.count())
             )
-            install_enabled = (not has_cuda) and self.cuda_thread is None and self.thread is None
+            has_working_cuda = has_cuda_option or pytorch_cuda_is_available()
+            install_enabled = (not has_working_cuda) and self.cuda_thread is None and self.thread is None
             self.cuda_install_button.setEnabled(install_enabled)
-            if has_cuda:
+            if has_working_cuda:
                 self.cuda_install_button.setToolTip("CUDA is already available to PyTorch in this environment.")
             elif self.cuda_thread is not None:
                 self.cuda_install_button.setToolTip("CUDA-enabled PyTorch is currently being installed.")
@@ -1446,6 +1447,17 @@ def normalize_embedding_device_value(value: str) -> str:
     return device
 
 
+def pytorch_cuda_is_available() -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+    try:
+        return bool(torch.cuda.is_available()) and int(torch.cuda.device_count()) > 0
+    except Exception:
+        return False
+
+
 def resolve_embedding_device(value: str) -> str:
     device = normalize_embedding_device_value(value)
     if device != "auto":
@@ -1533,6 +1545,10 @@ def apply_dark_theme(app: QApplication) -> None:
             color: white;
             font-weight: 600;
             padding: 9px 16px;
+        }
+        QPushButton:disabled {
+            background: #1f2630;
+            color: #6b7280;
         }
         QPushButton#infoButton {
             background: #202632;
