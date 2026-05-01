@@ -264,6 +264,15 @@ class MainWindow(QMainWindow):
         guide_action.triggered.connect(self.show_workflow_guide)
         toolbar.addAction(guide_action)
 
+        settings_action = QAction("Settings", self)
+        self.set_action_help(
+            settings_action,
+            "Return to the Global Settings panel where you can edit Podcast name, Database ID, "
+            "Collection, Embedding model, paths, and global speaker selections.",
+        )
+        settings_action.triggered.connect(self.show_global_settings)
+        toolbar.addAction(settings_action)
+
     def set_action_help(self, action: QAction, text: str) -> None:
         action.setToolTip(text)
         action.setStatusTip(text)
@@ -292,13 +301,23 @@ class MainWindow(QMainWindow):
         self.output_root = Path(folder)
         self.log.appendPlainText(f"Output folder: {self.output_root}")
         self.rebuild_tree()
+
+    def show_global_settings(self) -> None:
+        root = self.tree.topLevelItem(0)
+        if root:
+            self.tree.setCurrentItem(root)
         self.render_global()
 
-    def rebuild_tree(self) -> None:
+    def rebuild_tree(self, select_key: tuple[str, str] | None = None) -> None:
+        if select_key is None:
+            current = self.tree.currentItem()
+            select_key = current.data(0, Qt.UserRole) if current else ("global", "")
+        expanded = self.expanded_tree_keys()
+
+        self.tree.blockSignals(True)
         self.tree.clear()
         root = QTreeWidgetItem(["Global Settings"])
         root.setData(0, Qt.UserRole, ("global", ""))
-        root.setExpanded(True)
         self.tree.addTopLevelItem(root)
 
         imported = self.imported_episode_fingerprints()
@@ -315,7 +334,34 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem([label])
             item.setData(0, Qt.UserRole, ("episode", episode.fingerprint))
             root.addChild(item)
-        self.tree.setCurrentItem(root)
+
+        item_by_key = self.tree_items_by_key()
+        root.setExpanded(("global", "") in expanded or not expanded)
+        for key, item in item_by_key.items():
+            if key in expanded:
+                item.setExpanded(True)
+        selected = item_by_key.get(select_key, root)
+        self.tree.setCurrentItem(selected)
+        self.tree.blockSignals(False)
+        self.render_selected_item(selected)
+
+    def expanded_tree_keys(self) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        root = self.tree.topLevelItem(0)
+        if root and root.isExpanded():
+            keys.add(root.data(0, Qt.UserRole))
+        return keys
+
+    def tree_items_by_key(self) -> dict[tuple[str, str], QTreeWidgetItem]:
+        items: dict[tuple[str, str], QTreeWidgetItem] = {}
+        root = self.tree.topLevelItem(0)
+        if not root:
+            return items
+        items[root.data(0, Qt.UserRole)] = root
+        for index in range(root.childCount()):
+            child = root.child(index)
+            items[child.data(0, Qt.UserRole)] = child
+        return items
 
     def imported_episode_fingerprints(self) -> set[str]:
         if not self.output_root:
@@ -455,7 +501,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Import log"))
         layout.addWidget(self.log)
         layout.addStretch(1)
-        self.right.setWidget(panel)
+        self.set_right_panel(panel)
 
     def render_episode(self, episode: Episode) -> None:
         panel = QWidget()
@@ -547,6 +593,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Import log"))
         layout.addWidget(self.log)
         layout.addStretch(1)
+        self.set_right_panel(panel)
+
+    def set_right_panel(self, panel: QWidget) -> None:
+        old_panel = self.right.takeWidget()
+        if old_panel:
+            for widget in (self.podcast_name, self.database_id, self.collection_name, self.embedding_model, self.log):
+                if is_descendant_of(widget, old_panel):
+                    widget.setParent(None)
+            old_panel.deleteLater()
         self.right.setWidget(panel)
 
     def add_info_row(
@@ -654,7 +709,6 @@ class MainWindow(QMainWindow):
             included.add(speaker)
         else:
             included.discard(speaker)
-        self.rebuild_tree()
         self.render_episode(episode)
 
     def set_all_episode_speakers(self, episode: Episode, enabled: bool) -> None:
@@ -663,7 +717,6 @@ class MainWindow(QMainWindow):
             included.update(episode.speakers)
         else:
             included.clear()
-        self.rebuild_tree()
         self.render_episode(episode)
 
     def selected_documents(self, episode: Episode) -> list[ProcessedDocument]:
@@ -757,8 +810,7 @@ class MainWindow(QMainWindow):
         }
         for episode in self.episodes:
             self.included_speakers_by_episode.setdefault(episode.fingerprint, set(episode.speakers))
-        self.rebuild_tree()
-        self.render_global()
+        self.rebuild_tree(("global", ""))
         self.log.appendPlainText(f"Loaded plan: {filename}")
 
     def start_export(self, plan: ImportPlan, mode: str) -> None:
@@ -1003,6 +1055,15 @@ def safe_folder_name(value: str) -> str:
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", value).strip()
     safe = re.sub(r"\s+", " ", safe)
     return safe or "Podcast Export"
+
+
+def is_descendant_of(widget: QWidget, ancestor: QWidget) -> bool:
+    parent = widget.parent()
+    while parent is not None:
+        if parent is ancestor:
+            return True
+        parent = parent.parent()
+    return False
 
 
 def apply_dark_theme(app: QApplication) -> None:
