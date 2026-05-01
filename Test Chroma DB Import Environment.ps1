@@ -6,6 +6,7 @@ param(
 $ConfigPath = Join-Path $PSScriptRoot "chroma_db_import_config.json"
 $ConfigExamplePath = Join-Path $PSScriptRoot "chroma_db_import_config.example.json"
 $RequirementsPath = Join-Path $PSScriptRoot "chroma_db_import_requirements.txt"
+$TorchCudaIndexUrl = "https://download.pytorch.org/whl/cu128"
 
 if (-not $Config) {
     $Config = $ConfigPath
@@ -97,5 +98,56 @@ if missing:
         }
     } finally {
         Remove-Item -LiteralPath $dependencyCheckPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $cudaCheckPath = Join-Path ([System.IO.Path]::GetTempPath()) ("chroma_import_cuda_check_{0}.py" -f [guid]::NewGuid().ToString("N"))
+    @"
+import subprocess
+import sys
+
+print("CUDA environment diagnosis")
+try:
+    result = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
+    if result.returncode == 0:
+        print("nvidia-smi: PASS")
+        print(result.stdout.strip())
+    else:
+        print("nvidia-smi: FAIL")
+        print(result.stderr.strip())
+except Exception as exc:
+    print(f"nvidia-smi: FAIL ({type(exc).__name__}: {exc})")
+
+try:
+    import torch
+except Exception as exc:
+    print(f"TORCH_IMPORT_FAIL:{type(exc).__name__}: {exc}")
+    sys.exit(0)
+
+print(f"torch version: {getattr(torch, '__version__', 'unknown')}")
+print(f"torch CUDA runtime: {getattr(getattr(torch, 'version', None), 'cuda', None) or 'not included'}")
+try:
+    available = torch.cuda.is_available()
+    print(f"torch.cuda.is_available: {available}")
+    if available:
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        for index in range(torch.cuda.device_count()):
+            print(f"CUDA device {index}: {torch.cuda.get_device_name(index)}")
+        sys.exit(0)
+    sys.exit(2)
+except Exception as exc:
+    print(f"CUDA_QUERY_FAIL:{type(exc).__name__}: {exc}")
+    sys.exit(3)
+"@ | Set-Content -LiteralPath $cudaCheckPath -Encoding UTF8
+    try {
+        & conda run --no-capture-output -n $CondaEnvName python $cudaCheckPath
+        if ($LASTEXITCODE -eq 0) {
+            Write-Check -Status PASS -Name "CUDA / PyTorch GPU" -Detail "PyTorch can use at least one CUDA GPU."
+        } elseif ($LASTEXITCODE -eq 2) {
+            Write-Check -Status WARN -Name "CUDA / PyTorch GPU" -Detail "PyTorch cannot use CUDA. If nvidia-smi passed, install CUDA PyTorch: conda run -n $CondaEnvName python -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchCudaIndexUrl"
+        } else {
+            Write-Check -Status WARN -Name "CUDA / PyTorch GPU" -Detail "CUDA diagnosis failed; inspect the output above."
+        }
+    } finally {
+        Remove-Item -LiteralPath $cudaCheckPath -Force -ErrorAction SilentlyContinue
     }
 }

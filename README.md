@@ -18,7 +18,22 @@ Use the toolbar from left to right:
 - `Output`: choose a folder where self-contained exports will be written.
 - `Generate`: rebuilds the selected podcast export from scratch. If the export folder already exists, the UI prompts before deleting it.
 - `Update`: imports only episodes not already listed in the generated `podcast.json`.
-- `Save Plan` / `Load Plan`: persist and restore podcast/output/settings/speaker selections.
+- `Settings`: edit podcast/output/settings/speaker selections. Use `Save Settings` / `Load Settings` inside this page to persist and restore them.
+- `Guide`: view the expected new-export and update workflows.
+
+The UI startup script prints a CUDA/PyTorch diagnosis before launching. To install a CUDA-enabled PyTorch build into the UI virtual environment, run:
+
+```powershell
+.\Run Chroma DB Import UI.ps1 -InstallCudaTorch
+```
+
+By default this uses the PyTorch CUDA 12.8 wheel index:
+
+```text
+https://download.pytorch.org/whl/cu128
+```
+
+This is separate from the NVIDIA driver-reported CUDA version. A newer NVIDIA driver can normally run applications built against an older CUDA runtime such as the PyTorch CUDA 12.8 wheel.
 
 The export layout is:
 
@@ -43,10 +58,28 @@ Copy-Item .\chroma_db_import_config.example.json .\chroma_db_import_config.json
 
 Edit `chroma_db_import_config.json` so `processed_data_dir` points at the preprocessed cache directory and `persist_dir` points at the Chroma database directory you want to populate.
 
+To create or update the Conda CLI environment with CUDA-enabled PyTorch:
+
+```powershell
+.\Run Chroma DB Import.ps1 -CreateCondaEnv -InstallCudaTorch
+```
+
+or, for an existing environment:
+
+```powershell
+.\Run Chroma DB Import.ps1 -InstallCudaTorch -SkipDependencyCheck
+```
+
 ## Test
 
 ```powershell
 .\Test Chroma DB Import Environment.ps1
+```
+
+The test script checks `nvidia-smi`, PyTorch version, PyTorch CUDA runtime, `torch.cuda.is_available()`, and CUDA device names when available. If `nvidia-smi` sees the GPU but PyTorch reports CUDA unavailable, reinstall PyTorch with:
+
+```powershell
+conda run -n chroma-db-import python -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ## Import

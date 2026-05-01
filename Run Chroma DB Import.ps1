@@ -6,6 +6,8 @@ param(
     [string]$CollectionName,
     [switch]$OneFile,
     [switch]$CreateCondaEnv,
+    [switch]$InstallCudaTorch,
+    [string]$TorchCudaIndexUrl = "https://download.pytorch.org/whl/cu128",
     [switch]$SkipDependencyCheck
 )
 
@@ -45,6 +47,16 @@ function New-ProjectCondaEnv {
     if ($LASTEXITCODE -eq 0) {
         & conda run --no-capture-output -n $CondaEnvName python -m pip install -r $RequirementsPath
     }
+    if (($LASTEXITCODE -eq 0) -and $InstallCudaTorch) {
+        & conda run --no-capture-output -n $CondaEnvName python -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchCudaIndexUrl
+    }
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+}
+
+function Install-CudaTorch {
+    & conda run --no-capture-output -n $CondaEnvName python -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchCudaIndexUrl
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -82,6 +94,52 @@ if missing:
     }
 }
 
+function Test-TorchCuda {
+    $cudaCheckPath = Join-Path ([System.IO.Path]::GetTempPath()) ("chroma_import_cuda_check_{0}.py" -f [guid]::NewGuid().ToString("N"))
+    @"
+import subprocess
+import sys
+
+print("CUDA environment diagnosis")
+try:
+    result = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
+    if result.returncode == 0:
+        print("nvidia-smi: PASS")
+        print(result.stdout.strip())
+    else:
+        print("nvidia-smi: FAIL")
+        print(result.stderr.strip())
+except Exception as exc:
+    print(f"nvidia-smi: FAIL ({type(exc).__name__}: {exc})")
+
+try:
+    import torch
+except Exception as exc:
+    print(f"torch import: FAIL ({type(exc).__name__}: {exc})")
+    sys.exit(0)
+
+print(f"torch version: {getattr(torch, '__version__', 'unknown')}")
+print(f"torch CUDA runtime: {getattr(getattr(torch, 'version', None), 'cuda', None) or 'not included'}")
+try:
+    available = torch.cuda.is_available()
+    print(f"torch.cuda.is_available: {available}")
+    if available:
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        for index in range(torch.cuda.device_count()):
+            print(f"CUDA device {index}: {torch.cuda.get_device_name(index)}")
+    else:
+        print("Diagnosis: PyTorch cannot use CUDA. If nvidia-smi passed, install a CUDA-enabled PyTorch wheel.")
+except Exception as exc:
+    print(f"CUDA query: FAIL ({type(exc).__name__}: {exc})")
+"@ | Set-Content -LiteralPath $cudaCheckPath -Encoding UTF8
+
+    try {
+        Invoke-ProjectPython -Arguments @($cudaCheckPath)
+    } finally {
+        Remove-Item -LiteralPath $cudaCheckPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if (-not (Get-Command conda -ErrorAction SilentlyContinue)) {
     throw "Conda was not found on PATH. Open a Miniconda/Anaconda PowerShell prompt, or add Conda to PATH."
 }
@@ -103,6 +161,10 @@ if (-not (Test-CondaEnv)) {
     exit 1
 }
 
+if ($InstallCudaTorch) {
+    Install-CudaTorch
+}
+
 if (-not $SkipDependencyCheck) {
     $dependencyExitCode = Test-PythonDependencies
     if ($dependencyExitCode -ne 0) {
@@ -111,6 +173,7 @@ if (-not $SkipDependencyCheck) {
         Write-Host "  conda run -n $CondaEnvName python -m pip install -r `"$RequirementsPath`""
         exit $dependencyExitCode
     }
+    Test-TorchCuda
 }
 
 $argsList = @("--config", $Config)
