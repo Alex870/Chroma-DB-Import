@@ -14,6 +14,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -44,6 +45,12 @@ from chroma_db_import import (
 
 ALWAYS_INCLUDE_NODE_TYPES = {"episode_thesis"}
 SUMMARY_NODE_TYPES = {"cluster_summary"}
+
+
+@dataclass
+class DeviceOption:
+    label: str
+    value: str
 
 
 @dataclass
@@ -193,7 +200,8 @@ class MainWindow(QMainWindow):
         self.database_id = QLineEdit("podcast-chat-export")
         self.collection_name = QLineEdit("whisper_rag_v2")
         self.embedding_model = QLineEdit("BAAI/bge-large-en-v1.5")
-        self.embedding_device = QLineEdit("auto")
+        self.embedding_device = QComboBox()
+        self.gpu_status = QLabel()
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(180)
@@ -203,7 +211,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
 
+        self.populate_embedding_devices()
+        self.connect_prerequisite_signals()
         self._build_toolbar()
+        self.update_action_states()
         self.render_global()
 
     def _build_toolbar(self) -> None:
@@ -228,49 +239,23 @@ class MainWindow(QMainWindow):
         output_action.triggered.connect(self.choose_output_folder)
         toolbar.addAction(output_action)
 
-        generate_action = QAction("Generate", self)
+        self.generate_action = QAction("Generate", self)
         self.set_action_help(
-            generate_action,
+            self.generate_action,
             "Build the selected podcast export from scratch. If the export folder already exists, "
             "you will be prompted before it is deleted and rebuilt.",
         )
-        generate_action.triggered.connect(self.generate)
-        toolbar.addAction(generate_action)
+        self.generate_action.triggered.connect(self.generate)
+        toolbar.addAction(self.generate_action)
 
-        update_action = QAction("Update", self)
+        self.update_action = QAction("Update", self)
         self.set_action_help(
-            update_action,
+            self.update_action,
             "Append only episodes that are not already recorded in the existing podcast.json. "
             "Previously imported source files are skipped; use Generate to rebuild changed episodes.",
         )
-        update_action.triggered.connect(self.update)
-        toolbar.addAction(update_action)
-
-        save_plan_action = QAction("Save Plan", self)
-        self.set_action_help(
-            save_plan_action,
-            "Save the current source folder, output folder, podcast settings, and speaker selections "
-            "to a JSON import plan so the same job can be repeated later.",
-        )
-        save_plan_action.triggered.connect(self.save_plan)
-        toolbar.addAction(save_plan_action)
-
-        load_plan_action = QAction("Load Plan", self)
-        self.set_action_help(
-            load_plan_action,
-            "Load a saved import plan to restore paths, database settings, and speaker selections "
-            "for a repeat import or later update.",
-        )
-        load_plan_action.triggered.connect(self.load_plan)
-        toolbar.addAction(load_plan_action)
-
-        guide_action = QAction("Guide", self)
-        self.set_action_help(
-            guide_action,
-            "Show the common workflows for creating a new vector DB export or updating an existing one.",
-        )
-        guide_action.triggered.connect(self.show_workflow_guide)
-        toolbar.addAction(guide_action)
+        self.update_action.triggered.connect(self.update)
+        toolbar.addAction(self.update_action)
 
         settings_action = QAction("Settings", self)
         self.set_action_help(
@@ -281,10 +266,78 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self.show_global_settings)
         toolbar.addAction(settings_action)
 
+        guide_action = QAction("Guide", self)
+        self.set_action_help(
+            guide_action,
+            "Show the common workflows for creating a new vector DB export or updating an existing one.",
+        )
+        guide_action.triggered.connect(self.show_workflow_guide)
+        toolbar.addAction(guide_action)
+
     def set_action_help(self, action: QAction, text: str) -> None:
         action.setToolTip(text)
         action.setStatusTip(text)
         action.setWhatsThis(text)
+
+    def connect_prerequisite_signals(self) -> None:
+        for field in (self.podcast_name, self.database_id, self.collection_name, self.embedding_model):
+            field.textChanged.connect(self.update_action_states)
+        self.embedding_device.currentIndexChanged.connect(self.update_action_states)
+
+    def populate_embedding_devices(self, selected: str = "auto") -> None:
+        options, diagnostic = embedding_device_options()
+        self.embedding_device.blockSignals(True)
+        self.embedding_device.clear()
+        for option in options:
+            self.embedding_device.addItem(option.label, option.value)
+        self.embedding_device.blockSignals(False)
+        self.select_embedding_device(selected)
+        self.gpu_status.setText(diagnostic)
+        self.gpu_status.setWordWrap(True)
+
+    def select_embedding_device(self, selected: str) -> None:
+        value = normalize_embedding_device_value(selected)
+        for index in range(self.embedding_device.count()):
+            if self.embedding_device.itemData(index) == value:
+                self.embedding_device.setCurrentIndex(index)
+                return
+        if value.startswith("cuda"):
+            self.log.appendPlainText(f"Saved GPU device '{selected}' is not currently available to PyTorch; using Auto.")
+        self.embedding_device.setCurrentIndex(0)
+
+    def selected_embedding_device(self) -> str:
+        return str(self.embedding_device.currentData() or "auto")
+
+    def missing_prerequisites(self) -> list[str]:
+        missing: list[str] = []
+        if not self.processed_data_dir:
+            missing.append("choose a processed RAG output folder")
+        if not self.output_root:
+            missing.append("choose an output folder")
+        if not self.episodes:
+            missing.append("load at least one processed episode file")
+        if not self.podcast_name.text().strip():
+            missing.append("enter a podcast name")
+        if not self.collection_name.text().strip():
+            missing.append("enter a Chroma collection")
+        if not self.embedding_model.text().strip():
+            missing.append("enter an embedding model")
+        return missing
+
+    def update_action_states(self) -> None:
+        if not hasattr(self, "generate_action"):
+            return
+        missing = self.missing_prerequisites()
+        enabled = not missing and self.thread is None
+        detail = "Ready to export." if enabled else "Requires: " + "; ".join(missing)
+        self.generate_action.setEnabled(enabled)
+        self.generate_action.setToolTip(
+            "Build the selected podcast export from scratch. " + detail
+        )
+        self.update_action.setEnabled(enabled)
+        self.update_action.setToolTip(
+            "Append only episodes not already recorded in the existing podcast.json. " + detail
+        )
 
     def open_processed_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Open processed RAG output folder")
@@ -300,6 +353,7 @@ class MainWindow(QMainWindow):
             self.database_id.setText(slugify(self.podcast_name.text()))
         self.rebuild_tree()
         self.render_global()
+        self.update_action_states()
         self.log.appendPlainText(f"Loaded {len(self.episodes)} processed episode file(s).")
 
     def choose_output_folder(self) -> None:
@@ -309,6 +363,7 @@ class MainWindow(QMainWindow):
         self.output_root = Path(folder)
         self.log.appendPlainText(f"Output folder: {self.output_root}")
         self.rebuild_tree()
+        self.update_action_states()
 
     def show_global_settings(self) -> None:
         root = self.tree.topLevelItem(0)
@@ -455,9 +510,16 @@ class MainWindow(QMainWindow):
             form,
             "Embedding device",
             self.embedding_device,
-            "Compute device used by the embedding model. Use auto to choose CUDA when a compatible "
-            "NVIDIA/PyTorch CUDA stack is installed, otherwise CPU. You can also set cpu, cuda, "
-            "or cuda:0 explicitly. Changing this affects import speed, not retrieval semantics.",
+            "Compute device used by the embedding model. Auto chooses the first usable PyTorch CUDA "
+            "device when one is available, otherwise CPU. GPU names appear only when PyTorch reports "
+            "them as CUDA-usable. Changing this affects import speed, not retrieval semantics.",
+        )
+        self.add_info_row(
+            form,
+            "GPU status",
+            self.gpu_status,
+            "Explains what PyTorch reports about CUDA/GPU availability. If Auto falls back to CPU, "
+            "this status and GPU Details explain the likely reason.",
         )
         self.add_info_row(
             form,
@@ -494,6 +556,26 @@ class MainWindow(QMainWindow):
             "determine which speaker-scoped documents are inserted.",
         )
         layout.addLayout(form)
+
+        settings_buttons = QHBoxLayout()
+        save_settings = QPushButton("Save Settings")
+        save_settings.setToolTip(
+            "Save paths, database fields, embedding settings, and speaker selections to a JSON settings file."
+        )
+        save_settings.clicked.connect(self.save_plan)
+        load_settings = QPushButton("Load Settings")
+        load_settings.setToolTip(
+            "Load a saved settings file to restore paths, database fields, embedding settings, and speaker selections."
+        )
+        load_settings.clicked.connect(self.load_plan)
+        gpu_details = QPushButton("GPU Details")
+        gpu_details.setToolTip("Show PyTorch CUDA diagnostics used to decide whether GPU import is available.")
+        gpu_details.clicked.connect(self.show_gpu_details)
+        settings_buttons.addWidget(save_settings)
+        settings_buttons.addWidget(load_settings)
+        settings_buttons.addWidget(gpu_details)
+        settings_buttons.addStretch(1)
+        layout.addLayout(settings_buttons)
 
         layout.addWidget(QLabel("Speakers"))
         speaker_buttons = QHBoxLayout()
@@ -626,6 +708,7 @@ class MainWindow(QMainWindow):
                 self.collection_name,
                 self.embedding_model,
                 self.embedding_device,
+                self.gpu_status,
                 self.progress_label,
                 self.progress_bar,
                 self.log,
@@ -683,10 +766,14 @@ class MainWindow(QMainWindow):
             "3. Click Update. The app reads the existing podcast.json and skips source files "
             "already recorded there. New episode files are appended to the existing Chroma DB "
             "and metadata.\n\n"
-            "Save Plan stores the current paths, database fields, and speaker selections in a "
-            "JSON file. Load Plan restores those choices when you want to repeat a build, continue "
-            "later, or run the same update workflow again.",
+            "Save Settings stores the current paths, database fields, embedding settings, and "
+            "speaker selections in a JSON file. Load Settings restores those choices when you want "
+            "to repeat a build, continue later, or run the same update workflow again.",
         )
+
+    def show_gpu_details(self) -> None:
+        _options, diagnostic = embedding_device_options()
+        QMessageBox.information(self, "GPU Details", diagnostic)
 
     def global_speakers(self) -> list[str]:
         return sorted({speaker for episode in self.episodes for speaker in episode.speakers})
@@ -770,7 +857,7 @@ class MainWindow(QMainWindow):
             output_root=self.output_root,
             collection_name=self.collection_name.text().strip() or "whisper_rag_v2",
             embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
-            embedding_device=self.embedding_device.text().strip() or "auto",
+            embedding_device=self.selected_embedding_device(),
             episodes=self.episodes,
             included_speakers_by_episode=self.included_speakers_by_episode,
         )
@@ -796,10 +883,7 @@ class MainWindow(QMainWindow):
         self.start_export(plan, "update")
 
     def save_plan(self) -> None:
-        if not self.episodes:
-            QMessageBox.warning(self, "No plan to save", "Open a processed RAG output folder first.")
-            return
-        filename, _ = QFileDialog.getSaveFileName(self, "Save import plan", filter="JSON files (*.json)")
+        filename, _ = QFileDialog.getSaveFileName(self, "Save import settings", filter="JSON files (*.json)")
         if not filename:
             return
         payload = {
@@ -810,17 +894,17 @@ class MainWindow(QMainWindow):
             "output_root": str(self.output_root or ""),
             "collection_name": self.collection_name.text(),
             "embedding_model": self.embedding_model.text(),
-            "embedding_device": self.embedding_device.text(),
+            "embedding_device": self.selected_embedding_device(),
             "included_speakers_by_episode": {
                 fingerprint: sorted(speakers)
                 for fingerprint, speakers in self.included_speakers_by_episode.items()
             },
         }
         Path(filename).write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-        self.log.appendPlainText(f"Saved plan: {filename}")
+        self.log.appendPlainText(f"Saved settings: {filename}")
 
     def load_plan(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(self, "Load import plan", filter="JSON files (*.json)")
+        filename, _ = QFileDialog.getOpenFileName(self, "Load import settings", filter="JSON files (*.json)")
         if not filename:
             return
         payload = json.loads(Path(filename).read_text(encoding="utf-8"))
@@ -828,13 +912,16 @@ class MainWindow(QMainWindow):
         if processed.exists():
             self.processed_data_dir = processed
             self.episodes = self.loader.load_folder(processed)
+        else:
+            self.processed_data_dir = None
+            self.episodes = []
         output_root = Path(str(payload.get("output_root") or ""))
         self.output_root = output_root if output_root.exists() else None
         self.podcast_name.setText(str(payload.get("podcast_name") or "Podcast Chat Export"))
         self.database_id.setText(str(payload.get("database_id") or slugify(self.podcast_name.text())))
         self.collection_name.setText(str(payload.get("collection_name") or "whisper_rag_v2"))
         self.embedding_model.setText(str(payload.get("embedding_model") or "BAAI/bge-large-en-v1.5"))
-        self.embedding_device.setText(str(payload.get("embedding_device") or "auto"))
+        self.populate_embedding_devices(str(payload.get("embedding_device") or "auto"))
         self.included_speakers_by_episode = {
             str(fingerprint): set(speakers)
             for fingerprint, speakers in dict(payload.get("included_speakers_by_episode") or {}).items()
@@ -842,7 +929,8 @@ class MainWindow(QMainWindow):
         for episode in self.episodes:
             self.included_speakers_by_episode.setdefault(episode.fingerprint, set(episode.speakers))
         self.rebuild_tree(("global", ""))
-        self.log.appendPlainText(f"Loaded plan: {filename}")
+        self.update_action_states()
+        self.log.appendPlainText(f"Loaded settings: {filename}")
 
     def start_export(self, plan: ImportPlan, mode: str) -> None:
         if self.thread is not None:
@@ -851,6 +939,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"Starting {mode}...")
         self.progress_bar.setRange(0, 0)
         self.thread = QThread()
+        self.update_action_states()
         self.worker = ChromaExportWorker(plan, mode)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -897,6 +986,7 @@ class MainWindow(QMainWindow):
     def clear_worker(self) -> None:
         self.thread = None
         self.worker = None
+        self.update_action_states()
 
 
 def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary:  # type: ignore[no-untyped-def]
@@ -1161,15 +1251,82 @@ def safe_folder_name(value: str) -> str:
     return safe or "Podcast Export"
 
 
-def resolve_embedding_device(value: str) -> str:
-    device = value.strip().lower()
-    if device and device != "auto":
-        return device
+def embedding_device_options() -> tuple[list[DeviceOption], str]:
+    options = [DeviceOption("Auto", "auto"), DeviceOption("CPU", "cpu")]
     try:
         import torch
-    except ImportError:
-        return "cpu"
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError as exc:
+        return options, (
+            "GPU unavailable: PyTorch is not installed in this environment. "
+            f"Auto will use CPU. Import error: {exc}"
+        )
+
+    torch_version = getattr(torch, "__version__", "unknown")
+    cuda_version = getattr(getattr(torch, "version", None), "cuda", None) or "not included"
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception as exc:
+        return options, (
+            f"GPU unavailable: PyTorch {torch_version} could not query CUDA. "
+            f"Auto will use CPU. CUDA runtime reported: {exc}"
+        )
+
+    if not cuda_available:
+        return options, (
+            f"GPU unavailable: PyTorch {torch_version} reports CUDA is not available. "
+            f"PyTorch CUDA build/runtime: {cuda_version}. Auto will use CPU. "
+            "This usually means the installed PyTorch build is CPU-only, the NVIDIA driver/CUDA "
+            "runtime is not visible, or no compatible NVIDIA GPU is available."
+        )
+
+    try:
+        device_count = int(torch.cuda.device_count())
+    except Exception as exc:
+        return options, (
+            f"GPU unavailable: PyTorch {torch_version} reports CUDA support, but device enumeration failed. "
+            f"Auto will use CPU. Error: {exc}"
+        )
+
+    if device_count <= 0:
+        return options, (
+            f"GPU unavailable: PyTorch {torch_version} reports CUDA support but no CUDA devices. "
+            f"PyTorch CUDA build/runtime: {cuda_version}. Auto will use CPU."
+        )
+
+    names: list[str] = []
+    for index in range(device_count):
+        try:
+            name = str(torch.cuda.get_device_name(index))
+        except Exception as exc:
+            names.append(f"CUDA device {index} (name unavailable: {exc})")
+            continue
+        names.append(name)
+        options.append(DeviceOption(name, f"cuda:{index}"))
+
+    return options, (
+        f"GPU available: PyTorch {torch_version} can use {device_count} CUDA device(s): "
+        f"{', '.join(names)}. Auto will use {names[0]}."
+    )
+
+
+def normalize_embedding_device_value(value: str) -> str:
+    device = value.strip().lower()
+    if not device:
+        return "auto"
+    if device == "cuda":
+        return "cuda:0"
+    return device
+
+
+def resolve_embedding_device(value: str) -> str:
+    device = normalize_embedding_device_value(value)
+    if device != "auto":
+        return device
+    options, _diagnostic = embedding_device_options()
+    for option in options:
+        if option.value.startswith("cuda"):
+            return option.value
+    return "cpu"
 
 
 def is_descendant_of(widget: QWidget, ancestor: QWidget) -> bool:
@@ -1213,11 +1370,20 @@ def apply_dark_theme(app: QApplication) -> None:
         QLabel {
             padding: 2px;
         }
-        QLineEdit, QPlainTextEdit {
+        QLineEdit, QPlainTextEdit, QComboBox {
             background: #0c0f14;
             border: 1px solid #2b313d;
             border-radius: 6px;
             padding: 8px;
+            selection-background-color: #2f6feb;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 28px;
+        }
+        QComboBox QAbstractItemView {
+            background: #151922;
+            border: 1px solid #2b313d;
             selection-background-color: #2f6feb;
         }
         QProgressBar {
