@@ -494,7 +494,7 @@ class MainWindow(QMainWindow):
             checkbox = QCheckBox(speaker)
             checkbox.setTristate(True)
             checkbox.setCheckState(self.global_speaker_state(speaker))
-            checkbox.stateChanged.connect(lambda state, value=speaker: self.set_global_speaker(value, state))
+            checkbox.clicked.connect(lambda checked, value=speaker: self.set_global_speaker(value, checked))
             row.addWidget(checkbox)
             layout.addLayout(row)
 
@@ -680,10 +680,7 @@ class MainWindow(QMainWindow):
             return Qt.PartiallyChecked
         return Qt.Unchecked
 
-    def set_global_speaker(self, speaker: str, state: int) -> None:
-        if state == Qt.PartiallyChecked.value:
-            return
-        enabled = state == Qt.Checked.value
+    def set_global_speaker(self, speaker: str, enabled: bool) -> None:
         for episode in self.episodes:
             if speaker not in episode.speakers:
                 continue
