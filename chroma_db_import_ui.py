@@ -1129,20 +1129,20 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     plan.export_dir.mkdir(parents=True, exist_ok=True)
 
     metadata_path = plan.export_dir / "podcast.json"
-    existing_fingerprints = set()
-    existing_source_files = set()
     existing_episode_entries: list[dict[str, Any]] = []
+    existing_by_fingerprint: dict[str, dict[str, Any]] = {}
+    existing_by_source_file: dict[str, dict[str, Any]] = {}
     if mode == "update" and metadata_path.exists():
         existing = json.loads(metadata_path.read_text(encoding="utf-8"))
         existing_episode_entries = list(existing.get("episodes", []))
-        existing_fingerprints = {
-            str(item.get("source_fingerprint"))
-            for item in existing.get("episodes", [])
+        existing_by_fingerprint = {
+            str(item.get("source_fingerprint")): item
+            for item in existing_episode_entries
             if item.get("source_fingerprint")
         }
-        existing_source_files = {
-            str(item.get("source_file"))
-            for item in existing.get("episodes", [])
+        existing_by_source_file = {
+            str(item.get("source_file")): item
+            for item in existing_episode_entries
             if item.get("source_file")
         }
 
@@ -1160,8 +1160,11 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
 
     episodes_to_import: list[Episode] = []
     for episode in plan.episodes:
-        if mode == "update" and (
-            episode.fingerprint in existing_fingerprints or str(episode.path) in existing_source_files
+        if mode == "update" and update_should_skip_episode(
+            episode,
+            plan.included_speakers_by_episode,
+            existing_by_fingerprint,
+            existing_by_source_file,
         ):
             continue
         episodes_to_import.append(episode)
@@ -1182,8 +1185,11 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     skipped = 0
     processed_documents = 0
     for index, episode in enumerate(plan.episodes, 1):
-        if mode == "update" and (
-            episode.fingerprint in existing_fingerprints or str(episode.path) in existing_source_files
+        if mode == "update" and update_should_skip_episode(
+            episode,
+            plan.included_speakers_by_episode,
+            existing_by_fingerprint,
+            existing_by_source_file,
         ):
             skipped += 1
             emit_progress(
@@ -1203,6 +1209,12 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
             if has_text(doc.page_content)
         ]
         ids = [str(doc.metadata["node_id"]) for doc in selected if has_text(doc.page_content)]
+
+        if mode == "update":
+            existing_ids = existing_vector_ids(vectorstore, ids)
+            pending = [(doc, doc_id) for doc, doc_id in zip(documents, ids) if doc_id not in existing_ids]
+            documents = [doc for doc, _doc_id in pending]
+            ids = [doc_id for _doc, doc_id in pending]
 
         for start in range(0, len(documents), 64):
             batch_docs = documents[start : start + 64]
@@ -1226,7 +1238,7 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
                     )
                 )
 
-        imported_episodes.append(episode_metadata_entry(episode, selected))
+        imported_episodes.append(episode_metadata_entry(episode, selected, len(documents)))
         emit_progress(
             ImportProgress(
                 f"Imported {len(documents)} documents: {episode.title}",
@@ -1246,6 +1258,63 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     )
 
 
+def update_should_skip_episode(
+    episode: Episode,
+    included_speakers_by_episode: dict[str, set[str]],
+    existing_by_fingerprint: dict[str, dict[str, Any]],
+    existing_by_source_file: dict[str, dict[str, Any]],
+) -> bool:
+    existing_entry = existing_entry_for_episode(episode, existing_by_fingerprint, existing_by_source_file)
+    if existing_entry is None:
+        return False
+
+    selected_speakers = selected_speakers_for_episode(episode, included_speakers_by_episode)
+    if not selected_speakers:
+        return True
+
+    existing_speakers = episode_speakers_from_entry(existing_entry)
+    return selected_speakers.issubset(existing_speakers)
+
+
+def existing_entry_for_episode(
+    episode: Episode,
+    existing_by_fingerprint: dict[str, dict[str, Any]],
+    existing_by_source_file: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    return existing_by_fingerprint.get(episode.fingerprint) or existing_by_source_file.get(str(episode.path))
+
+
+def selected_speakers_for_episode(
+    episode: Episode,
+    included_speakers_by_episode: dict[str, set[str]],
+) -> set[str]:
+    included_speakers = included_speakers_by_episode.get(episode.fingerprint, set())
+    return {speaker for speaker in episode.speakers if speaker in included_speakers}
+
+
+def episode_speakers_from_entry(entry: dict[str, Any]) -> set[str]:
+    speakers: set[str] = set()
+    for item in entry.get("speakers", []):
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item or "").strip()
+        if name:
+            speakers.add(name)
+    return speakers
+
+
+def existing_vector_ids(vectorstore: Any, ids: list[str]) -> set[str]:
+    if not ids:
+        return set()
+    existing: set[str] = set()
+    for start in range(0, len(ids), 64):
+        batch_ids = ids[start : start + 64]
+        result = vectorstore.get(ids=batch_ids, include=[])
+        existing.update(str(item) for item in result.get("ids", []) if item)
+    return existing
+
+
 def merge_episode_entries(
     existing_episode_entries: list[dict[str, Any]],
     imported_episodes: list[dict[str, Any]],
@@ -1256,11 +1325,24 @@ def merge_episode_entries(
         if entry.get("source_file")
     }
     for entry in imported_episodes:
-        by_source_file[str(entry.get("source_file"))] = entry
+        source_file = str(entry.get("source_file"))
+        if source_file in by_source_file:
+            by_source_file[source_file] = merge_episode_entry(by_source_file[source_file], entry)
+        else:
+            by_source_file[source_file] = entry
     return sorted(
         by_source_file.values(),
         key=lambda item: (str(item.get("episode_date") or "9999-99-99"), str(item.get("episode_title") or "")),
     )
+
+
+def merge_episode_entry(existing: dict[str, Any], imported: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    merged.update(imported)
+    speaker_names = sorted(episode_speakers_from_entry(existing) | episode_speakers_from_entry(imported))
+    merged["speakers"] = [{"id": slugify(speaker), "name": speaker} for speaker in speaker_names]
+    merged["document_count"] = int(existing.get("document_count") or 0) + int(imported.get("document_count") or 0)
+    return merged
 
 
 def select_documents_for_episode(
@@ -1290,7 +1372,11 @@ def should_include_document(doc: ProcessedDocument, included_speakers: set[str])
     return bool(speakers & included_speakers)
 
 
-def episode_metadata_entry(episode: Episode, selected: list[ProcessedDocument]) -> dict[str, Any]:
+def episode_metadata_entry(
+    episode: Episode,
+    selected: list[ProcessedDocument],
+    document_count: int | None = None,
+) -> dict[str, Any]:
     speakers = sorted({speaker for doc in selected for speaker in document_speakers(doc.metadata)})
     return {
         "source_file": str(episode.path),
@@ -1298,7 +1384,7 @@ def episode_metadata_entry(episode: Episode, selected: list[ProcessedDocument]) 
         "episode_id": episode.episode_id,
         "episode_title": episode.title,
         "episode_date": episode.episode_date,
-        "document_count": len(selected),
+        "document_count": len(selected) if document_count is None else document_count,
         "speakers": [{"id": slugify(speaker), "name": speaker} for speaker in speakers],
         "imported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
