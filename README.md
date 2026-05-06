@@ -49,6 +49,20 @@ The tree has a single `Global Settings` root node. Episode nodes are ordered by 
 
 Excluded speakers are omitted from the generated metadata and their speaker-specific documents are not inserted. Episode-level thesis documents and multi-speaker summary nodes are preserved to keep retrieval context useful.
 
+## Embeddings
+
+The default embedding model is:
+
+```text
+BAAI/bge-large-en-v1.5
+```
+
+This model converts each selected RAG document into a dense vector before insertion into Chroma. `PodCast Chat` later embeds the user's question with the same model and asks Chroma for nearby vectors, which is how the chat app finds semantically relevant podcast viewpoints before sending context to LM Studio.
+
+`bge-large-en-v1.5` was chosen as the default because it is a strong general-purpose English retrieval embedding model with good semantic search behavior for natural-language questions, transcript excerpts, summaries, and viewpoint-style passages. It is also widely available through Hugging Face tooling, works on CPU, and can be accelerated with CUDA PyTorch when a compatible NVIDIA GPU environment is installed. That makes it a good fit for a Windows desktop workflow where reliability and easy setup matter, while still allowing faster imports on GPU-equipped machines.
+
+The embedding model is configurable in the UI and in the CLI config, but the Chroma export and the chat client must agree on the model. If a database is generated with one embedding model and queried with another, vector distances become unreliable because the vectors no longer live in the same embedding space. The generated `podcast.json` records the embedding model so `PodCast Chat` can display and use the expected value.
+
 ## Setup
 
 ```powershell
