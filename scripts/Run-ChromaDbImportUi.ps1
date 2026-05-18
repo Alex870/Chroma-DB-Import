@@ -1,9 +1,14 @@
 param(
     [switch]$InstallCudaTorch,
-    [string]$TorchCudaIndexUrl = "https://download.pytorch.org/whl/cu128"
+    [string]$TorchCudaIndexUrl = "https://download.pytorch.org/whl/cu128",
+    [switch]$NoLaunch
 )
 
 $ErrorActionPreference = "Stop"
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$VenvPython = Join-Path $ProjectRoot ".venv\\Scripts\\python.exe"
+$RequirementsPath = Join-Path $ProjectRoot "chroma_db_import_requirements.txt"
+$UiScript = Join-Path $ProjectRoot "chroma_db_import_ui.py"
 
 function Test-TorchCuda {
     $diagnostic = @"
@@ -42,16 +47,35 @@ try:
 except Exception as exc:
     print(f"CUDA query: FAIL ({type(exc).__name__}: {exc})")
 "@
-    $diagnostic | .\.venv\Scripts\python.exe -
+    $diagnostic | & $VenvPython -
 }
 
-if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
-    python -m venv .venv
+function Install-UiDependencies {
+    if (-not (Test-Path $VenvPython)) {
+        python -m venv (Join-Path $ProjectRoot ".venv")
+    }
+
+    & $VenvPython -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    & $VenvPython -m pip install -r $RequirementsPath
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    if ($InstallCudaTorch) {
+        & $VenvPython -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchCudaIndexUrl
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+    }
 }
 
-.\.venv\Scripts\python.exe -m pip install -r chroma_db_import_requirements.txt
-if ($InstallCudaTorch) {
-    .\.venv\Scripts\python.exe -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchCudaIndexUrl
-}
+Install-UiDependencies
 Test-TorchCuda
-.\.venv\Scripts\pythonw.exe .\chroma_db_import_ui.py
+if (-not $NoLaunch) {
+    & $VenvPython $UiScript
+    exit $LASTEXITCODE
+}

@@ -5,3 +5,9 @@ __pycache__/
 chroma_db_import_config.json
 state/
 chroma_db*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/

@@ -3,9 +3,10 @@ param(
     [string]$CondaEnvName = "chroma-db-import"
 )
 
-$ConfigPath = Join-Path $PSScriptRoot "chroma_db_import_config.json"
-$ConfigExamplePath = Join-Path $PSScriptRoot "chroma_db_import_config.example.json"
-$RequirementsPath = Join-Path $PSScriptRoot "chroma_db_import_requirements.txt"
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$ConfigPath = Join-Path $ProjectRoot "chroma_db_import_config.json"
+$ConfigExamplePath = Join-Path $ProjectRoot "examples\\chroma_db_import_config.example.json"
+$RequirementsPath = Join-Path $ProjectRoot "chroma_db_import_requirements.txt"
 $TorchCudaIndexUrl = "https://download.pytorch.org/whl/cu128"
 
 if (-not $Config) {
@@ -21,7 +22,7 @@ function Resolve-ProjectPath {
     param([string]$Value)
     if (-not $Value) { return $null }
     if ([System.IO.Path]::IsPathRooted($Value)) { return $Value }
-    return (Join-Path $PSScriptRoot $Value)
+    return (Join-Path $ProjectRoot $Value)
 }
 
 if (-not (Get-Command conda -ErrorAction SilentlyContinue)) {
@@ -40,7 +41,7 @@ foreach ($envPath in $envListJson.envs) {
     }
 }
 if (-not $envExists) {
-    Write-Check -Status FAIL -Name "Conda environment" -Detail "Missing '$CondaEnvName'. Create it with .\Run Chroma DB Import.ps1 -CreateCondaEnv"
+    Write-Check -Status FAIL -Name "Conda environment" -Detail "Missing '$CondaEnvName'. Create it with .\scripts\Run-ChromaDbImport.ps1 -CreateCondaEnv"
 }
 
 if (-not (Test-Path -LiteralPath $Config)) {
@@ -78,7 +79,7 @@ if ($envExists) {
     @"
 import importlib
 import sys
-required = ['chromadb', 'langchain_chroma', 'langchain_core', 'langchain_huggingface', 'sentence_transformers']
+required = ['chromadb', 'langchain_chroma', 'langchain_core', 'langchain_huggingface', 'psutil', 'sentence_transformers']
 missing = []
 for name in required:
     try:
