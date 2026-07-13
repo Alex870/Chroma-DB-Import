@@ -1,87 +1,58 @@
 # Roadmap
 
-This roadmap defines how `Chroma DB Import` should support richer high-context preprocessing outputs while remaining fully compatible with the existing baseline export workflow.
+`Chroma DB Import` is the contract boundary between processed podcast artifacts and self-contained Chroma exports. The roadmap prioritizes repeatability, vector-space integrity, and traceability over source-runtime labels.
 
-## Compatibility Principles
+## Principles
 
-- Keep deterministic import behavior as the default.
-- Treat high-context preprocessing metadata as additive.
-- Accept both older processed caches and newer richer manifests.
-- Surface compatibility warnings before surfacing hard failures whenever possible.
+- Make imports deterministic, inspectable, and safe to resume.
+- Keep old valid caches readable while making metadata additive and versioned.
+- Never mix incompatible embedding spaces in one collection.
+- Treat `podcast.json` and import manifests as downstream contracts.
+- Explain exactly what an update inserted, skipped, replaced, or removed.
 
-## Shared Runtime Profile Model
+## Current Foundation
 
-- Recognize source-side metadata from preprocessing:
-  - `runtime_profile`
-  - `backend`
-  - `model_name`
-  - `model_capabilities`
-- Record importer-side metadata:
-  - embedding model
-  - embedding dimension
-  - selected speaker filter
-  - importer runtime profile if needed
+- PySide import UI, episode/speaker selection, rebuild/update modes, metadata generation, CUDA diagnostics, and incremental-import tests.
 
-## Data Contract
+## Priority 1: Export Contract And Provenance
 
-- Extend executable import validation to accept:
-  - old caches with minimal metadata
-  - new caches with high-context fields
-- Validate import manifests for:
-  - source runtime profile
-  - source preprocessing version
-  - prompt/version manifest presence when available
-- Record downstream compatibility warnings if `PodCast Chat` expects a different embedding model or export profile.
+- Define versioned schemas for `podcast.json` and `import_manifest.json`.
+- Record collection name, Chroma version, embedding model/fingerprint/dimension, selected speakers, source-cache IDs, counts, and timestamp.
+- Keep document-level provenance back to processed node IDs, episode, speaker, timestamps, and source text hash.
+- Preserve optional source-model metadata as provenance, not a compatibility requirement.
+- Share fixtures with Podcast Chat and RAGScope.
 
-## Import Workflow
+## Priority 2: Safe Incremental Import
 
-- Keep the current simple import flow as baseline.
-- Add profile-aware preflight checks:
-  - source cache schema version
-  - embedding model mismatch risk
-  - source runtime profile summary
-  - structured-output provenance presence
-  - judge-pass provenance presence
-- Keep rebuild and update modes backward compatible.
-- Preserve chunk-level resumability and embedding cache behavior.
+- Use content hashes to classify source episodes as new, changed, unchanged, or deleted.
+- Update when newly selected speakers add eligible nodes, even if an episode was previously imported.
+- Retain historical vectors by default; make deletion a deliberate reconcile mode.
+- Validate in a staging collection or recoverable transaction boundary before promotion.
+- Emit a machine-readable inserted/updated/skipped/omitted/failed report with reasons.
 
-## UI And UX
+## Priority 3: Embedding-Space Governance
 
-- Show source preprocessing profile in the UI.
-- Show manifest compatibility warnings before generate/update.
-- Add a validation view that highlights:
-  - baseline-compatible caches
-  - high-context caches
-  - mixed-profile datasets
-- Show export summary fields:
-  - source profile distribution
-  - embedding compatibility state
-  - import manifest version
+- Block reuse when model, normalization, or dimension differs.
+- Provide explicit migration exports rather than silently mixing vector spaces.
+- Run a pinned-query embedding smoke test before large generation jobs.
+- Cache embeddings by content hash plus embedding fingerprint, with clear invalidation.
 
-## Metadata And Export
+## Priority 4: Data Quality Gates
 
-- Extend `podcast.json` and `import_manifest.json` with:
-  - source preprocessing runtime profile
-  - source preprocessing backend
-  - embedding model and dimension
-  - compatibility warnings for chat consumers
-- Keep all new fields optional for readers.
+- Validate hierarchy, speaker, date, and provenance fields before import.
+- Distinguish missing optional metadata from retrieval-breaking violations.
+- Surface speaker/date/node-type coverage, duplicate content, exclusions, and export health.
+- Ensure omitted speakers are absent from both vectors and metadata.
 
-## Testing
+## Priority 5: Tests And Interoperability
 
-- Add fixtures for:
-  - old baseline processed caches
-  - new high-context processed caches
-  - mixed baseline/high-context batches
-- Add tests for:
-  - manifest compatibility warnings
-  - import of old caches with missing new fields
-  - export metadata stability
+- Test generate, update, migration, rollback, and collection validation with synthetic multi-episode fixtures.
+- Verify Podcast Chat scanning and RAGScope provenance reads for generated exports.
 
-## Implementation Phases
+## Sequencing
 
-1. Add profile-aware validation and manifest fields while keeping older caches valid.
-2. Surface source runtime profile and compatibility warnings in CLI and UI.
-3. Extend `podcast.json` and `import_manifest.json` with additive compatibility metadata.
-4. Add mixed-profile test fixtures and import regression coverage.
-5. Add UI summaries for source profile distribution and downstream compatibility.
+1. Publish export/manifest schemas.
+2. Implement source-hash classification and reports.
+3. Add embedding migration safeguards.
+4. Add staging validation.
+5. Expand cross-project contract tests.

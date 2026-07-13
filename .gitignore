@@ -4,7 +4,7 @@ __pycache__/
 .env
 chroma_db_import_config.json
 state/
-chroma_db*/
+/chroma_db*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
