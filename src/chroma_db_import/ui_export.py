@@ -5,13 +5,17 @@ import json
 import shutil
 import time
 import re
+import hashlib
 from pathlib import Path
 from typing import Any
 
 import chroma_db_import.runtime as runtime
 from chroma_db_import.config import ImportConfig
 from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, has_text, sanitize_metadata, summarize_reports, validate_document_items, validate_podcast_metadata
-from chroma_db_import.importer import cache_fingerprint, validate_documents
+from chroma_db_import.importer import cache_fingerprint, validate_documents, document_fingerprints, representation_spec
+from chroma_db_import.providers import create_embedding_provider
+from chroma_db_import.reconciliation import plan_reconciliation, require_delete_confirmation
+from chroma_db_import.representation import embedding_text, recommended_batch_size
 from chroma_db_import.ui_helpers import document_speakers, slugify, safe_folder_name
 from chroma_db_import.ui_models import Episode, ImportPlan, ImportProgress, ImportSummary, ProcessedDocument
 from chroma_db_import.ui_support import resolve_embedding_device
@@ -26,7 +30,6 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     runtime.load_runtime_deps()
     from langchain_chroma import Chroma
     from langchain_core.documents import Document
-    from langchain_huggingface import HuggingFaceEmbeddings
 
     started_at = time.time()
     emit_progress(ImportProgress("Validating selected documents...", 0, 0))
@@ -60,10 +63,14 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
 
     embedding_device = resolve_embedding_device(plan.embedding_device)
     emit_progress(ImportProgress(f"Loading embedding model on {embedding_device}...", 0, 0))
-    embeddings = HuggingFaceEmbeddings(
-        model_name=plan.embedding_model,
-        model_kwargs={"device": embedding_device},
+    provider_config = ImportConfig(
+        embedding_model=plan.embedding_model,
+        embedding_device=plan.embedding_device,
+        contextualization=plan.contextualization,
+        experimental_bge_m3=plan.experimental_bge_m3,
     )
+    spec = representation_spec(provider_config)
+    embeddings, provider_diagnostics = create_embedding_provider(spec, embedding_device)
     emit_progress(ImportProgress("Opening Chroma collection...", 0, 0))
     vectorstore = Chroma(
         embedding_function=embeddings,
@@ -116,11 +123,16 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
 
         selected = select_documents_for_episode(episode, plan.included_speakers_by_episode)
         validate_documents([Document(page_content=doc.page_content, metadata=doc.metadata) for doc in selected], str(episode.path))
-        documents = [
-            Document(page_content=doc.page_content, metadata=sanitize_metadata(doc.metadata))
-            for doc in selected
-            if has_text(doc.page_content)
-        ]
+        documents = []
+        source_cache = str(episode.path.resolve())
+        for doc in selected:
+            if not has_text(doc.page_content):
+                continue
+            item = Document(page_content=doc.page_content, metadata=sanitize_metadata(doc.metadata))
+            fingerprints = document_fingerprints(item, spec)
+            item.metadata.update(fingerprints)
+            item.metadata["import_source_cache"] = source_cache
+            documents.append(item)
         ids = [str(doc.metadata["node_id"]) for doc in selected if has_text(doc.page_content)]
         emit_progress(
             ImportProgress(
@@ -130,15 +142,33 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
             )
         )
 
+        current = {doc_id: {"embedding_fingerprint": doc.metadata["embedding_fingerprint"], "metadata_fingerprint": doc.metadata["metadata_fingerprint"]} for doc, doc_id in zip(documents, ids)}
+        existing = {}
         if mode == "update":
-            existing_ids = existing_vector_ids(vectorstore, ids)
-            pending = [(doc, doc_id) for doc, doc_id in zip(documents, ids) if doc_id not in existing_ids]
-            documents = [doc for doc, _doc_id in pending]
-            ids = [doc_id for _doc, doc_id in pending]
+            payloads = [vectorstore._collection.get(ids=ids, include=["metadatas"])] if ids else []
+            try:
+                payloads.append(vectorstore._collection.get(where={"import_source_cache": source_cache}, include=["metadatas"]))
+            except Exception:
+                pass
+            for payload in payloads:
+                for item_id, metadata in zip(payload.get("ids") or [], payload.get("metadatas") or []):
+                    metadata = metadata or {}
+                    existing[str(item_id)] = {"embedding_fingerprint": str(metadata.get("embedding_fingerprint") or ""), "metadata_fingerprint": str(metadata.get("metadata_fingerprint") or "")}
+        reconciliation = plan_reconciliation(current, existing)
+        emit_progress(ImportProgress(f"Preview {episode.title}: added={len(reconciliation.added)}, changed={len(reconciliation.changed)}, metadata-only={len(reconciliation.metadata_only)}, unchanged={len(reconciliation.unchanged)}, removed={len(reconciliation.removed)}", processed_documents, total_documents_to_import))
+        require_delete_confirmation(reconciliation, plan.allow_delete_missing)
+        by_id = dict(zip(ids, documents))
+        if reconciliation.metadata_only:
+            vectorstore._collection.update(ids=reconciliation.metadata_only, documents=[by_id[item].page_content for item in reconciliation.metadata_only], metadatas=[by_id[item].metadata for item in reconciliation.metadata_only])
+        if reconciliation.removed:
+            vectorstore._collection.delete(ids=reconciliation.removed)
+        ids = reconciliation.added + reconciliation.changed
+        documents = [by_id[item] for item in ids]
 
-        for start in range(0, len(documents), 64):
-            batch_docs = documents[start : start + 64]
-            batch_ids = ids[start : start + 64]
+        batch_size = recommended_batch_size(provider_diagnostics["device"])
+        for start in range(0, len(documents), batch_size):
+            batch_docs = documents[start : start + batch_size]
+            batch_ids = ids[start : start + batch_size]
             if batch_docs:
                 emit_progress(
                     ImportProgress(
@@ -147,7 +177,8 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
                         total_documents_to_import,
                     )
                 )
-                vectorstore.add_documents(batch_docs, ids=batch_ids)
+                vectors = embeddings.embed_documents([embedding_text(doc.page_content, doc.metadata, spec.contextualization) for doc in batch_docs])
+                vectorstore._collection.upsert(ids=batch_ids, documents=[doc.page_content for doc in batch_docs], metadatas=[doc.metadata for doc in batch_docs], embeddings=vectors)
                 inserted += len(batch_docs)
                 processed_documents += len(batch_docs)
                 emit_progress(
@@ -226,7 +257,17 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
         selected_speakers=sorted({speaker for speakers in plan.included_speakers_by_episode.values() for speaker in speakers}),
         compatibility_warnings=metadata_report.warnings,
     )
-    (plan.export_dir / "import_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8")
+    manifest["representation"] = spec.as_dict()
+    manifest["provider_diagnostics"] = provider_diagnostics
+    manifest_path = plan.export_dir / "import_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8")
+    immutable_id = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    profile = "bge-m3-shadow" if plan.experimental_bge_m3 else "baseline"
+    immutable_dir = plan.output_root / "exports" / profile / immutable_id
+    if not immutable_dir.exists():
+        immutable_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(plan.export_dir, immutable_dir)
+        (immutable_dir / "BUILD_IMMUTABLE").write_text(immutable_id + "\n", encoding="ascii")
     return ImportSummary(
         inserted=inserted,
         skipped_episodes=skipped,

@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import time
+import hashlib
+import json
+import shutil
 from pathlib import Path
 
 import chroma_db_import.runtime as runtime
@@ -20,6 +23,8 @@ from chroma_db_import.diagnostics import (
 )
 from chroma_db_import.importer import ChromaImporter, cache_fingerprint, iter_cache_files
 from chroma_db_import.state import load_state, save_state
+from chroma_db_import.importer import representation_spec
+from chroma_db_import.providers import download_model
 
 
 def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
@@ -52,16 +57,18 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
     if config.validation_only:
         print("Validation-only mode complete; no Chroma writes performed.")
         return 0
+    importer = ChromaImporter(config, project_dir)
     if config.dry_run:
-        print("Dry-run mode: no Chroma writes will be performed.")
-        for source in preflight["source_files"]:
+        print("Dry-run reconciliation preview; no Chroma writes will be performed.")
+        for path in files:
+            result = importer.import_cache(path, dry_run=True)
+            counts = result["reconciliation"]
             print(
-                f"  {Path(source['path']).name}: docs={source['document_count']} "
-                f"node_types={source['validation']['counts_by_node_type']}"
+                f"  {path.name}: added={len(counts['added'])}, changed={len(counts['changed'])}, "
+                f"metadata_only={len(counts['metadata_only'])}, unchanged={len(counts['unchanged'])}, "
+                f"removed={len(counts['removed'])}"
             )
         return 0
-
-    importer = ChromaImporter(config, project_dir)
     pending = []
     for path in files:
         fingerprint = cache_fingerprint(path)
@@ -122,6 +129,8 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
         f"docs_per_second={total_inserted / elapsed_total:.2f}"
     )
     print(f"Import manifest written: {manifest_path}")
+    snapshot_path = write_immutable_export(config, project_dir, importer.persist_dir, manifest_path)
+    print(f"Immutable export written: {snapshot_path}")
     print("\nImport complete.")
     return 0
 
@@ -146,6 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-delete-missing", action="store_true", help="After dry-run review, allow update reconciliation to delete missing IDs.")
     parser.add_argument("--contextualization", choices=("none", "minimal", "full"), help="Embedding-only contextual header profile.")
     parser.add_argument("--experimental-bge-m3", action="store_true", help="Build with the pinned experimental BGE-M3 dense provider profile.")
+    parser.add_argument("--download-model", action="store_true", help="Explicitly download the configured embedding model, then exit.")
     return parser.parse_args()
 
 
@@ -176,6 +186,11 @@ def main() -> int:
     if args.experimental_bge_m3:
         config.experimental_bge_m3 = True
 
+    if args.download_model:
+        path = download_model(representation_spec(config))
+        print(f"Model downloaded: {path}")
+        return 0
+
     if args.embedding_benchmark:
         return benchmark_embeddings(config, project_dir)
     if args.diagnostic_bundle:
@@ -189,3 +204,16 @@ def main() -> int:
     if args.delete_collection:
         return delete_collection(config, project_dir)
     return run_import(config, project_dir, args.one_file)
+
+
+def write_immutable_export(config: ImportConfig, project_dir: Path, persist_dir: Path, manifest_path: Path) -> Path:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    profile = "bge-m3-shadow" if config.experimental_bge_m3 else "baseline"
+    target = (project_dir / config.shadow_export_root / profile / identity).resolve()
+    if target.exists():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(persist_dir, target)
+    (target / "BUILD_IMMUTABLE").write_text(identity + "\n", encoding="ascii")
+    return target

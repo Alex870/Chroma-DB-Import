@@ -15,6 +15,7 @@ class ImportConfig:
     embedding_provider: str = "sentence_transformers"
     embedding_model_revision: str = ""
     embedding_device: str = "auto"
+    allow_model_download: bool = False
     normalize_embeddings: bool = True
     distance_metric: str = "cosine"
     contextualization: str = "minimal"
@@ -23,7 +24,7 @@ class ImportConfig:
     experimental_bge_m3: bool = False
     shadow_export_root: str = "exports"
     allow_delete_missing: bool = False
-    import_batch_size: int = 64
+    import_batch_size: int = 0
     chroma_batch_size: int = 64
     skip_existing_ids: bool = True
     stop_file: str = "state/stop_after_current_import.txt"

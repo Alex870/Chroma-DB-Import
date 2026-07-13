@@ -40,8 +40,11 @@ class ImportPlan:
     collection_name: str
     embedding_model: str
     embedding_device: str
-    episodes: list[Episode]
-    included_speakers_by_episode: dict[str, set[str]]
+    contextualization: str = "minimal"
+    experimental_bge_m3: bool = False
+    allow_delete_missing: bool = False
+    episodes: list[Episode] = field(default_factory=list)
+    included_speakers_by_episode: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def export_dir(self) -> Path:

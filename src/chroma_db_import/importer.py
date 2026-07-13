@@ -13,6 +13,9 @@ from chroma_db_import.config import ImportConfig, resolve_path
 from chroma_db_import.contract import content_fingerprint, file_fingerprint, has_text, sanitize_metadata, validate_document_items
 from chroma_db_import.state import write_json
 from chroma_db_import.representation import RepresentationSpec, embedding_fingerprint, embedding_text, metadata_fingerprint
+from chroma_db_import.reconciliation import plan_reconciliation, require_delete_confirmation
+from chroma_db_import.providers import create_embedding_provider
+from chroma_db_import.representation import recommended_batch_size
 
 def cache_fingerprint(path: Path) -> str:
     return file_fingerprint(path)
@@ -121,11 +124,10 @@ class ChromaImporter:
     def __init__(self, config: ImportConfig, project_dir: Path):
         runtime.load_runtime_deps()
         Chroma = runtime.Chroma
-        HuggingFaceEmbeddings = runtime.HuggingFaceEmbeddings
         self.config = config
         self.project_dir = project_dir
         self.spec = representation_spec(config)
-        self.embeddings = HuggingFaceEmbeddings(model_name=self.spec.model_id)
+        self.embeddings, self.provider_diagnostics = create_embedding_provider(self.spec, config.embedding_device)
         self.persist_dir = resolve_path(project_dir, config.persist_dir)
         self.vectorstore = Chroma(
             embedding_function=self.embeddings,
@@ -150,6 +152,30 @@ class ChromaImporter:
                 return set()
             existing.update(payload.get("ids") or [])
         return existing
+
+    def existing_records(self, ids: list[str], source_cache: str) -> dict[str, dict[str, str]]:
+        """Read persisted reconciliation fingerprints for current and removed source records."""
+        records: dict[str, dict[str, str]] = {}
+        payloads = []
+        if ids:
+            payloads.append(self.vectorstore._collection.get(ids=ids, include=["metadatas"]))
+        try:
+            payloads.append(
+                self.vectorstore._collection.get(
+                    where={"import_source_cache": source_cache}, include=["metadatas"]
+                )
+            )
+        except Exception:
+            # Older collections have no source-cache tag; current IDs still reconcile safely.
+            pass
+        for payload in payloads:
+            for item_id, metadata in zip(payload.get("ids") or [], payload.get("metadatas") or []):
+                metadata = metadata or {}
+                records[str(item_id)] = {
+                    "embedding_fingerprint": str(metadata.get("embedding_fingerprint") or ""),
+                    "metadata_fingerprint": str(metadata.get("metadata_fingerprint") or ""),
+                }
+        return records
 
     def batch_state_path(self, cache_path: Path) -> Path:
         return self.import_state_dir / f"{content_fingerprint(cache_path)}.batches.json"
@@ -215,34 +241,55 @@ class ChromaImporter:
         docs = load_processed_documents(cache_path)
         validate_documents(docs, str(cache_path))
         docs = [doc for doc in docs if has_text(doc.page_content) and should_include_document(doc, self.config)]
-        ids = [document_id(doc) for doc in docs]
-        existing = self.existing_ids(ids)
-        pending = [
-            Document(page_content=doc.page_content, metadata=sanitize_metadata(doc.metadata))
-            for doc in docs
-            if document_id(doc) not in existing
-        ]
-        pending_ids = [document_id(doc) for doc in docs if document_id(doc) not in existing]
+        source_cache = str(cache_path.resolve())
+        prepared: dict[str, Document] = {}
+        current: dict[str, dict[str, str]] = {}
+        for doc in docs:
+            item_id = document_id(doc)
+            fingerprints = document_fingerprints(doc, self.spec)
+            metadata = sanitize_metadata(doc.metadata)
+            metadata.update(fingerprints)
+            metadata["import_source_cache"] = source_cache
+            prepared[item_id] = Document(page_content=doc.page_content, metadata=metadata)
+            current[item_id] = fingerprints
+        existing = self.existing_records(list(prepared), source_cache)
+        reconciliation = plan_reconciliation(current, existing)
         summary = summarize_documents_for_plan(docs)
         if dry_run:
             return {
                 "documents": len(docs),
                 "inserted": 0,
-                "skipped_existing": len(existing),
-                "new_ids": pending_ids,
+                "skipped_existing": len(reconciliation.unchanged),
+                "reconciliation": reconciliation.as_dict(),
                 "summary": summary,
                 "dry_run": True,
             }
+
+        require_delete_confirmation(reconciliation, self.config.allow_delete_missing)
+        pending_ids = reconciliation.added + reconciliation.changed
+        pending = [prepared[item_id] for item_id in pending_ids]
+
+        if reconciliation.metadata_only:
+            self.vectorstore._collection.update(
+                ids=reconciliation.metadata_only,
+                documents=[prepared[item_id].page_content for item_id in reconciliation.metadata_only],
+                metadatas=[prepared[item_id].metadata for item_id in reconciliation.metadata_only],
+            )
+        if reconciliation.removed:
+            self.vectorstore._collection.delete(ids=reconciliation.removed)
 
         inserted = 0
         embedding_hits = 0
         batch_state = self.load_batch_state(cache_path)
         completed_batches = set(batch_state.get("completed_batches") or [])
-        batch_size = max(1, int(self.config.import_batch_size or 64))
+        batch_size = max(1, int(self.config.import_batch_size or recommended_batch_size(self.provider_diagnostics["device"])))
         for start in range(0, len(pending), batch_size):
             batch_docs = pending[start : start + batch_size]
             batch_ids = pending_ids[start : start + batch_size]
-            batch_key = hashlib.sha1("|".join(batch_ids).encode("utf-8")).hexdigest()
+            batch_identity = "|".join(
+                f"{item_id}:{current[item_id]['embedding_fingerprint']}" for item_id in batch_ids
+            )
+            batch_key = hashlib.sha1(batch_identity.encode("utf-8")).hexdigest()
             if batch_key in completed_batches:
                 inserted += len(batch_docs)
                 continue
@@ -250,7 +297,7 @@ class ChromaImporter:
                 continue
             embeddings, hits = self.embed_documents_cached(batch_docs)
             embedding_hits += hits
-            self.vectorstore._collection.add(
+            self.vectorstore._collection.upsert(
                 ids=batch_ids,
                 documents=[doc.page_content for doc in batch_docs],
                 metadatas=[doc.metadata for doc in batch_docs],
@@ -265,8 +312,11 @@ class ChromaImporter:
         return {
             "documents": len(docs),
             "inserted": inserted,
-            "skipped_existing": len(existing),
+            "updated_metadata": len(reconciliation.metadata_only),
+            "removed": len(reconciliation.removed),
+            "skipped_existing": len(reconciliation.unchanged),
             "embedding_cache_hits": embedding_hits,
+            "reconciliation": reconciliation.as_dict(),
             "summary": summary,
         }
 

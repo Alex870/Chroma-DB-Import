@@ -285,6 +285,10 @@ class MainWindow(QMainWindow):
         self.collection_name = QLineEdit("whisper_rag_v2")
         self.embedding_model = QLineEdit("BAAI/bge-large-en-v1.5")
         self.embedding_device = QComboBox()
+        self.contextualization = QComboBox()
+        self.contextualization.addItems(["minimal", "full", "none"])
+        self.experimental_bge_m3 = QCheckBox("Use pinned BGE-M3 dense shadow profile")
+        self.mirror_removals = QCheckBox("Mirror records removed from source caches")
         self.gpu_status = QLabel()
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -913,6 +917,9 @@ class MainWindow(QMainWindow):
         message = QLabel(
             "You can select and copy the full message below. Use Copy to Clipboard for the entire text."
         )
+        self.add_info_row(form, "Context header", self.contextualization, "Experimental embedding-only context header. Minimal is the safe default; full adds topic and hierarchy labels.")
+        self.add_info_row(form, "BGE-M3 shadow", self.experimental_bge_m3, "Build with the experimental dense BGE-M3 profile without replacing an existing baseline export.")
+        self.add_info_row(form, "Mirror removals", self.mirror_removals, "Preview and remove only records previously tagged to the same source cache. Confirmation is required on Update.")
         message.setWordWrap(True)
         layout.addWidget(message)
 
@@ -1168,6 +1175,9 @@ class MainWindow(QMainWindow):
             collection_name=self.collection_name.text().strip() or "whisper_rag_v2",
             embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
             embedding_device=self.selected_embedding_device(),
+            contextualization=self.contextualization.currentText(),
+            experimental_bge_m3=self.experimental_bge_m3.isChecked(),
+            allow_delete_missing=self.mirror_removals.isChecked(),
             episodes=self.episodes,
             included_speakers_by_episode=self.included_speakers_by_episode,
         )
@@ -1189,6 +1199,10 @@ class MainWindow(QMainWindow):
     def update(self) -> None:
         plan = self.build_plan()
         if not plan:
+            return
+        if plan.allow_delete_missing and QMessageBox.question(
+            self, "Confirm mirrored removals", "The preview may include records removed from source caches. Allow the update to mirror those deletions?"
+        ) != QMessageBox.Yes:
             return
         self.start_export(plan, "update")
 
