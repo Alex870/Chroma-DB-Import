@@ -13,7 +13,7 @@ class ImportConfig:
     collection_name: str = "whisper_rag_v2"
     embedding_model: str = "BAAI/bge-large-en-v1.5"
     embedding_provider: str = "sentence_transformers"
-    embedding_model_revision: str = ""
+    embedding_model_revision: str = "d4aa6901d3a41ba39fb536a557fa166f842b0e09"
     embedding_device: str = "auto"
     allow_model_download: bool = False
     normalize_embeddings: bool = True

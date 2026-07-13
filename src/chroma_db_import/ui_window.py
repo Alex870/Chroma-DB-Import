@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 
 from chroma_db_import.config import ImportConfig
 from chroma_db_import.contract import validate_podcast_metadata
-from chroma_db_import.ui_export import build_ui_validation_report, select_documents_for_episode, update_should_skip_episode
+from chroma_db_import.ui_export import build_ui_validation_report, preview_ui_reconciliation, select_documents_for_episode, update_should_skip_episode
 from chroma_db_import.ui_export import should_include_document
 from chroma_db_import.ui_helpers import safe_folder_name, slugify
 from chroma_db_import.ui_loader import EpisodeLoader
@@ -1200,9 +1200,29 @@ class MainWindow(QMainWindow):
         plan = self.build_plan()
         if not plan:
             return
-        if plan.allow_delete_missing and QMessageBox.question(
-            self, "Confirm mirrored removals", "The preview may include records removed from source caches. Allow the update to mirror those deletions?"
-        ) != QMessageBox.Yes:
+        try:
+            preview = preview_ui_reconciliation(plan)
+        except Exception as exc:
+            QMessageBox.critical(self, "Update preview failed", f"No changes were made.\n\n{type(exc).__name__}: {exc}")
+            return
+        removed_preview = "\n".join(f"- {item}" for item in preview.removed[:20])
+        if len(preview.removed) > 20:
+            removed_preview += f"\n- ... and {len(preview.removed) - 20} more"
+        message = (
+            f"Added: {len(preview.added)}\nChanged: {len(preview.changed)}\n"
+            f"Metadata only: {len(preview.metadata_only)}\nUnchanged: {len(preview.unchanged)}\n"
+            f"Removed: {len(preview.removed)}"
+        )
+        if preview.removed:
+            message += f"\n\nRecords proposed for removal:\n{removed_preview}"
+            if not plan.allow_delete_missing:
+                QMessageBox.warning(
+                    self,
+                    "Update preview",
+                    message + "\n\nEnable Mirror removals and run Update again to authorize deletion.",
+                )
+                return
+        if QMessageBox.question(self, "Confirm update preview", message + "\n\nApply this update?") != QMessageBox.Yes:
             return
         self.start_export(plan, "update")
 

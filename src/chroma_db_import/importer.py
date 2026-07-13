@@ -15,6 +15,7 @@ from chroma_db_import.state import write_json
 from chroma_db_import.representation import RepresentationSpec, embedding_fingerprint, embedding_text, metadata_fingerprint
 from chroma_db_import.reconciliation import plan_reconciliation, require_delete_confirmation
 from chroma_db_import.providers import create_embedding_provider
+from chroma_db_import.providers import pinned_revision
 from chroma_db_import.representation import recommended_batch_size
 
 def cache_fingerprint(path: Path) -> str:
@@ -57,7 +58,7 @@ def representation_spec(config: ImportConfig, dimension: int | None = None) -> R
     spec = RepresentationSpec(
         provider=config.embedding_provider,
         model_id=model_id,
-        model_revision=config.embedding_model_revision,
+        model_revision=pinned_revision(model_id, "" if config.experimental_bge_m3 else config.embedding_model_revision),
         dimension=dimension,
         normalize_embeddings=config.normalize_embeddings,
         distance_metric=config.distance_metric,

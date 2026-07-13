@@ -14,7 +14,7 @@ from chroma_db_import.config import ImportConfig
 from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, has_text, sanitize_metadata, summarize_reports, validate_document_items, validate_podcast_metadata
 from chroma_db_import.importer import cache_fingerprint, validate_documents, document_fingerprints, representation_spec
 from chroma_db_import.providers import create_embedding_provider
-from chroma_db_import.reconciliation import plan_reconciliation, require_delete_confirmation
+from chroma_db_import.reconciliation import ReconciliationPlan, plan_reconciliation, require_delete_confirmation
 from chroma_db_import.representation import embedding_text, recommended_batch_size
 from chroma_db_import.ui_helpers import document_speakers, slugify, safe_folder_name
 from chroma_db_import.ui_models import Episode, ImportPlan, ImportProgress, ImportSummary, ProcessedDocument
@@ -23,6 +23,54 @@ from chroma_db_import.ui_support import resolve_embedding_device
 ALWAYS_INCLUDE_NODE_TYPES = {"episode_thesis"}
 SUMMARY_NODE_TYPES = {"cluster_summary"}
 TOPIC_INDEX_FILENAME = "topic_index.json"
+
+
+def preview_ui_reconciliation(plan: ImportPlan) -> ReconciliationPlan:
+    """Inspect an existing desktop export without loading or downloading an embedding model."""
+    combined = ReconciliationPlan()
+    config = ImportConfig(
+        embedding_model=plan.embedding_model,
+        contextualization=plan.contextualization,
+        experimental_bge_m3=plan.experimental_bge_m3,
+    )
+    spec = representation_spec(config)
+    collection = None
+    if (plan.export_dir / "chroma.sqlite3").exists():
+        import chromadb
+
+        client = chromadb.PersistentClient(path=str(plan.export_dir))
+        try:
+            collection = client.get_collection(plan.collection_name)
+        except Exception:
+            collection = None
+    for episode in plan.episodes:
+        source_cache = str(episode.path.resolve())
+        selected = [doc for doc in select_documents_for_episode(episode, plan.included_speakers_by_episode) if has_text(doc.page_content)]
+        current = {}
+        for doc in selected:
+            item = DocumentLike(doc.page_content, sanitize_metadata(doc.metadata))
+            current[str(doc.metadata.get("node_id"))] = document_fingerprints(item, spec)
+        existing = {}
+        if collection is not None:
+            payloads = [collection.get(ids=list(current), include=["metadatas"])] if current else []
+            try:
+                payloads.append(collection.get(where={"import_source_cache": source_cache}, include=["metadatas"]))
+            except Exception:
+                pass
+            for payload in payloads:
+                for item_id, metadata in zip(payload.get("ids") or [], payload.get("metadatas") or []):
+                    metadata = metadata or {}
+                    existing[str(item_id)] = {
+                        "embedding_fingerprint": str(metadata.get("embedding_fingerprint") or ""),
+                        "metadata_fingerprint": str(metadata.get("metadata_fingerprint") or ""),
+                    }
+        episode_plan = plan_reconciliation(current, existing)
+        for field_name in ("added", "changed", "metadata_only", "unchanged", "removed"):
+            getattr(combined, field_name).extend(getattr(episode_plan, field_name))
+    for field_name in ("added", "changed", "metadata_only", "unchanged", "removed"):
+        setattr(combined, field_name, sorted(set(getattr(combined, field_name))))
+    return combined
+
 
 def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary:  # type: ignore[no-untyped-def]
     """Create or update a self-contained Chroma export for the selected episodes."""

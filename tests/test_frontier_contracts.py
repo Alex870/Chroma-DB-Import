@@ -3,9 +3,15 @@ import unittest
 from chroma_db_import.contracts import ContractCompatibilityError, require_compatible_contract
 from chroma_db_import.reconciliation import plan_reconciliation, require_delete_confirmation
 from chroma_db_import.representation import RepresentationSpec, contextual_header, embedding_fingerprint
+from chroma_db_import.providers import PINNED_MODEL_REVISIONS, pinned_revision
 
 
 class FrontierContractTests(unittest.TestCase):
+    def test_frontier_embedding_models_use_immutable_revisions(self):
+        for model_id, revision in PINNED_MODEL_REVISIONS.items():
+            self.assertEqual(pinned_revision(model_id), revision)
+            self.assertRegex(revision, r"^[0-9a-f]{40}$")
+
     def test_contract_accepts_new_minor_and_rejects_new_major(self):
         require_compatible_contract("2.9", "2.0", artifact_path="manifest.json", component="Importer")
         with self.assertRaises(ContractCompatibilityError):
