@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import math
 
 import chroma_db_import.runtime as runtime
 from chroma_db_import.representation import RepresentationSpec
@@ -11,6 +12,10 @@ PINNED_MODEL_REVISIONS = {
     "BAAI/bge-large-en-v1.5": "d4aa6901d3a41ba39fb536a557fa166f842b0e09",
     "BAAI/bge-m3": "5617a9f61b028005a4858fdac845db406aefb181",
 }
+
+
+class EmbeddingCompatibilityError(RuntimeError):
+    """Raised when a provider cannot safely read or write the target space."""
 
 
 def pinned_revision(model_id: str, configured: str = "") -> str:
@@ -49,7 +54,42 @@ def create_embedding_provider(spec: RepresentationSpec, requested_device: str) -
             f"Embedding model {spec.model_id!r} at revision {spec.model_revision or 'default'} is not cached. "
             "Use the explicit --download-model action before importing."
         ) from exc
-    return provider, {"provider": spec.provider, "model_id": spec.model_id, "revision": revision, "resolved_revision": revision, "device": device}
+    return provider, {
+        "provider": spec.provider,
+        "model_id": spec.model_id,
+        "revision": revision,
+        "resolved_revision": revision,
+        "device": device,
+        "representation_id": spec.representation_id,
+    }
+
+
+def probe_embedding_provider(
+    provider: Any,
+    *,
+    expected_dimension: int | None = None,
+    probe_text: str = "podcast import pinned embedding probe",
+) -> dict[str, Any]:
+    """Run the deterministic probe used before any staging or promotion."""
+    try:
+        vector = provider.embed_query(probe_text)
+    except Exception as exc:
+        raise EmbeddingCompatibilityError(f"Pinned embedding probe failed: {exc}") from exc
+    if not vector:
+        raise EmbeddingCompatibilityError("Pinned embedding probe returned an empty vector")
+    try:
+        values = [float(value) for value in vector]
+    except (TypeError, ValueError) as exc:
+        raise EmbeddingCompatibilityError("Pinned embedding probe returned non-numeric values") from exc
+    if not all(math.isfinite(value) for value in values):
+        raise EmbeddingCompatibilityError("Pinned embedding probe returned non-finite values")
+    dimension = len(values)
+    if expected_dimension is not None and dimension != expected_dimension:
+        raise EmbeddingCompatibilityError(
+            f"Embedding dimension mismatch: provider={dimension}, target={expected_dimension}. "
+            "Use a new export or an explicit migration path."
+        )
+    return {"probe": probe_text, "dimension": dimension, "finite": True}
 
 
 def download_model(spec: RepresentationSpec, cache_dir: Path | None = None) -> Path:

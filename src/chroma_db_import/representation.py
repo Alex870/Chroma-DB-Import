@@ -8,6 +8,7 @@ from typing import Any
 
 INDEX_SCHEMA_VERSION = "1.0"
 CONTEXT_HEADER_VERSION = "1.0"
+REPRESENTATION_IMPLEMENTATION_VERSION = "stage-04-v1"
 BASELINE_MODEL = "BAAI/bge-large-en-v1.5"
 BGE_M3_MODEL = "BAAI/bge-m3"
 
@@ -25,10 +26,19 @@ class RepresentationSpec:
     output_dimension: int | None = None
     matryoshka_compatible: bool = False
     index_schema_version: str = INDEX_SCHEMA_VERSION
+    pooling: str = "mean"
+    query_document_mode: str = "document"
+    implementation_version: str = REPRESENTATION_IMPLEMENTATION_VERSION
 
     def validate(self) -> None:
         if self.contextualization not in {"none", "minimal", "full"}:
             raise ValueError("contextualization must be none, minimal, or full")
+        if not self.pooling.strip():
+            raise ValueError("pooling must be explicit")
+        if not self.query_document_mode.strip():
+            raise ValueError("query_document_mode must be explicit")
+        if not self.implementation_version.strip():
+            raise ValueError("implementation_version must be explicit")
         if self.output_dimension is not None:
             if not self.matryoshka_compatible:
                 raise ValueError("output_dimension requires a Matryoshka-compatible provider")
@@ -37,11 +47,19 @@ class RepresentationSpec:
 
     def as_dict(self) -> dict[str, Any]:
         self.validate()
-        return asdict(self)
+        payload = asdict(self)
+        payload["representation_id"] = self.representation_id
+        return payload
 
     def fingerprint(self) -> str:
-        payload = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
+        self.validate()
+        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @property
+    def representation_id(self) -> str:
+        """Stable identity for the complete embedding/index space."""
+        return self.fingerprint()
 
 
 def contextual_header(metadata: dict[str, Any], profile: str = "minimal") -> str:
@@ -83,6 +101,11 @@ def embedding_fingerprint(page_content: str, metadata: dict[str, Any], spec: Rep
     return stable_fingerprint({"representation": spec.fingerprint(), "text": embedding_text(page_content, metadata, spec.contextualization)})
 
 
+def embedding_content_hash(page_content: str, metadata: dict[str, Any], spec: RepresentationSpec) -> str:
+    """Hash the exact text presented to the embedding provider."""
+    return stable_fingerprint({"text": embedding_text(page_content, metadata, spec.contextualization)})
+
+
 def metadata_fingerprint(metadata: dict[str, Any]) -> str:
     return stable_fingerprint(metadata)
 
@@ -95,4 +118,3 @@ def recommended_batch_size(device: str, available_memory_bytes: int | None = Non
     if available_memory_bytes and available_memory_bytes < 4 * 1024**3:
         return 8
     return 16
-

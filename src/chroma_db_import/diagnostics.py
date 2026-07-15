@@ -134,6 +134,9 @@ def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImpo
         collection_name=config.collection_name,
         selected_speakers=sorted(selected_speaker_set(config)),
         compatibility_warnings=preflight.get("safety_warnings") or [],
+        representation={**importer.spec.as_dict(), "representation_id": importer.spec.representation_id},
+        operation={"mode": "reconcile" if config.reconcile else "update" if config.update else "import"},
+        embedding_cache=getattr(importer, "last_cache_stats", {}),
     )
     manifest["index_schema_version"] = INDEX_SCHEMA_VERSION
     manifest["representation"] = importer.spec.as_dict()

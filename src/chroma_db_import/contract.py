@@ -265,6 +265,11 @@ def build_import_manifest(
     collection_name: str,
     selected_speakers: list[str] | None = None,
     compatibility_warnings: list[str] | None = None,
+    representation: dict[str, Any] | None = None,
+    operation: dict[str, Any] | None = None,
+    staging: dict[str, Any] | None = None,
+    reconciliation: dict[str, Any] | None = None,
+    embedding_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary = summarize_reports(validation_results)
     return {
@@ -283,6 +288,12 @@ def build_import_manifest(
             "files": [report.as_dict() for report in validation_results],
         },
         "compatibility_warnings": compatibility_warnings or [],
+        "representation": representation or {},
+        "representation_id": (representation or {}).get("representation_id") or "",
+        "operation": operation or {},
+        "staging": staging or {},
+        "reconciliation": reconciliation or {},
+        "embedding_cache": embedding_cache or {},
     }
 
 

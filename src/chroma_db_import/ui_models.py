@@ -26,6 +26,8 @@ class Episode:
     documents: list[ProcessedDocument]
     speakers: list[str]
     node_counts: dict[str, int]
+    source_content_fingerprint: str = ""
+    schema_version: str = ""
 
     @property
     def sort_key(self) -> tuple[str, str]:
@@ -43,6 +45,7 @@ class ImportPlan:
     contextualization: str = "minimal"
     experimental_bge_m3: bool = False
     allow_delete_missing: bool = False
+    reconcile: bool = False
     episodes: list[Episode] = field(default_factory=list)
     included_speakers_by_episode: dict[str, set[str]] = field(default_factory=dict)
 
@@ -65,3 +68,4 @@ class ImportSummary:
     skipped_documents: int = 0
     elapsed_seconds: float = 0.0
     warnings: list[str] = field(default_factory=list)
+    operation_report: dict[str, Any] = field(default_factory=dict)

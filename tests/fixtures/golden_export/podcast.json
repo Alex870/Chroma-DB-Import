@@ -1,0 +1,23 @@
+{
+  "podcast_name": "Golden Fixture Podcast",
+  "database_id": "golden-fixture",
+  "collection_name": "golden_fixture",
+  "embedding_model": "BAAI/bge-large-en-v1.5",
+  "representation_id": "golden-representation-v1",
+  "embedding_dimension": 4,
+  "episode_count": 1,
+  "chunk_count": 1,
+  "speakers": [{"id": "host", "name": "Host"}],
+  "episodes": [{
+    "source_file": "episode-001.processed_documents.json",
+    "source_fingerprint": "golden-path-fingerprint",
+    "source_content_fingerprint": "golden-content-v1",
+    "source_identity": "golden-source-identity-v1",
+    "schema_version": "2.0",
+    "episode_id": "episode-001",
+    "episode_title": "Golden Episode",
+    "episode_date": "2026-01-01",
+    "document_count": 1,
+    "speakers": [{"id": "host", "name": "Host"}]
+  }]
+}

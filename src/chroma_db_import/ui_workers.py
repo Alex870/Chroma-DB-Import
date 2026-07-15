@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import datetime as dt
+import json
 
 from PySide6.QtCore import QObject, Signal
-from chroma_db_import.ui_export import export_chroma
+from chroma_db_import.ui_export import export_chroma, preview_ui_import_plan
 from chroma_db_import.ui_models import ImportPlan, ImportProgress
 from chroma_db_import.ui_support import TORCH_CUDA_INDEX_URL
+from chroma_db_import.staging import operation_id
 
 class ChromaExportWorker(QObject):
     progress = Signal(object)
@@ -20,9 +23,24 @@ class ChromaExportWorker(QObject):
 
     def run(self) -> None:
         try:
+            preview = preview_ui_import_plan(self.plan, self.mode)
+            self.progress.emit(ImportProgress(
+                f"Plan: {preview['source_episodes']} source episode(s), {preview['eligible_records']} eligible record(s); "
+                f"invalid={preview['invalid_records']}; embedding={preview['embedding']['compatibility']}; staging={preview['staging_destination']}", 0, 0
+            ))
             self.progress.emit(ImportProgress(f"Preparing {self.mode} export...", 0, 0))
             summary = export_chroma(self.plan, self.mode, self.progress.emit)
         except Exception as exc:
+            report_dir = self.plan.output_root / "state" / "import_reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_path = report_dir / f"{operation_id('ui-failed')}.json"
+            report_path.write_text(json.dumps({
+                "status": "failed",
+                "failed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "mode": self.mode,
+                "export_dir": str(self.plan.export_dir),
+                "error": f"{type(exc).__name__}: {exc}",
+            }, indent=2), encoding="utf-8")
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
         self.finished.emit(summary)

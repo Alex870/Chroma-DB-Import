@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 
 from chroma_db_import.config import ImportConfig
 from chroma_db_import.contract import validate_podcast_metadata
-from chroma_db_import.ui_export import build_ui_validation_report, preview_ui_reconciliation, select_documents_for_episode, update_should_skip_episode
+from chroma_db_import.ui_export import build_ui_validation_report, preview_ui_import_plan, preview_ui_reconciliation, select_documents_for_episode, update_should_skip_episode
 from chroma_db_import.ui_export import should_include_document
 from chroma_db_import.ui_helpers import safe_folder_name, slugify
 from chroma_db_import.ui_loader import EpisodeLoader
@@ -347,6 +347,14 @@ class MainWindow(QMainWindow):
         self.update_action.triggered.connect(self.update)
         toolbar.addAction(self.update_action)
 
+        self.reconcile_action = QAction("Reconcile", self)
+        self.set_action_help(
+            self.reconcile_action,
+            "Preview and explicitly remove records no longer eligible because source episodes or speaker selection changed.",
+        )
+        self.reconcile_action.triggered.connect(self.reconcile)
+        toolbar.addAction(self.reconcile_action)
+
         dry_run_action = QAction("Dry Run", self)
         self.set_action_help(
             dry_run_action,
@@ -499,6 +507,9 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(
             f"Loaded {len(self.episodes)} processed episode file(s) from {self.processed_data_dir}."
         )
+        if hasattr(self, "reconcile_action"):
+            self.reconcile_action.setEnabled(enabled)
+            self.reconcile_action.setToolTip("Explicitly reconcile removals after a review. " + detail)
 
     def choose_output_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose output folder")
@@ -1178,6 +1189,7 @@ class MainWindow(QMainWindow):
             contextualization=self.contextualization.currentText(),
             experimental_bge_m3=self.experimental_bge_m3.isChecked(),
             allow_delete_missing=self.mirror_removals.isChecked(),
+            reconcile=self.mirror_removals.isChecked(),
             episodes=self.episodes,
             included_speakers_by_episode=self.included_speakers_by_episode,
         )
@@ -1219,28 +1231,55 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Update preview",
-                    message + "\n\nEnable Mirror removals and run Update again to authorize deletion.",
+                    message + "\n\nThese records will be retained by the default update. Enable Mirror removals and run Update again only to reconcile them away.",
                 )
-                return
         if QMessageBox.question(self, "Confirm update preview", message + "\n\nApply this update?") != QMessageBox.Yes:
             return
         self.start_export(plan, "update")
+
+    def reconcile(self) -> None:
+        plan = self.build_plan()
+        if not plan:
+            return
+        plan.allow_delete_missing = True
+        plan.reconcile = True
+        try:
+            preview = preview_ui_import_plan(plan, "reconcile")
+        except Exception as exc:
+            QMessageBox.critical(self, "Reconcile preview failed", f"No changes were made.\n\n{type(exc).__name__}: {exc}")
+            return
+        reconciliation = preview["reconciliation"]
+        message = (
+            f"Added: {len(reconciliation['added'])}\n"
+            f"Changed: {len(reconciliation['changed'])}\n"
+            f"Unchanged: {len(reconciliation['unchanged'])}\n"
+            f"Delete: {len(reconciliation['removed'])}\n"
+            f"Embedding: {preview['embedding']['compatibility']}\n"
+            f"Staging: {preview['staging_destination']}\n\n"
+            "Apply this destructive reconciliation?"
+        )
+        if QMessageBox.question(self, "Confirm reconciliation", message) != QMessageBox.Yes:
+            return
+        self.start_export(plan, "reconcile")
 
     def dry_run(self) -> None:
         plan = self.build_plan()
         if not plan:
             return
-        report = build_ui_validation_report(plan)
-        summary = report["summary"]
+        report = preview_ui_import_plan(plan, "update")
+        summary = report["validation"]["summary"]
         QMessageBox.information(
             self,
             "Dry Run Summary",
             "\n".join(
                 [
-                    f"Documents selected: {summary['document_count']}",
-                    f"Node types: {summary['counts_by_node_type']}",
-                    f"Speakers: {summary['counts_by_speaker']}",
-                    f"Episodes: {len(summary['counts_by_episode'])}",
+                    f"Eligible records: {report['eligible_records']}",
+                    f"Source episodes: {report['source_episodes']}",
+                    f"Invalid records: {report['invalid_records']}",
+                    f"Validation: {'PASS' if report['validation']['valid'] else 'FAIL'}",
+                    f"Added / changed / unchanged / removed: {len(report['reconciliation']['added'])} / {len(report['reconciliation']['changed'])} / {len(report['reconciliation']['unchanged'])} / {len(report['reconciliation']['removed'])}",
+                    f"Embedding: {report['embedding']['compatibility']} ({report['embedding']['identity'][:12]})",
+                    f"Staging: {report['staging_destination']}",
                     f"Date range: {summary.get('date_min') or 'unknown'} to {summary.get('date_max') or 'unknown'}",
                     f"Errors: {summary['error_count']}",
                     f"Warnings: {summary['warning_count']}",

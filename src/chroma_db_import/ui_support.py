@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QApplication, QWidget
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QApplication, QWidget
 from chroma_db_import.ui_models import DeviceOption
 
 TORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
@@ -90,7 +93,7 @@ def resolve_embedding_device(value: str) -> str:
             return option.value
     return "cpu"
 
-def is_descendant_of(widget: QWidget, ancestor: QWidget) -> bool:
+def is_descendant_of(widget: "QWidget", ancestor: "QWidget") -> bool:
     parent = widget.parent()
     while parent is not None:
         if parent is ancestor:
@@ -98,7 +101,7 @@ def is_descendant_of(widget: QWidget, ancestor: QWidget) -> bool:
         parent = parent.parent()
     return False
 
-def apply_dark_theme(app: QApplication) -> None:
+def apply_dark_theme(app: "QApplication") -> None:
     app.setStyleSheet(
         """
         QWidget {

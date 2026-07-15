@@ -153,6 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inspect-collection", action="store_true", help="Inspect the configured Chroma collection.")
     parser.add_argument("--delete-collection", action="store_true", help="Delete the configured Chroma collection.")
     parser.add_argument("--allow-delete-missing", action="store_true", help="After dry-run review, allow update reconciliation to delete missing IDs.")
+    parser.add_argument("--reconcile", action="store_true", help="Enable explicit destructive reconciliation after reviewing the preview.")
     parser.add_argument("--contextualization", choices=("none", "minimal", "full"), help="Embedding-only contextual header profile.")
     parser.add_argument("--experimental-bge-m3", action="store_true", help="Build with the pinned experimental BGE-M3 dense provider profile.")
     parser.add_argument("--download-model", action="store_true", help="Explicitly download the configured embedding model, then exit.")
@@ -181,6 +182,8 @@ def main() -> int:
         config.update = True
     if args.allow_delete_missing:
         config.allow_delete_missing = True
+    if args.reconcile:
+        config.reconcile = True
     if args.contextualization:
         config.contextualization = args.contextualization
     if args.experimental_bge_m3:

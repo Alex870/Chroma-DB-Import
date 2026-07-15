@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from chroma_db_import.contract import content_fingerprint
 from chroma_db_import.importer import cache_fingerprint
 from chroma_db_import.ui_helpers import document_speakers, first_present
 from chroma_db_import.ui_models import Episode, ProcessedDocument
@@ -49,4 +50,6 @@ class EpisodeLoader:
             documents=documents,
             speakers=speakers,
             node_counts=node_counts,
+            source_content_fingerprint=content_fingerprint(path),
+            schema_version=str(payload.get("schema_version") or ""),
         )

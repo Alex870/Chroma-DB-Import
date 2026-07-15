@@ -24,6 +24,8 @@ class ImportConfig:
     experimental_bge_m3: bool = False
     shadow_export_root: str = "exports"
     allow_delete_missing: bool = False
+    reconcile: bool = False
+    staging_collection_prefix: str = "__stage04__"
     import_batch_size: int = 0
     chroma_batch_size: int = 64
     skip_existing_ids: bool = True

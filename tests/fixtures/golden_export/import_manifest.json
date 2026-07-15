@@ -1,0 +1,40 @@
+{
+  "manifest_version": "2.0",
+  "importer_version": "0.3.0",
+  "collection_name": "golden_fixture",
+  "embedding_model": "BAAI/bge-large-en-v1.5",
+  "embedding_dimension": 4,
+  "representation_id": "golden-representation-v1",
+  "representation": {
+    "provider": "sentence_transformers",
+    "model_id": "BAAI/bge-large-en-v1.5",
+    "model_revision": "d4aa6901d3a41ba39fb536a557fa166f842b0e09",
+    "dimension": 4,
+    "normalize_embeddings": true,
+    "distance_metric": "cosine",
+    "contextualization": "minimal",
+    "context_header_version": "1.0",
+    "output_dimension": null,
+    "matryoshka_compatible": false,
+    "index_schema_version": "1.0",
+    "pooling": "mean",
+    "query_document_mode": "document",
+    "implementation_version": "stage-04-v1",
+    "representation_id": "golden-representation-v1"
+  },
+  "source_files": [
+    {
+      "path": "episode-001.processed_documents.json",
+      "source_identity": "golden-source-identity-v1",
+      "content_fingerprint": "golden-content-v1",
+      "schema_version": "2.0",
+      "document_count": 1
+    }
+  ],
+  "document_counts": {"document_count": 1, "error_count": 0, "warning_count": 0},
+  "validation": {"valid": true, "files": []},
+  "operation": {"mode": "generate", "status": "promoted"},
+  "staging": {"valid": true, "dimension": 4, "smoke_query_ids": ["node-001"]},
+  "reconciliation": {"added": ["node-001"], "changed": [], "unchanged": [], "removed": []},
+  "embedding_cache": {"hits": 0, "misses": 1, "invalidations": 0, "cache_size": 1}
+}
