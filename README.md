@@ -17,6 +17,8 @@ The desktop UI is the primary workflow. A headless CLI path still exists for aut
 - `tests/`: focused unit coverage for contract checks and update-import behavior
 - `chroma_db_import_ui.py`: compatibility entry point for legacy UI commands
 
+The direct Python dependencies are exact-pinned in `chroma_db_import_requirements.txt`. Use `scripts/Test-ChromaDbImportEnvironment.ps1` for the clean-machine CUDA/CPU, config, staging-recovery, and output-contract diagnostics before launching the UI.
+
 ## Architecture
 
 - `contract.py`: shared schema and compatibility checks for processed documents, manifests, and `podcast.json`
