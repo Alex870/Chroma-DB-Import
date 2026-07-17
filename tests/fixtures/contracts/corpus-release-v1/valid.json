@@ -1,0 +1,11 @@
+{
+  "applied_delta_ids":["delta_cd4243705ab6f5d00d428f498b61c0837a7e3091980bbc024637244f5c7a5f8f"],
+  "contract_version":"corpus-release-v1","embedding_identity":{"dimensions":8,"model":"synthetic-v1","provider":"local"},
+  "legacy_reduced_evaluability":false,"parent_release_id":"release-baseline",
+  "plan_id":"release_plan_14d7a053a059b2a10cc22bb690040c940cb805ed8fe170aff1ac0e10ebef247e",
+  "producer":{"contract_version":"1","name":"chroma-db-import"},
+  "release_id":"release_a2d93846471b014d648ae859cf26762b3403bbb1973521fb04813545b7d74fc7",
+  "representation_fingerprint":"page-content-v1","retention_state":"planned","rollback_release_id":"release-baseline",
+  "selection_fingerprint":"selection-v1","separate_release_required":false,"smoke_tests":[],"source_cache_ids":["cache-old"],
+  "storage":{},"timings_ms":{},"validation":{"delta_counts_reconciled":true},"vector_operations":{"add":0,"remove_advisory":0,"update":1}
+}
