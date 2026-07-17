@@ -1,58 +1,72 @@
 # Roadmap
 
-`Chroma DB Import` is the contract boundary between processed podcast artifacts and self-contained Chroma exports. The roadmap prioritizes repeatability, vector-space integrity, and traceability over source-runtime labels.
+Updated: 2026-07-17
 
-## Principles
+`Chroma DB Import` is the transactional corpus-release boundary between processed podcast artifacts and self-contained vector exports. Versioned manifests, hash-driven classification, embedding governance, staging validation, reconciliation, rollback evidence, and downstream contract fixtures are implemented. The next work makes corpus updates routine, observable, and scalable.
 
-- Make imports deterministic, inspectable, and safe to resume.
-- Keep old valid caches readable while making metadata additive and versioned.
-- Never mix incompatible embedding spaces in one collection.
-- Treat `podcast.json` and import manifests as downstream contracts.
-- Explain exactly what an update inserted, skipped, replaced, or removed.
+## Product Direction
+
+- Treat every promoted export as an immutable, identifiable corpus release.
+- Apply the smallest safe delta while preserving rollback and historical evidence.
+- Never mix incompatible embedding spaces or representation identities.
+- Make every inserted, updated, retained, omitted, and removed vector explainable.
+- Keep exports self-contained and readable by Chat and RAGScope without importer internals.
 
 ## Current Foundation
 
-- PySide import UI, episode/speaker selection, rebuild/update modes, metadata generation, CUDA diagnostics, and incremental-import tests.
+- Generate/update/reconcile workflows with episode and speaker selection.
+- Source/content identity classification and exact embedding cache keys.
+- Complete embedding fingerprints, pinned provider probes, and mismatch refusal.
+- Temporary staging, dimension/finite/evidence validation, smoke queries, promotion, and failure reports.
+- Default-retain deletion semantics with explicit reconcile mode and reasons.
+- Versioned `podcast.json` and import manifest consumed by Chat and RAGScope fixtures.
+- Clean-machine dependency pins, diagnostics, and UI progress reporting.
 
-## Priority 1: Export Contract And Provenance
+## Value-Ordered Priorities
 
-- Define versioned schemas for `podcast.json` and `import_manifest.json`.
-- Record collection name, Chroma version, embedding model/fingerprint/dimension, selected speakers, source-cache IDs, counts, and timestamp.
-- Keep document-level provenance back to processed node IDs, episode, speaker, timestamps, and source text hash.
-- Preserve optional source-model metadata as provenance, not a compatibility requirement.
-- Share fixtures with Podcast Chat and RAGScope.
+### 1. Introduce corpus releases and delta ingestion
 
-## Priority 2: Safe Incremental Import
+- Consume Podcast-RAG delta manifests directly instead of rediscovering every change from directory state.
+- Assign a corpus release ID spanning source caches, representation, embedding fingerprint, selection, and parent release.
+- Preview the exact vector and metadata delta before work begins.
+- Promote atomically, retain a bounded rollback generation, and verify Chat/RAGScope readiness after promotion.
+- Emit stale-evidence and judgment-impact information for RAGScope.
 
-- Use content hashes to classify source episodes as new, changed, unchanged, or deleted.
-- Update when newly selected speakers add eligible nodes, even if an episode was previously imported.
-- Retain historical vectors by default; make deletion a deliberate reconcile mode.
-- Validate in a staging collection or recoverable transaction boundary before promotion.
-- Emit a machine-readable inserted/updated/skipped/omitted/failed report with reasons.
+### 2. Automate export health and recovery
 
-## Priority 3: Embedding-Space Governance
+- Add preflight estimates for document count, embedding work, cache reuse, disk space, and expected duration.
+- Add resumable background jobs, cancellation checkpoints, and recovery from interrupted staging/promotion.
+- Provide backup/restore, retention, and manifest migration commands.
+- Produce one actionable health summary covering metadata, hierarchy, duplicates, exclusions, smoke queries, and rollback state.
 
-- Block reuse when model, normalization, or dimension differs.
-- Provide explicit migration exports rather than silently mixing vector spaces.
-- Run a pinned-query embedding smoke test before large generation jobs.
-- Cache embeddings by content hash plus embedding fingerprint, with clear invalidation.
+### 3. Support measured retrieval representations
 
-## Priority 4: Data Quality Gates
+- Import/select dense representation IDs explicitly and preserve lexical fields for hybrid retrievers.
+- Add side-by-side migration plans for new embedding spaces rather than in-place replacement.
+- Benchmark batching, embedding cache layout, and collection write sizes on representative corpora.
+- Support optional auxiliary indexes only after RAGScope shows a judged retrieval gap.
 
-- Validate hierarchy, speaker, date, and provenance fields before import.
-- Distinguish missing optional metadata from retrieval-breaking violations.
-- Surface speaker/date/node-type coverage, duplicate content, exclusions, and export health.
-- Ensure omitted speakers are absent from both vectors and metadata.
+### 4. Improve selection and reconciliation UX
 
-## Priority 5: Tests And Interoperability
+- Show why an episode/speaker is new, changed, unchanged, newly eligible, stale, or excluded.
+- Add diff views for source identity, representation, selection, and expected downstream effects.
+- Require confirmation for destructive reconcile operations and export a rollback plan first.
+- Make headless plans and UI plans use the same validated core.
 
-- Test generate, update, migration, rollback, and collection validation with synthetic multi-episode fixtures.
-- Verify Podcast Chat scanning and RAGScope provenance reads for generated exports.
+### 5. Harden interoperability and packaging
+
+- Run generated-export smoke checks through Chat scanning and RAGScope provenance APIs in the release path.
+- Add large-corpus and low-disk target-machine tests.
+- Document portable export layout, migration compatibility, and safe deletion boundaries.
+- Package only after cache-free Windows and rollback drills pass.
 
 ## Sequencing
 
-1. Publish export/manifest schemas.
-2. Implement source-hash classification and reports.
-3. Add embedding migration safeguards.
-4. Add staging validation.
-5. Expand cross-project contract tests.
+1. Adopt processed-cache delta manifests and corpus release identity.
+2. Add preview, resumability, rollback generations, and post-promotion consumer checks.
+3. Establish operational health, backup/restore, and migration workflows.
+4. Run scale/performance tuning on representative releases.
+5. Add new representation/index support only from measured retrieval needs.
+6. Complete destructive-operation UX and target-machine packaging validation.
+
+The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
