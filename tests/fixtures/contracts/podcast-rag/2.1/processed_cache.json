@@ -1,0 +1,8 @@
+{
+  "schema_version": "2.1",
+  "source_fingerprint": "fixture-source",
+  "documents": [
+    {"page_content": "Speaker A describes the policy.", "embedding_text": "Episode: Fixture Episode\nSpeaker: Speaker A\n\nSpeaker A describes the policy.", "lexical_text": "Speaker A describes the policy Fixture Episode", "metadata": {"node_id": "leaf_1", "node_type": "leaf_chunk", "level": "leaf", "source": "fixture.json", "episode_id": "episode-1", "episode_title": "Fixture Episode", "episode_date": "2026-01-01", "speaker": "Speaker A", "source_segment_ids": ["episode-1:segment:0"]}},
+    {"page_content": "The episode discusses the policy.", "embedding_text": "Episode: Fixture Episode\n\nThe episode discusses the policy.", "lexical_text": "The episode discusses the policy Fixture Episode", "metadata": {"node_id": "thesis_1", "node_type": "episode_thesis", "level": "episode", "source": "fixture.json", "episode_id": "episode-1", "episode_title": "Fixture Episode", "episode_date": "2026-01-01", "child_ids": ["leaf_1"]}}
+  ]
+}
