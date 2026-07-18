@@ -70,3 +70,6 @@ Updated: 2026-07-17
 6. Complete destructive-operation UX and target-machine packaging validation.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
+## Phases 0–2 implementation status (2026-07-17)
+
+Processed-delta consumption and the approved staged corpus-release lifecycle, retention, promotion, and rollback are implemented. Real release acceptance awaits the approved private evaluation pack.
