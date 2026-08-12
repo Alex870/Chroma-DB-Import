@@ -33,8 +33,12 @@ def _id(value: Mapping[str, Any], prefix: str) -> str:
 def export_fingerprint(export_dir: str | Path) -> str:
     root = Path(export_dir).resolve()
     digest = hashlib.sha256()
-    for name in ("podcast.json", "import_manifest.json", "chroma.sqlite3"):
-        path = root / name
+    for required in ("podcast.json", "import_manifest.json", "chroma.sqlite3"):
+        if not (root / required).is_file():
+            raise ReleaseError(f"export is missing required file: {required}")
+    files=sorted((path for path in root.rglob("*") if path.is_file()),key=lambda path:path.relative_to(root).as_posix())
+    for path in files:
+        name=path.relative_to(root).as_posix()
         if not path.is_file():
             raise ReleaseError(f"export is missing required file: {name}")
         digest.update(name.encode("utf-8"))
@@ -95,7 +99,8 @@ def plan_release(delta: Mapping[str, Any], *, parent_release_id: str | None,
                  active_embedding: Mapping[str, Any] | None, requested_embedding: Mapping[str, Any],
                  selection_fingerprint: str, source_cache_ids: list[str] | None = None,
                  removal_mode: str = "retain_advisory", export_bundle_fingerprint: str = "",
-                 vector_representation_id: str = "", export_work: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                 vector_representation_id: str = "", export_work: Mapping[str, Any] | None = None,
+                 lexical_corpus: str | Path | None = None) -> dict[str, Any]:
     if removal_mode not in {"retain_advisory", "reconcile_approved"}:
         raise ReleaseError("invalid removal mode")
     if delta.get("contract_version") != "processed-delta-v1" or not delta.get("delta_id"):
@@ -135,6 +140,12 @@ def plan_release(delta: Mapping[str, Any], *, parent_release_id: str | None,
         "legacy_reduced_evaluability": False,
         "validation": {"delta_counts_reconciled": True},
     }
+    if lexical_corpus:
+        from .lexical_index import inspect_corpus
+        evidence=inspect_corpus(lexical_corpus)
+        plan["retrieval_channels"]=[{"type":"lexical","contract_version":"lexical-index-v1","relative_location":"lexical-index.json",**evidence}]
+    else:
+        plan["retrieval_channels"]=[]
     plan["release_id"] = _id(plan, "release")
     plan["plan_id"] = _id({"release": plan, "action": "stage_and_promote"}, "release_plan")
     validate_release(plan)
@@ -203,7 +214,7 @@ class ReleaseStore:
         (destination / "payload.json").write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         return destination
 
-    def stage_export(self, plan: Mapping[str, Any], export_dir: str | Path, *, cancel: bool = False) -> Path:
+    def stage_export(self, plan: Mapping[str, Any], export_dir: str | Path, *, cancel: bool = False, lexical_corpus: str | Path | None = None) -> Path:
         validate_release(plan)
         source = Path(export_dir).resolve()
         destination = self.staging / str(plan["release_id"])
@@ -273,6 +284,24 @@ class ReleaseStore:
         (export_target / "import_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         (destination / "release.json").write_text(json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         (export_target / "release.json").write_text(json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        channels=list(plan.get("retrieval_channels") or [])
+        if channels:
+            if len(channels)!=1 or channels[0].get("type")!="lexical" or not lexical_corpus:
+                raise ReleaseError("release plan requires its lexical representation corpus during staging")
+            from .lexical_index import build_sidecar, validate_sidecar
+            sidecar=build_sidecar(lexical_corpus,export_target/channels[0]["relative_location"],parent_release_id=release_id)
+            validate_sidecar(sidecar,release_id=release_id,expected=channels[0])
+            try:
+                import chromadb
+                client=chromadb.PersistentClient(path=str(export_target)); collection=client.get_collection(str(podcast["collection_name"])); dense_ids=sorted(map(str,collection.get(include=[]).get("ids") or [])); client._system.stop(); chromadb.api.client.SharedSystemClient.clear_system_cache()
+            except Exception as exc:
+                raise ReleaseError(f"could not validate lexical alignment against staged Chroma: {exc}") from exc
+            if dense_ids!=sorted(sidecar["ordered_document_ids"]):
+                raise ReleaseError("lexical sidecar document IDs do not exactly align with staged dense collection")
+            manifest["retrieval_channels"]=[{**channels[0],"channel_id":sidecar["channel_id"],"checksum":sidecar["checksum"]}]
+            podcast["retrieval_channels"]=manifest["retrieval_channels"]
+            (export_target / "podcast.json").write_text(json.dumps(podcast, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            (export_target / "import_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         (destination / "staging-validation.json").write_text(json.dumps({
             "release_id": release_id,
             "export_bundle_fingerprint": expected_export_fingerprint,

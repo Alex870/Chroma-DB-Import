@@ -79,7 +79,7 @@ class ReleaseJobStore:
 
 
 def plan_job(plan: Mapping[str, Any], export_dir: str | Path, release_store: str | Path,
-             job_store: ReleaseJobStore, *, reserve_factor: float = 2.1) -> dict[str, Any]:
+             job_store: ReleaseJobStore, *, reserve_factor: float = 2.1, lexical_corpus: str | Path | None = None) -> dict[str, Any]:
     validate_release(plan)
     source = Path(export_dir).resolve()
     required = max(1, int(sum(p.stat().st_size for p in source.rglob("*") if p.is_file()) * reserve_factor))
@@ -91,6 +91,7 @@ def plan_job(plan: Mapping[str, Any], export_dir: str | Path, release_store: str
         "contract_version": "corpus-release-job-v1", "job_id": job_id, "status": "planned",
         "cancel_requested": False, "release_store": str(Path(release_store).resolve()),
         "export_dir": str(source), "export_fingerprint": export_fingerprint(source), "plan": dict(plan),
+        "lexical_corpus": str(Path(lexical_corpus).resolve()) if lexical_corpus else None,
         "preflight": {"required_bytes": required, "available_bytes": available, "reserve_factor": reserve_factor},
         "checkpoints": {"staging": False, "validation": False, "promotion": False, "consumer_checks": False},
         "created_at_epoch_ms": int(time.time() * 1000),
@@ -112,7 +113,7 @@ def run_job(job_store: ReleaseJobStore, job_id: str, *, approved_plan_id: str) -
     store = ReleaseStore(job["release_store"])
     try:
         if not job["checkpoints"]["staging"]:
-            store.stage_export(plan, job["export_dir"])
+            store.stage_export(plan, job["export_dir"], lexical_corpus=job.get("lexical_corpus"))
             job["checkpoints"]["staging"] = True
             job["status"] = "staged"
             job_store.save(job)

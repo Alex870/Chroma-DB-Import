@@ -1,0 +1,16 @@
+{
+  "build_diagnostics": {"total_terms": 2, "unique_terms": 2},
+  "channel_id": "lexical-fixture",
+  "checksum": "59ee6a4850dc54d4ff22c6099352a698a0150be4bab57f7c547966273b67f703",
+  "contract_version": "lexical-index-v1",
+  "document_count": 1,
+  "document_ids_hash": "fixture-ids",
+  "documents": [{"document_id": "doc-1", "filters": {"episode_date": "2026-01-17", "episode_sort_key": 20260117, "node_type": "leaf_chunk", "speaker": "Host", "speakers": []}, "length": 2, "source_hash": "fixture-source", "terms": {"amara": 1, "tfm": 1}}],
+  "field_weights": {"lexical_text": 1.0},
+  "implementation": {"id": "podcast-bm25-v1", "version": "1.0"},
+  "ordered_document_ids": ["doc-1"],
+  "parent_corpus_release_id": "release-fixture",
+  "representation_id": "normalized-lexical-v1",
+  "source_corpus_hash": "fixture-corpus",
+  "tokenizer": {"id": "unicode-word-casefold-v1", "lowercase": true}
+}

@@ -1,0 +1,22 @@
+name: M2 contract portability
+on:
+  push:
+  pull_request:
+jobs:
+  m2-contracts:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install Chroma test dependency
+        run: python -m pip install chromadb
+      - name: Run deterministic M2 tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest tests.test_m2_lexical_index -v

@@ -1,0 +1,6 @@
+{
+  "producer_repository": "Chroma DB Import",
+  "contract": "lexical-index-v1",
+  "fixture": "valid.json",
+  "consumer": "Podcast Chat"
+}
