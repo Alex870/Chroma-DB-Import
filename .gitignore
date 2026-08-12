@@ -6,6 +6,7 @@ chroma_db_import_config.json
 state/
 /chroma_db*/
 .pytest_cache/
+.test_tmp/
 .mypy_cache/
 .ruff_cache/
 build/

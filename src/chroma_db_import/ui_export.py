@@ -455,7 +455,12 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     manifest["representation"] = spec.as_dict()
     manifest["representation_id"] = spec.representation_id
     manifest["provider_diagnostics"] = provider_diagnostics
-    manifest["operation"] = {"operation_id": operation, "mode": mode, "status": "promoted"}
+    manifest["operation"] = {
+        "operation_id": operation,
+        "mode": mode,
+        "status": "promoted",
+        "elapsed_seconds": round(time.time() - started_at, 2),
+    }
     manifest["staging"] = staging_validation.as_dict()
     manifest["reconciliation"] = preview_ui_reconciliation(original_plan).as_dict() if mode in {"update", "reconcile"} else {}
     manifest["embedding_cache"] = cache_stats

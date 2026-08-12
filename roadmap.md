@@ -1,6 +1,6 @@
 # Roadmap
 
-Updated: 2026-07-17
+Updated: 2026-08-11
 
 `Chroma DB Import` is the transactional corpus-release boundary between processed podcast artifacts and self-contained vector exports. Versioned manifests, hash-driven classification, embedding governance, staging validation, reconciliation, rollback evidence, and downstream contract fixtures are implemented. The next work makes corpus updates routine, observable, and scalable.
 
@@ -26,11 +26,11 @@ Updated: 2026-07-17
 
 ### 1. Introduce corpus releases and delta ingestion
 
-- Consume Podcast-RAG delta manifests directly instead of rediscovering every change from directory state.
-- Assign a corpus release ID spanning source caches, representation, embedding fingerprint, selection, and parent release.
-- Preview the exact vector and metadata delta before work begins.
-- Promote atomically, retain a bounded rollback generation, and verify Chat/RAGScope readiness after promotion.
-- Emit stale-evidence and judgment-impact information for RAGScope.
+- Implemented: consume and identity-validate Podcast-RAG delta manifests through the production release CLI.
+- Implemented: bind release identity to delta, parent, representation, embedding, selection, and the exact Chroma export fingerprint.
+- Implemented: reject any mismatch between the approved delta and actual export reconciliation.
+- Implemented: stage and promote a consumer-readable release atomically, with explicit rollback and separately approved retention deletion.
+- Next operational proof: run the workflow against the approved private corpus and verify the retained release in Chat and RAGScope.
 
 ### 2. Automate export health and recovery
 
@@ -62,7 +62,7 @@ Updated: 2026-07-17
 
 ## Sequencing
 
-1. Adopt processed-cache delta manifests and corpus release identity.
+1. Run the implemented processed-delta/corpus-release workflow against the approved private corpus.
 2. Add preview, resumability, rollback generations, and post-promotion consumer checks.
 3. Establish operational health, backup/restore, and migration workflows.
 4. Run scale/performance tuning on representative releases.
@@ -70,6 +70,6 @@ Updated: 2026-07-17
 6. Complete destructive-operation UX and target-machine packaging validation.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
-## Phases 0–2 implementation status (2026-07-17)
+## Phases 0–2 implementation status (2026-08-11)
 
-Processed-delta consumption and the approved staged corpus-release lifecycle, retention, promotion, and rollback are implemented. Real release acceptance awaits the approved private evaluation pack.
+Processed-delta identity validation and the approved real-export corpus-release lifecycle, exact reconciliation, non-destructive retention, promotion, and rollback are implemented. Real release acceptance awaits the approved private evaluation pack.

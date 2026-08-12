@@ -1,4 +1,6 @@
+import gc
 import tempfile
+import time
 import unittest
 from importlib.util import find_spec
 from pathlib import Path
@@ -14,7 +16,9 @@ class ReconciliationIntegrationTests(unittest.TestCase):
     def test_temporary_chroma_preview_classifies_every_outcome(self):
         import chromadb
 
-        with tempfile.TemporaryDirectory(dir="C:\\temp\\codex") as tmp:
+        scratch = Path(__file__).parent.parent / ".test_tmp"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as tmp:
             root = Path(tmp)
             source = root / "episode.processed_documents.json"
             source.write_text("{}", encoding="utf-8")
@@ -75,6 +79,10 @@ class ReconciliationIntegrationTests(unittest.TestCase):
             self.assertEqual(preview.removed, ["removed"])
             client._system.stop()
             chromadb.api.client.SharedSystemClient.clear_system_cache()
+            del collection
+            del client
+            gc.collect()
+            time.sleep(0.1)
 
 
 if __name__ == "__main__":
