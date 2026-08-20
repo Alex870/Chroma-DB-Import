@@ -19,3 +19,4 @@ where = ["src"]
 [project.scripts]
 chroma-db-import = "chroma_db_import.cli:main"
 chroma-corpus-release = "chroma_db_import.release_cli:main"
+chroma-import-hardening = "chroma_db_import.hardening:main"
