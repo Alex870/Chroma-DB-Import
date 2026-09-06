@@ -90,6 +90,75 @@ def has_text(text: str) -> bool:
     return bool(re.sub(r"\s+", " ", text or "").strip())
 
 
+PARTITION_IDENTITY_FIELDS = (
+    "partition_id",
+    "corpus_id",
+    "partition_display_name",
+    "context_type",
+    "workflow_profile",
+    "partition_config_fingerprint",
+)
+
+
+def _partition_identity_from_mapping(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    nested = value.get("partition") if isinstance(value.get("partition"), dict) else {}
+    identity: dict[str, str] = {}
+    for field in PARTITION_IDENTITY_FIELDS:
+        candidate = value.get(field)
+        if candidate in (None, ""):
+            candidate = nested.get(field)
+        if candidate not in (None, ""):
+            identity[field] = str(candidate)
+    return identity
+
+
+def partition_identities(payload: Any) -> list[dict[str, str]]:
+    """Extract partition identities from a processed cache or exported payload.
+
+    Partition metadata was added additively, so old caches simply return an empty
+    list.  The document scan catches malformed caches that contain more than one
+    identity even when their top-level metadata is incomplete.
+    """
+    if not isinstance(payload, dict):
+        return []
+    candidates: list[dict[str, str]] = []
+    for mapping in (payload, payload.get("metadata")):
+        identity = _partition_identity_from_mapping(mapping)
+        if identity:
+            candidates.append(identity)
+    documents = payload.get("documents")
+    if isinstance(documents, list):
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            for mapping in (item.get("metadata"), item):
+                identity = _partition_identity_from_mapping(mapping)
+                if identity:
+                    candidates.append(identity)
+
+    unique: dict[str, dict[str, str]] = {}
+    for identity in candidates:
+        key = json.dumps(
+            {
+                "partition_id": identity.get("partition_id", ""),
+                "corpus_id": identity.get("corpus_id", ""),
+            },
+            sort_keys=True,
+        )
+        unique.setdefault(key, identity)
+    return list(unique.values())
+
+
+def partition_identity(payload: Any) -> dict[str, str]:
+    """Return the single partition identity represented by a payload, if any."""
+    identities = partition_identities(payload)
+    if not identities:
+        return {}
+    return dict(identities[0])
+
+
 def is_missing_context_response(text: str) -> bool:
     compact = re.sub(r"\s+", " ", text or "").strip().lower()
     if not compact:
@@ -270,9 +339,11 @@ def build_import_manifest(
     staging: dict[str, Any] | None = None,
     reconciliation: dict[str, Any] | None = None,
     embedding_cache: dict[str, Any] | None = None,
+    partition_identity: dict[str, Any] | None = None,
+    dedup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary = summarize_reports(validation_results)
-    return {
+    manifest = {
         "manifest_version": IMPORT_MANIFEST_VERSION,
         "importer_version": IMPORTER_VERSION,
         "imported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -295,6 +366,16 @@ def build_import_manifest(
         "reconciliation": reconciliation or {},
         "embedding_cache": embedding_cache or {},
     }
+    if dedup is not None:
+        manifest["dedup"] = dict(dedup)
+    if partition_identity:
+        manifest["partition"] = dict(partition_identity)
+        if partition_identity.get("partition_id"):
+            manifest["partition_id"] = str(partition_identity["partition_id"])
+        corpus_id = partition_identity.get("corpus_id") or partition_identity.get("partition_id")
+        if corpus_id:
+            manifest["corpus_id"] = str(corpus_id)
+    return manifest
 
 
 def validate_podcast_metadata(payload: dict[str, Any]) -> ValidationReport:

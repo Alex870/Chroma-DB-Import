@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Any
 
 @dataclass
 class ImportConfig:
@@ -42,6 +43,13 @@ class ImportConfig:
     expected_embedding_model: str = ""
     selected_speakers: list[str] | None = None
     troubleshooting_dir: str = "state/diagnostics"
+    portable_artifacts: bool = False
+    managed_partition_identity: dict[str, str] | None = None
+    upstream_release_id: str = ""
+    handoff_ids: list[str] | None = None
+    # Resolved by the managed context catalog.  The importer accepts this
+    # field for headless runs, but does not require users to edit JSON.
+    dedup_policy: dict[str, Any] | None = None
 
 def resolve_path(base_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()

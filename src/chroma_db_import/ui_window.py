@@ -37,6 +37,9 @@ from PySide6.QtWidgets import (
 
 from chroma_db_import.config import ImportConfig
 from chroma_db_import.contract import validate_podcast_metadata
+from chroma_db_import.managed import ManagedCatalog, discover, import_profile_payload
+from chroma_db_import.deduplication import resolve_dedup_policy
+from chroma_db_import.dedup_artifacts import validate_dedup_artifacts
 from chroma_db_import.ui_export import build_ui_validation_report, preview_ui_import_plan, preview_ui_reconciliation, select_documents_for_episode, update_should_skip_episode
 from chroma_db_import.ui_export import should_include_document
 from chroma_db_import.ui_helpers import safe_folder_name, slugify
@@ -50,7 +53,7 @@ from chroma_db_import.ui_support import (
     pytorch_cuda_is_available,
     resolve_embedding_device,
 )
-from chroma_db_import.ui_workers import ChromaExportWorker, CudaTorchInstallWorker
+from chroma_db_import.ui_workers import ChromaExportWorker, CudaTorchInstallWorker, ManagedDedupPreviewWorker, ManagedDedupReviewWorker, ManagedImportWorker, RedundancyWorker
 
 class ProcessedFolderPreviewDialog(QDialog):
     """Browse for a processed-data folder and preview compatible files before accepting."""
@@ -255,6 +258,9 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
         self.project_root = Path(__file__).resolve().parents[2]
         self.ui_state_path = self.project_root / "state" / "ui_state.json"
+        self.context_catalog_path = self.project_root / "state" / "context_catalog.sqlite3"
+        self.context_catalog = ManagedCatalog(self.context_catalog_path)
+        self.context_selected_partition = ""
         self._loading_state = False
 
         self.loader = EpisodeLoader()
@@ -264,8 +270,11 @@ class MainWindow(QMainWindow):
         self.included_speakers_by_episode: dict[str, set[str]] = {}
         self.thread: QThread | None = None
         self.worker: ChromaExportWorker | None = None
+        self.managed_worker: ManagedImportWorker | None = None
         self.cuda_thread: QThread | None = None
         self.cuda_worker: CudaTorchInstallWorker | None = None
+        self.redundancy_thread: QThread | None = None
+        self.redundancy_worker: RedundancyWorker | None = None
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
@@ -288,6 +297,15 @@ class MainWindow(QMainWindow):
         self.contextualization = QComboBox()
         self.contextualization.addItems(["minimal", "full", "none"])
         self.experimental_bge_m3 = QCheckBox("Use pinned BGE-M3 dense shadow profile")
+        self.dedup_profile = QComboBox()
+        self.dedup_profile.addItems(["off", "safe", "audit"])
+        self.dedup_near_enabled = QCheckBox("Report near repetitions")
+        self.dedup_near_enabled.setChecked(True)
+        self.dedup_retrieval_enabled = QCheckBox("Collapse exact repetitions during retrieval")
+        self.dedup_retrieval_enabled.setChecked(True)
+        self.dedup_near_threshold = QLineEdit("0.90")
+        self.dedup_near_length_ratio = QLineEdit("0.90")
+        self.dedup_near_max_block = QLineEdit("2000")
         self.mirror_removals = QCheckBox("Mirror records removed from source caches")
         self.gpu_status = QLabel()
         self.log = QPlainTextEdit()
@@ -319,6 +337,23 @@ class MainWindow(QMainWindow):
         )
         open_action.triggered.connect(self.open_processed_folder)
         toolbar.addAction(open_action)
+
+        contexts_action = QAction("Contexts", self)
+        self.set_action_help(
+            contexts_action,
+            "Discover Podcast-RAG handoffs and manage one isolated Chroma database per podcast or meeting context.",
+        )
+        contexts_action.triggered.connect(self.show_contexts)
+        toolbar.addAction(contexts_action)
+
+        redundancy_action = QAction("Redundancy", self)
+        self.set_action_help(
+            redundancy_action,
+            "Configure and run a read-only semantic redundancy assessment for the selected managed context. "
+            "Assessment bundles are advisory and never change the active export.",
+        )
+        redundancy_action.triggered.connect(self.show_redundancy)
+        toolbar.addAction(redundancy_action)
 
         output_action = QAction("Output", self)
         self.set_action_help(
@@ -874,7 +909,7 @@ class MainWindow(QMainWindow):
     def set_right_panel(self, panel: QWidget, scroll_value: int = 0) -> None:
         old_panel = self.right.takeWidget()
         if old_panel:
-            for widget in (
+            preserved_widgets = (
                 self.podcast_name,
                 self.database_id,
                 self.collection_name,
@@ -884,7 +919,10 @@ class MainWindow(QMainWindow):
                 self.progress_label,
                 self.progress_bar,
                 self.log,
-            ):
+            )
+            if getattr(self, "redundancy_cancel_button", None) is not None:
+                preserved_widgets += (self.redundancy_cancel_button,)
+            for widget in preserved_widgets:
                 if is_descendant_of(widget, old_panel):
                     widget.setParent(None)
             old_panel.deleteLater()
@@ -1132,6 +1170,632 @@ class MainWindow(QMainWindow):
             else:
                 included.discard(speaker)
         self.render_global()
+
+    def show_contexts(self) -> None:
+        self.render_contexts()
+
+    def _redundancy_release_ids(self) -> list[str]:
+        if not self.context_selected_partition:
+            return []
+        return [str(row.get("upstream_release_id") or "") for row in self.context_catalog.releases(self.context_selected_partition) if row.get("upstream_release_id")]
+
+    def show_redundancy(self) -> None:
+        if not self.context_selected_partition:
+            QMessageBox.information(self, "Context required", "Select a managed context before opening semantic redundancy.")
+            return
+        try:
+            policy_record = self.context_catalog.get_redundancy_policy(self.context_selected_partition)
+            policy = dict(policy_record["policy"])
+            judge_config = self.context_catalog.get_redundancy_judge_config(self.context_selected_partition) or {}
+        except Exception as exc:
+            QMessageBox.warning(self, "Redundancy unavailable", f"{type(exc).__name__}: {exc}")
+            return
+        releases = self._redundancy_release_ids()
+        if not releases:
+            QMessageBox.information(self, "No release", "This context has no discovered release to assess.")
+            return
+
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        title = QLabel("Semantic Redundancy")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(title)
+        intro = QLabel(
+            "Assess candidate overlap and optional local-judge relationships in a private bundle. "
+            "Every original occurrence remains in the base export; saving a policy here does not activate retrieval changes in Podcast Chat."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.redundancy_release = QComboBox()
+        self.redundancy_release.addItems(releases)
+        self.redundancy_storage = QComboBox()
+        self.redundancy_storage.addItems(["full", "shared_input"])
+        self.redundancy_storage.setCurrentText(str(policy.get("vector_storage") or "full"))
+        self.redundancy_retrieval = QComboBox()
+        self.redundancy_retrieval.addItems(["ranked", "semantic_mmr"])
+        self.redundancy_retrieval.setCurrentText(str(policy.get("retrieval_mode") or "ranked"))
+        self.redundancy_judge_enabled = QCheckBox("Allow explicit judge pilot")
+        self.redundancy_judge_enabled.setChecked(bool(policy.get("judge_enabled")))
+        self.redundancy_judge_fraction = QLineEdit(str(policy.get("judge_record_fraction", "0.10")))
+        self.redundancy_judge_max_calls = QLineEdit(str(policy.get("judge_max_calls", "100")))
+        self.redundancy_base_url = QLineEdit(str(judge_config.get("base_url") or "http://localhost:1234/v1"))
+        self.redundancy_model = QLineEdit(str(judge_config.get("model") or ""))
+        self.redundancy_model_fingerprint = QLineEdit(str(judge_config.get("model_fingerprint") or ""))
+        self.add_info_row(form, "Base release", self.redundancy_release, "The immutable managed release that will be inspected. Assessment never changes its active pointer.")
+        self.add_info_row(form, "Vector storage", self.redundancy_storage, "Choose full vectors or shared-input representatives for the private assessment artifact. Original evidence stays complete in either mode.")
+        self.add_info_row(form, "Retrieval recommendation", self.redundancy_retrieval, "Record ranked or semantic MMR as an advisory preference. The consumer must explicitly select a validated bundle.")
+        self.add_info_row(form, "Judge enablement", self.redundancy_judge_enabled, "Saving this only permits a later explicit Pilot judge action; it never calls a model by itself.")
+        self.add_info_row(form, "Judge fraction", self.redundancy_judge_fraction, "Fraction of eligible candidates to send to the bounded local judge, subject to the call cap.")
+        self.add_info_row(form, "Judge max calls", self.redundancy_judge_max_calls, "Hard maximum number of judge requests for one assessment job.")
+        self.add_info_row(form, "LM Studio URL", self.redundancy_base_url, "Loopback-compatible LM Studio endpoint. Credentials are not stored in the catalog.")
+        self.add_info_row(form, "LM Studio model", self.redundancy_model, "Explicit model ID selected by the user; the importer never auto-selects or downloads a model.")
+        self.add_info_row(form, "Model fingerprint", self.redundancy_model_fingerprint, "Optional immutable model artifact identity used to scope judgment cache entries.")
+        layout.addLayout(form)
+
+        channels = QHBoxLayout()
+        self.redundancy_channel_checks: dict[str, QCheckBox] = {}
+        for name, label in (("lexical", "Lexical"), ("structural", "Source / structure"), ("dense", "Dense")):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(bool(policy.get(f"{name}_enabled", True)))
+            self.redundancy_channel_checks[name] = checkbox
+            channels.addWidget(checkbox)
+        channels.addStretch(1)
+        layout.addWidget(QLabel("Candidate channels"))
+        layout.addLayout(channels)
+
+        resume_row = QHBoxLayout()
+        self.redundancy_resume_job = QLineEdit()
+        self.redundancy_resume_job.setPlaceholderText("Optional frozen job ID")
+        resume_row.addWidget(self.redundancy_resume_job, 1)
+        layout.addLayout(resume_row)
+
+        config_buttons = QHBoxLayout()
+        save_policy = QPushButton("Save Policy")
+        save_policy.clicked.connect(self.save_redundancy_policy_from_ui)
+        save_judge = QPushButton("Save Judge Configuration")
+        save_judge.clicked.connect(self.save_redundancy_judge_from_ui)
+        config_buttons.addWidget(save_policy)
+        config_buttons.addWidget(save_judge)
+        config_buttons.addStretch(1)
+        layout.addLayout(config_buttons)
+
+        action_buttons = QHBoxLayout()
+        preview = QPushButton("Preview")
+        preview.setToolTip("Compute model-free lexical/source coverage without creating a job or bundle.")
+        preview.clicked.connect(self.preview_redundancy)
+        assess = QPushButton("Assess")
+        assess.setToolTip("Run the selected candidate channels without invoking the judge.")
+        assess.clicked.connect(self.assess_redundancy)
+        pilot = QPushButton("Pilot Judge")
+        pilot.setToolTip("Run the explicitly configured, bounded local judge for this frozen assessment.")
+        pilot.clicked.connect(self.pilot_redundancy)
+        resume = QPushButton("Resume")
+        resume.clicked.connect(self.resume_redundancy)
+        self.redundancy_cancel_button = QPushButton("Cancel")
+        self.redundancy_cancel_button.setEnabled(False)
+        self.redundancy_cancel_button.clicked.connect(self.cancel_redundancy)
+        action_buttons.addWidget(preview)
+        action_buttons.addWidget(assess)
+        action_buttons.addWidget(pilot)
+        action_buttons.addWidget(resume)
+        action_buttons.addWidget(self.redundancy_cancel_button)
+        layout.addLayout(action_buttons)
+
+        artifact_buttons = QHBoxLayout()
+        review = QPushButton("Review Bundle")
+        review.clicked.connect(self.review_redundancy_bundle)
+        export_labels = QPushButton("Export Labels")
+        export_labels.clicked.connect(self.export_redundancy_labels)
+        evaluate = QPushButton("Evaluate")
+        evaluate.clicked.connect(self.evaluate_redundancy_bundle)
+        artifact_buttons.addWidget(review)
+        artifact_buttons.addWidget(export_labels)
+        artifact_buttons.addWidget(evaluate)
+        artifact_buttons.addStretch(1)
+        layout.addLayout(artifact_buttons)
+
+        layout.addWidget(QLabel("Operation log"))
+        self.add_progress_status(layout)
+        layout.addWidget(self.log)
+        layout.addStretch(1)
+        self.set_right_panel(panel)
+
+    def _redundancy_common_args(self, command: str) -> list[str]:
+        release = str(self.redundancy_release.currentData() or self.redundancy_release.currentText() or "")
+        return [command, "--catalog", str(self.context_catalog_path), "--partition", self.context_selected_partition, "--release", release]
+
+    def _selected_redundancy_channels(self) -> list[str]:
+        return [name for name in ("lexical", "structural", "dense") if self.redundancy_channel_checks[name].isChecked()]
+
+    def save_redundancy_policy_from_ui(self) -> None:
+        try:
+            current = self.context_catalog.get_redundancy_policy(self.context_selected_partition)
+            policy = dict(current["policy"])
+            policy.update({
+                "vector_storage": self.redundancy_storage.currentText(),
+                "retrieval_mode": self.redundancy_retrieval.currentText(),
+                "judge_enabled": self.redundancy_judge_enabled.isChecked(),
+                "judge_record_fraction": float(self.redundancy_judge_fraction.text()),
+                "judge_max_calls": int(self.redundancy_judge_max_calls.text()),
+            })
+            fingerprint = self.context_catalog.save_redundancy_policy(self.context_selected_partition, policy)
+            self.log.appendPlainText(f"Saved semantic redundancy policy: {fingerprint}")
+            QMessageBox.information(self, "Policy saved", "The validated policy was saved as a new scoped revision. Existing jobs remain frozen.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Policy not saved", f"{type(exc).__name__}: {exc}")
+
+    def save_redundancy_judge_from_ui(self) -> bool:
+        try:
+            self.context_catalog.set_redundancy_judge_config(self.context_selected_partition, {
+                "base_url": self.redundancy_base_url.text().strip(),
+                "model": self.redundancy_model.text().strip(),
+                "model_fingerprint": self.redundancy_model_fingerprint.text().strip() or None,
+            })
+            self.log.appendPlainText(f"Saved explicit judge configuration for {self.context_selected_partition}")
+            QMessageBox.information(self, "Judge configuration saved", "The model ID is stored privately for this partition. The importer will not call it until Pilot Judge is pressed.")
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "Judge configuration not saved", f"{type(exc).__name__}: {exc}")
+            return False
+
+    def _launch_redundancy_worker(self, arguments: list[str], description: str) -> None:
+        if self.redundancy_thread is not None:
+            QMessageBox.information(self, "Operation running", "Wait for the current semantic redundancy operation to finish.")
+            return
+        self.redundancy_thread = QThread()
+        self.redundancy_worker = RedundancyWorker(arguments)
+        self.redundancy_worker.moveToThread(self.redundancy_thread)
+        self.redundancy_thread.started.connect(self.redundancy_worker.run)
+        self.redundancy_worker.progress.connect(lambda message: self.log.appendPlainText(f"[Redundancy] {message}"))
+        self.redundancy_worker.finished.connect(self.handle_redundancy_finished)
+        self.redundancy_worker.failed.connect(self.handle_redundancy_failed)
+        self.redundancy_worker.finished.connect(self.redundancy_thread.quit)
+        self.redundancy_worker.failed.connect(self.redundancy_thread.quit)
+        self.redundancy_worker.finished.connect(self.redundancy_worker.deleteLater)
+        self.redundancy_worker.failed.connect(self.redundancy_worker.deleteLater)
+        self.redundancy_thread.finished.connect(self.redundancy_thread.deleteLater)
+        self.redundancy_thread.finished.connect(self.clear_redundancy_worker)
+        self.progress_label.setText(description)
+        self.progress_bar.setRange(0, 0)
+        if hasattr(self, "redundancy_cancel_button"):
+            self.redundancy_cancel_button.setEnabled(True)
+        self.redundancy_thread.start()
+
+    def cancel_redundancy(self) -> None:
+        if self.redundancy_worker is None:
+            return
+        self.redundancy_worker.cancel()
+        self.progress_label.setText("Cancelling redundancy operation...")
+
+    def clear_redundancy_worker(self) -> None:
+        self.redundancy_thread = None
+        self.redundancy_worker = None
+        if hasattr(self, "redundancy_cancel_button"):
+            self.redundancy_cancel_button.setEnabled(False)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+
+    def handle_redundancy_finished(self, result: dict[str, Any]) -> None:
+        output = str(result.get("output") or "")
+        if output:
+            self.log.appendPlainText(output)
+        partial = int(result.get("exit_code") or 0) == 2
+        self.progress_label.setText("Redundancy operation completed with pending coverage" if partial else "Redundancy operation complete")
+        if partial:
+            QMessageBox.warning(self, "Redundancy assessment is partial", "The bundle was preserved, but one or more requested channels or judge calls were unavailable. Review the coverage before using it.")
+        else:
+            QMessageBox.information(self, "Redundancy operation complete", "The read-only operation completed. Review the bundle or report before making any consumer selection.")
+
+    def handle_redundancy_failed(self, message: str) -> None:
+        self.progress_label.setText("Redundancy operation failed")
+        self.log.appendPlainText(f"[Redundancy failed] {message}")
+        QMessageBox.warning(self, "Redundancy operation failed", message)
+
+    def preview_redundancy(self) -> None:
+        self._launch_redundancy_worker(self._redundancy_common_args("preview"), "Computing model-free redundancy preview...")
+
+    def assess_redundancy(self) -> None:
+        channels = self._selected_redundancy_channels()
+        if not channels:
+            QMessageBox.warning(self, "Channel required", "Select at least one candidate channel.")
+            return
+        arguments = self._redundancy_common_args("assess")
+        arguments.extend(["--channels", ",".join(channels)])
+        self._launch_redundancy_worker(arguments, "Running read-only redundancy assessment...")
+
+    def pilot_redundancy(self) -> None:
+        if not self.redundancy_judge_enabled.isChecked():
+            QMessageBox.warning(self, "Judge not enabled", "Save the policy with explicit judge enablement before starting a pilot.")
+            return
+        try:
+            saved_policy = self.context_catalog.get_redundancy_policy(self.context_selected_partition)
+        except Exception as exc:
+            QMessageBox.warning(self, "Judge policy unavailable", f"{type(exc).__name__}: {exc}")
+            return
+        if not bool(saved_policy.get("policy", {}).get("judge_enabled")):
+            QMessageBox.warning(self, "Judge policy not saved", "Save the policy with explicit judge enablement before starting a pilot.")
+            return
+        if not self.save_redundancy_judge_from_ui():
+            return
+        channels = self._selected_redundancy_channels()
+        if not channels:
+            QMessageBox.warning(self, "Channel required", "Select at least one candidate channel.")
+            return
+        arguments = self._redundancy_common_args("assess")
+        arguments.extend(["--channels", ",".join(channels), "--judge"])
+        self._launch_redundancy_worker(arguments, "Running bounded local judge pilot...")
+
+    def resume_redundancy(self) -> None:
+        job_id = self.redundancy_resume_job.text().strip()
+        if not job_id:
+            QMessageBox.warning(self, "Job required", "Enter a frozen job ID before choosing Resume.")
+            return
+        arguments = self._redundancy_common_args("assess")
+        arguments.extend(["--resume", job_id])
+        self._launch_redundancy_worker(arguments, "Resuming frozen redundancy assessment...")
+
+    def review_redundancy_bundle(self) -> None:
+        bundle = QFileDialog.getExistingDirectory(self, "Choose redundancy bundle")
+        if bundle:
+            self._launch_redundancy_worker(["review", "--bundle", bundle], "Validating redundancy bundle...")
+
+    def export_redundancy_labels(self) -> None:
+        bundle = QFileDialog.getExistingDirectory(self, "Choose redundancy bundle")
+        if not bundle:
+            return
+        output, _selected_filter = QFileDialog.getSaveFileName(self, "Save label examples", "labels.json", "JSON files (*.json)")
+        if output:
+            self._launch_redundancy_worker(["label-export", "--bundle", bundle, "--output", output], "Exporting label examples...")
+
+    def evaluate_redundancy_bundle(self) -> None:
+        bundle = QFileDialog.getExistingDirectory(self, "Choose redundancy bundle")
+        if not bundle:
+            return
+        labels, _labels_filter = QFileDialog.getOpenFileName(self, "Choose reviewed labels", "", "JSON files (*.json)")
+        if not labels:
+            return
+        queries, _queries_filter = QFileDialog.getOpenFileName(self, "Choose queries (optional)", "", "JSON files (*.json)")
+        query_results, _results_filter = QFileDialog.getOpenFileName(self, "Choose retrieval results (optional)", "", "JSON files (*.json)")
+        output, _output_filter = QFileDialog.getSaveFileName(self, "Save evaluation report", "evaluation.json", "JSON files (*.json)")
+        if not output:
+            return
+        arguments = ["evaluate", "--bundle", bundle, "--labels", labels, "--output", output]
+        if queries:
+            arguments.extend(["--queries", queries])
+        if query_results:
+            arguments.extend(["--query-results", query_results])
+        self._launch_redundancy_worker(arguments, "Writing frozen redundancy evaluation...")
+
+    def render_contexts(self) -> None:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        title = QLabel("Managed Contexts")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(title)
+        intro = QLabel(
+            "Each valid Podcast-RAG handoff or release becomes an independent database. "
+            "The manifest supplies identity; this screen manages only local discovery, profiles, and destinations."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        buttons = QHBoxLayout()
+        link = QPushButton("Link Source Root")
+        link.setToolTip("Choose a Podcast-RAG project or release root once. Future contexts are discovered from contract manifests.")
+        link.clicked.connect(self.link_context_source)
+        refresh = QPushButton("Discover / Refresh")
+        refresh.clicked.connect(self.discover_contexts)
+        buttons.addWidget(link)
+        buttons.addWidget(refresh)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.context_list = QListWidget()
+        self.context_list.currentItemChanged.connect(self.context_selection_changed)
+        layout.addWidget(self.context_list, 1)
+        self.context_detail = QLabel("No context selected.")
+        self.context_detail.setWordWrap(True)
+        layout.addWidget(self.context_detail)
+
+        actions = QHBoxLayout()
+        archive = QPushButton("Archive / Restore")
+        archive.clicked.connect(self.toggle_context_archive)
+        import_button = QPushButton("Import Newest Release")
+        import_button.clicked.connect(self.import_selected_context)
+        profile_button = QPushButton("Save Current Profile")
+        profile_button.setToolTip("Save the current embedding and representation choices for the selected context in the local catalog.")
+        profile_button.clicked.connect(self.save_context_profile)
+        open_button = QPushButton("Open Active Database")
+        open_button.clicked.connect(self.open_selected_context)
+        redundancy_button = QPushButton("Semantic Redundancy")
+        redundancy_button.setToolTip("Configure and run a read-only redundancy assessment for this context.")
+        redundancy_button.clicked.connect(self.show_redundancy)
+        actions.addWidget(archive)
+        actions.addWidget(profile_button)
+        actions.addWidget(import_button)
+        actions.addWidget(open_button)
+        actions.addWidget(redundancy_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        dedup_form = QFormLayout()
+        dedup_form.addRow("Dedup profile", self.dedup_profile)
+        dedup_form.addRow("Near-match report", self.dedup_near_enabled)
+        dedup_form.addRow("Retrieval repetition control", self.dedup_retrieval_enabled)
+        dedup_form.addRow("Near Jaccard threshold", self.dedup_near_threshold)
+        dedup_form.addRow("Near length ratio", self.dedup_near_length_ratio)
+        dedup_form.addRow("Near block limit", self.dedup_near_max_block)
+        layout.addLayout(dedup_form)
+        review_button = QPushButton("Review Deduplication")
+        review_button.setToolTip("Read the validated release ledger and show groups, reasons, and coverage.")
+        review_button.clicked.connect(self.review_selected_context)
+        layout.addWidget(review_button)
+        preview_button = QPushButton("Preview Next Import")
+        preview_button.setToolTip("Validate the selected release and compute its complete prospective dedup plan without embedding or activation.")
+        preview_button.clicked.connect(self.preview_selected_context)
+        layout.addWidget(preview_button)
+        self.set_right_panel(panel)
+        self.refresh_context_list()
+
+    def refresh_context_list(self) -> None:
+        if not hasattr(self, "context_list"):
+            return
+        self.context_list.blockSignals(True)
+        self.context_list.clear()
+        selected = self.context_selected_partition
+        for context in self.context_catalog.contexts():
+            status = context.get("local_status") or context.get("producer_status") or "active"
+            label = f"{context.get('display_name')}  [{context.get('context_type')}] — {status}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, str(context.get("partition_id")))
+            self.context_list.addItem(item)
+            if str(context.get("partition_id")) == selected:
+                self.context_list.setCurrentItem(item)
+        self.context_list.blockSignals(False)
+        if self.context_list.currentItem() is None and self.context_list.count():
+            self.context_list.setCurrentRow(0)
+        self.context_selection_changed(self.context_list.currentItem(), None)
+
+    def link_context_source(self) -> None:
+        root = QFileDialog.getExistingDirectory(self, "Link Podcast-RAG source root")
+        if not root:
+            return
+        try:
+            self.context_catalog.add_source_root(Path(root))
+            self.context_catalog.set_setting("managed_output_root", str((self.output_root or (self.project_root / "exports")).resolve()))
+            report = discover(self.context_catalog)
+            self.context_selected_partition = ""
+            self.refresh_context_list()
+            self.log.appendPlainText(f"Discovered {len(report['releases'])} release(s), {len(report['invalid'])} invalid candidate(s).")
+            if report["invalid"]:
+                QMessageBox.warning(self, "Discovery warnings", f"{len(report['invalid'])} manifest candidate(s) were rejected. Review the context status or use the CLI for details.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Source link failed", f"{type(exc).__name__}: {exc}")
+
+    def discover_contexts(self) -> None:
+        try:
+            report = discover(self.context_catalog)
+            self.refresh_context_list()
+            self.log.appendPlainText(f"Context discovery complete: {len(report['contexts'])} context record(s), {len(report['releases'])} release(s).")
+        except Exception as exc:
+            QMessageBox.critical(self, "Discovery failed", f"{type(exc).__name__}: {exc}")
+
+    def context_selection_changed(self, item: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if item is None:
+            self.context_detail.setText("No context selected.")
+            return
+        partition_id = str(item.data(Qt.UserRole))
+        self.context_selected_partition = partition_id
+        context = self.context_catalog.context(partition_id) or {}
+        releases = self.context_catalog.releases(partition_id)
+        output_root = Path(self.context_catalog.get_setting("managed_output_root", str(self.project_root / "exports")))
+        partition_root = output_root / "partitions" / partition_id
+        active_release_id = "none"
+        episode_count = document_count = 0
+        active_pointer = partition_root / "active-release.json"
+        if active_pointer.is_file():
+            try:
+                active_payload = json.loads(active_pointer.read_text(encoding="utf-8"))
+                active_release_id = str(active_payload.get("release_id") or "none")
+                metadata_path = partition_root / "releases" / active_release_id / "export" / "podcast.json"
+                if metadata_path.is_file():
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    episode_count = int(metadata.get("episode_count") or len(metadata.get("episodes") or []))
+                    document_count = int(metadata.get("document_count") or 0)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                active_release_id = "invalid pointer"
+        latest_run = self.context_catalog.latest_run(partition_id)
+        warning_count = sum(1 for release in releases if release.get("status") in {"quarantined", "failed"})
+        lines = [
+            f"Display name: {context.get('display_name')}",
+            f"Partition: {context.get('partition_id')}",
+            f"Corpus: {context.get('corpus_id')}",
+            f"Workflow: {context.get('workflow_profile')}",
+            f"Discovered releases: {len(releases)}",
+            f"Active release: {active_release_id}",
+            f"Active counts: {episode_count} episode(s), {document_count} document(s)",
+            f"Last import result: {latest_run.get('status') if latest_run else 'not imported'}",
+            f"Validation warnings: {warning_count} quarantined/failed release(s)",
+            f"Database root: {partition_root}",
+            "Portability: managed export; machine-specific paths are masked in portable metadata",
+        ]
+        if releases:
+            lines.append(f"Newest release: {releases[0].get('upstream_release_id')} ({releases[0].get('status')})")
+        profile = self.context_catalog.profile(partition_id)
+        if profile:
+            lines.append(f"Saved import profile: {profile.get('profile_fingerprint')}")
+            saved_policy = resolve_dedup_policy((profile.get("profile") or {}).get("dedup_policy"), default_profile="safe")
+            lines.extend([
+                f"Deduplication: {saved_policy['profile']} (near={'on' if saved_policy['near_enabled'] else 'off'}, retrieval={'on' if saved_policy['retrieval']['enabled'] else 'off'})",
+                f"Profile changes apply on the next import; Safe/Audit require Chat dedup-aliases-v1 support.",
+            ])
+            self._load_context_profile_controls(profile["profile"])
+        self.context_detail.setText("\n".join(lines))
+
+    def _load_context_profile_controls(self, profile: dict[str, Any]) -> None:
+        policy = resolve_dedup_policy(profile.get("dedup_policy"), default_profile="safe")
+        for widget, value in ((self.dedup_profile, policy["profile"]),):
+            widget.blockSignals(True)
+            widget.setCurrentText(value)
+            widget.blockSignals(False)
+        self.dedup_near_enabled.setChecked(policy["near_enabled"])
+        self.dedup_retrieval_enabled.setChecked(policy["retrieval"]["enabled"])
+        self.dedup_near_threshold.setText(str(policy["near_jaccard_threshold"]))
+        self.dedup_near_length_ratio.setText(str(policy["near_length_ratio"]))
+        self.dedup_near_max_block.setText(str(policy["near_max_block_records"]))
+
+    def save_context_profile(self) -> None:
+        if not self.context_selected_partition:
+            return
+        selected_speakers = sorted(
+            {
+                speaker
+                for episode in self.episodes
+                for speaker in self.included_speakers_by_episode.get(episode.fingerprint, set())
+            }
+        ) or None
+        fingerprint = self.context_catalog.save_profile(
+            self.context_selected_partition,
+            import_profile_payload(
+                ImportConfig(
+                    embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
+                    embedding_device=self.selected_embedding_device(),
+                    contextualization=self.contextualization.currentText(),
+                    experimental_bge_m3=self.experimental_bge_m3.isChecked(),
+                    selected_speakers=selected_speakers,
+                    dedup_policy=resolve_dedup_policy({
+                        "profile": self.dedup_profile.currentText(),
+                        "near_enabled": self.dedup_near_enabled.isChecked(),
+                        "near_jaccard_threshold": float(self.dedup_near_threshold.text() or "0.90"),
+                        "near_length_ratio": float(self.dedup_near_length_ratio.text() or "0.90"),
+                        "near_max_block_records": int(self.dedup_near_max_block.text() or "2000"),
+                        "retrieval": {"enabled": self.dedup_retrieval_enabled.isChecked()},
+                    }, default_profile="safe"),
+                )
+            ),
+        )
+        self.log.appendPlainText(f"Saved managed import profile for {self.context_selected_partition}: {fingerprint}")
+        self.context_selection_changed(self.context_list.currentItem(), None)
+
+    def review_selected_context(self) -> None:
+        if not self.context_selected_partition:
+            return
+        output_root = Path(self.context_catalog.get_setting("managed_output_root", str(self.project_root / "exports")))
+        partition_root = output_root / "partitions" / self.context_selected_partition
+        pointer_path = partition_root / "active-release.json"
+        if not pointer_path.is_file():
+            QMessageBox.information(self, "Deduplication review", "This context has no active release.")
+            return
+        try:
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            export = partition_root / "releases" / str(pointer["release_id"]) / "export"
+            release = json.loads((export / "release.json").read_text(encoding="utf-8"))
+            result = validate_dedup_artifacts(export, release)
+            counts = result["manifest"].get("counts") or {}
+            QMessageBox.information(self, "Deduplication review", "\n".join([
+                f"Stored: {counts.get('stored', 0)}",
+                f"Suppressed exact: {counts.get('suppressed_exact', 0)}",
+                f"Would suppress (Audit): {counts.get('would_suppress_exact', 0)}",
+                f"Exact groups: {result.get('exact_group_count', 0)}",
+                f"Near edges: {result.get('near_edge_count', 0)}",
+                f"Coverage: {result['manifest'].get('near', {}).get('status', 'unknown')}",
+            ]))
+        except Exception as exc:
+            QMessageBox.warning(self, "Deduplication review unavailable", f"{type(exc).__name__}: {exc}")
+
+    def preview_selected_context(self) -> None:
+        if not self.context_selected_partition or self.thread is not None:
+            return
+        self.thread = QThread()
+        self.managed_worker = ManagedDedupPreviewWorker(
+            ImportConfig(), self.project_root, self.context_catalog_path,
+            self.context_selected_partition, self.output_root,
+        )
+        self.managed_worker.moveToThread(self.thread)
+        self.thread.started.connect(self.managed_worker.run)
+        self.managed_worker.finished.connect(self.handle_dedup_preview)
+        self.managed_worker.failed.connect(self.handle_failed)
+        self.managed_worker.finished.connect(self.thread.quit)
+        self.managed_worker.failed.connect(self.thread.quit)
+        self.managed_worker.finished.connect(self.managed_worker.deleteLater)
+        self.managed_worker.failed.connect(self.managed_worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.clear_worker)
+        self.progress_label.setText("Computing deduplication preview...")
+        self.progress_bar.setRange(0, 0)
+        self.thread.start()
+
+    def handle_dedup_preview(self, result: dict[str, Any]) -> None:
+        counts = result.get("dedup") or {}
+        self.log.appendPlainText("Prospective dedup plan: " + json.dumps(counts, ensure_ascii=True, default=str))
+        self.progress_label.setText("Deduplication preview complete")
+        QMessageBox.information(self, "Deduplication preview", "\n".join([
+            f"Eligible: {counts.get('eligible', 0)}",
+            f"Stored: {counts.get('stored', 0)}",
+            f"Suppressed exact: {counts.get('suppressed_exact', 0)}",
+            f"Would suppress: {counts.get('would_suppress_exact', 0)}",
+            f"Exact groups: {counts.get('exact_group_count', 0)}",
+            f"Plan fingerprint: {result.get('plan_fingerprint', 'unavailable')}",
+            "No embeddings, catalog settings, or active release were changed.",
+        ]))
+
+    def toggle_context_archive(self) -> None:
+        if not self.context_selected_partition:
+            return
+        context = self.context_catalog.context(self.context_selected_partition) or {}
+        current = str(context.get("local_status") or "active")
+        self.context_catalog.set_local_status(self.context_selected_partition, "active" if current in {"archived", "hidden"} else "archived")
+        self.refresh_context_list()
+
+    def import_selected_context(self) -> None:
+        if not self.context_selected_partition:
+            QMessageBox.information(self, "Context required", "Select a context first.")
+            return
+        if self.thread is not None:
+            return
+        config = ImportConfig(
+            embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
+            embedding_device=self.selected_embedding_device(),
+            contextualization=self.contextualization.currentText(),
+            experimental_bge_m3=self.experimental_bge_m3.isChecked(),
+            selected_speakers=sorted(
+                {
+                    speaker
+                    for episode in self.episodes
+                    for speaker in self.included_speakers_by_episode.get(episode.fingerprint, set())
+                }
+            ) or None,
+        )
+        self.thread = QThread()
+        self.managed_worker = ManagedImportWorker(config, self.project_root, self.context_catalog_path, self.context_selected_partition, self.output_root)
+        self.managed_worker.moveToThread(self.thread)
+        self.thread.started.connect(self.managed_worker.run)
+        self.managed_worker.progress.connect(self.handle_progress)
+        self.managed_worker.finished.connect(self.handle_managed_finished)
+        self.managed_worker.failed.connect(self.handle_failed)
+        self.managed_worker.finished.connect(self.thread.quit)
+        self.managed_worker.failed.connect(self.thread.quit)
+        self.managed_worker.finished.connect(self.managed_worker.deleteLater)
+        self.managed_worker.failed.connect(self.managed_worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.clear_worker)
+        self.progress_label.setText("Importing managed context...")
+        self.progress_bar.setRange(0, 0)
+        self.thread.start()
+
+    def open_selected_context(self) -> None:
+        if not self.context_selected_partition:
+            return
+        root = Path(self.context_catalog.get_setting("managed_output_root", str(self.project_root / "exports"))) / "partitions" / self.context_selected_partition
+        active = root / "active-release.json"
+        if active.exists():
+            payload = json.loads(active.read_text(encoding="utf-8"))
+            release_root = root / "releases" / str(payload.get("release_id")) / "export"
+            if release_root.is_dir():
+                subprocess.Popen(["explorer", str(release_root)])
+                return
+        QMessageBox.information(self, "Database unavailable", "This context has no active imported release yet.")
         self.save_persistent_state()
 
     def set_all_global_speakers(self, enabled: bool) -> None:
@@ -1364,6 +2028,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.save_persistent_state()
+        self.context_catalog.close()
         super().closeEvent(event)
 
     def start_export(self, plan: ImportPlan, mode: str) -> None:
@@ -1430,6 +2095,18 @@ class MainWindow(QMainWindow):
         )
         self.rebuild_tree()
 
+    def handle_managed_finished(self, result: dict[str, Any]) -> None:
+        status = str(result.get("status") or "unknown")
+        self.log.appendPlainText("Managed context result: " + json.dumps(result, ensure_ascii=True, default=str))
+        self.progress_label.setText(f"Managed context: {status}")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1 if status in {"completed", "reused"} else 0)
+        if status in {"completed", "reused"}:
+            QMessageBox.information(self, "Managed import complete", f"Database exported to:\n{result.get('export')}")
+        else:
+            QMessageBox.warning(self, "Managed import not completed", json.dumps(result, indent=2, default=str)[:6000])
+        self.render_contexts()
+
     def handle_failed(self, message: str) -> None:
         self.log.appendPlainText("Failed: " + message)
         self.progress_label.setText("Failed")
@@ -1441,4 +2118,5 @@ class MainWindow(QMainWindow):
     def clear_worker(self) -> None:
         self.thread = None
         self.worker = None
+        self.managed_worker = None
         self.update_action_states()

@@ -10,7 +10,14 @@ from typing import Any
 
 import chroma_db_import.runtime as runtime
 from chroma_db_import.config import ImportConfig, resolve_path
-from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, summarize_reports, validate_document_items
+from chroma_db_import.contract import (
+    IMPORTER_VERSION,
+    build_import_manifest,
+    content_fingerprint,
+    partition_identities,
+    summarize_reports,
+    validate_document_items,
+)
 from chroma_db_import.importer import (
     ChromaImporter,
     cache_fingerprint,
@@ -23,6 +30,7 @@ from chroma_db_import.importer import (
 from chroma_db_import.state import write_json
 from chroma_db_import.contracts import require_compatible_contract
 from chroma_db_import.representation import INDEX_SCHEMA_VERSION
+from chroma_db_import.deduplication import DedupPlan
 
 def config_payload(config: ImportConfig) -> dict[str, Any]:
     return {field.name: getattr(config, field.name) for field in fields(ImportConfig)}
@@ -68,10 +76,17 @@ def rebuild_safety_warnings(config: ImportConfig, project_dir: Path, files: list
         )
     return warnings
 
-def preflight_files(config: ImportConfig, project_dir: Path, files: list[Path]) -> dict[str, Any]:
+def preflight_files(
+    config: ImportConfig,
+    project_dir: Path,
+    files: list[Path],
+    *,
+    allow_mixed_partitions: bool = False,
+) -> dict[str, Any]:
     """Validate selected source caches and summarize compatibility risks before import."""
     reports = []
     source_files = []
+    partition_records: list[dict[str, Any]] = []
     for path in files:
         payload = load_processed_payload(path)
         docs = load_processed_documents(path)
@@ -90,6 +105,58 @@ def preflight_files(config: ImportConfig, project_dir: Path, files: list[Path]) 
                 "validation": report.as_dict(),
             }
         )
+        identities = partition_identities(payload)
+        partition_records.append({"path": str(path), "identities": identities})
+
+    partition_ids = sorted(
+        {
+            str(identity.get("partition_id"))
+            for record in partition_records
+            for identity in record["identities"]
+            if identity.get("partition_id")
+        }
+    )
+    corpus_ids = sorted(
+        {
+            str(identity.get("corpus_id"))
+            for record in partition_records
+            for identity in record["identities"]
+            if identity.get("corpus_id")
+        }
+    )
+    identity_keys = sorted(
+        {
+            str(identity.get("partition_id") or json.dumps(identity, sort_keys=True))
+            for record in partition_records
+            for identity in record["identities"]
+        }
+    )
+    legacy_files = [record["path"] for record in partition_records if not record["identities"]]
+    partition_errors: list[str] = []
+    if len(identity_keys) > 1 and not allow_mixed_partitions:
+        partition_errors.append(
+            "Selected processed caches belong to multiple processing spaces: "
+            + ", ".join(identity_keys)
+        )
+    if len(corpus_ids) > 1 and not allow_mixed_partitions:
+        partition_errors.append(
+            "Selected processed caches belong to multiple corpus IDs: "
+            + ", ".join(corpus_ids)
+        )
+    if identity_keys and legacy_files and not allow_mixed_partitions:
+        partition_errors.append(
+            "Selected processed caches mix partition-aware files with legacy files without a partition identity: "
+            + ", ".join(legacy_files[:5])
+        )
+    selected_partition = next(
+        (
+            identity
+            for record in partition_records
+            for identity in record["identities"]
+            if identity.get("partition_id")
+        ),
+        {},
+    )
     summary = summarize_reports(reports)
     safety_warnings = rebuild_safety_warnings(config, project_dir, files)
     report = {
@@ -97,10 +164,19 @@ def preflight_files(config: ImportConfig, project_dir: Path, files: list[Path]) 
         "importer_version": IMPORTER_VERSION,
         "processed_data_dir": str(resolve_path(project_dir, config.processed_data_dir)),
         "file_count": len(files),
-        "valid": all(item.valid for item in reports),
+        "valid": all(item.valid for item in reports) and not partition_errors,
         "summary": summary,
         "source_files": source_files,
         "safety_warnings": safety_warnings,
+        "partition_isolation": {
+            "valid": not partition_errors,
+            "partition": selected_partition,
+            "partition_ids": partition_ids,
+            "corpus_ids": corpus_ids,
+            "legacy_file_count": len(legacy_files),
+            "errors": partition_errors,
+            "policy": "allow-mixed" if allow_mixed_partitions else "single-partition",
+        },
     }
     return report
 
@@ -109,7 +185,7 @@ def write_preflight_report(config: ImportConfig, project_dir: Path, report: dict
     write_json(path, report)
     return path
 
-def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImporter, files: list[Path], preflight: dict[str, Any]) -> Path:
+def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImporter, files: list[Path], preflight: dict[str, Any], *, dedup_plan: DedupPlan | None = None) -> Path:
     """Write the downstream import manifest consumed by chat and inspection tools."""
     validation_results = [
         validate_document_items(load_processed_documents(path), str(path))
@@ -125,6 +201,7 @@ def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImpo
         }
         for path in files
     ]
+    partition_info = preflight.get("partition_isolation") or {}
     manifest = build_import_manifest(
         config=config_payload(config),
         source_files=source_files,
@@ -137,9 +214,24 @@ def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImpo
         representation={**importer.spec.as_dict(), "representation_id": importer.spec.representation_id},
         operation={"mode": "reconcile" if config.reconcile else "update" if config.update else "import"},
         embedding_cache=getattr(importer, "last_cache_stats", {}),
+        partition_identity=(
+            partition_info.get("partition")
+            if len(partition_info.get("partition_ids") or []) == 1
+            and not partition_info.get("legacy_file_count")
+            else None
+        ),
+        dedup=(dedup_plan.as_counts() if dedup_plan is not None else None),
     )
+    if partition_info.get("partition_ids"):
+        manifest["partition_ids"] = list(partition_info["partition_ids"])
     manifest["index_schema_version"] = INDEX_SCHEMA_VERSION
     manifest["representation"] = importer.spec.as_dict()
+    if dedup_plan is not None:
+        manifest["dedup"] = {
+            "policy": dedup_plan.policy,
+            "plan_fingerprint": dedup_plan.plan_fingerprint,
+            "counts": dedup_plan.as_counts(),
+        }
     path = importer.persist_dir / config.manifest_path
     write_json(path, manifest)
     return path

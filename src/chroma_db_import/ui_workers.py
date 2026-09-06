@@ -4,12 +4,97 @@ import subprocess
 import sys
 import datetime as dt
 import json
+import os
+import uuid
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 from chroma_db_import.ui_export import export_chroma, preview_ui_import_plan
 from chroma_db_import.ui_models import ImportPlan, ImportProgress
 from chroma_db_import.ui_support import TORCH_CUDA_INDEX_URL
 from chroma_db_import.staging import operation_id
+from chroma_db_import.managed import ManagedCatalog, run_managed_import
+from chroma_db_import.config import ImportConfig
+from chroma_db_import.dedup_artifacts import validate_dedup_artifacts
+
+
+class RedundancyWorker(QObject):
+    """Run one catalog-backed redundancy command away from the Qt UI thread."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, arguments: list[str]):
+        super().__init__()
+        self.arguments = list(arguments)
+        self.process: subprocess.Popen[str] | None = None
+        self.cancel_requested = False
+        self.cancel_file: Path | None = None
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        if self.cancel_file is not None:
+            try:
+                self.cancel_file.parent.mkdir(parents=True, exist_ok=True)
+                self.cancel_file.touch(exist_ok=True)
+                return
+            except OSError:
+                pass
+        process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def run(self) -> None:
+        if self.cancel_requested:
+            self.failed.emit("Redundancy operation cancelled before it started.")
+            return
+        self.progress.emit("Running semantic redundancy operation...")
+        try:
+            source_root = str(Path(__file__).resolve().parents[1])
+            environment = os.environ.copy()
+            current_pythonpath = environment.get("PYTHONPATH")
+            environment["PYTHONPATH"] = source_root if not current_pythonpath else source_root + os.pathsep + current_pythonpath
+            command_arguments = list(self.arguments)
+            if command_arguments and command_arguments[0] == "assess":
+                catalog_index = command_arguments.index("--catalog") if "--catalog" in command_arguments else -1
+                catalog_path = Path(command_arguments[catalog_index + 1]).expanduser().resolve() if catalog_index >= 0 and catalog_index + 1 < len(command_arguments) else Path.cwd() / "state" / "context_catalog.sqlite3"
+                self.cancel_file = catalog_path.parent / "redundancy_cancel" / f"{uuid.uuid4().hex}.cancel"
+                command_arguments.extend(["--cancel-file", str(self.cancel_file)])
+            self.process = subprocess.Popen(
+                [sys.executable, "-m", "chroma_db_import.cli", "redundancy", *command_arguments],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+            )
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        assert self.process.stdout is not None
+        output_lines: list[str] = []
+        for line in self.process.stdout:
+            text = line.rstrip()
+            if text:
+                output_lines.append(text)
+                self.progress.emit(text)
+        exit_code = int(self.process.wait())
+        self.process = None
+        if self.cancel_file is not None:
+            try:
+                self.cancel_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+        output = "\n".join(output_lines)
+        if self.cancel_requested:
+            self.failed.emit("Redundancy operation cancelled. No active export pointer was changed.")
+            return
+        if exit_code not in (0, 2):
+            self.failed.emit(output or f"Redundancy operation failed with exit code {exit_code}")
+            return
+        self.finished.emit({"exit_code": exit_code, "output": output, "error": ""})
 
 class ChromaExportWorker(QObject):
     progress = Signal(object)
@@ -88,3 +173,74 @@ class CudaTorchInstallWorker(QObject):
             self.failed.emit(f"pip exited with code {return_code}")
             return
         self.finished.emit("CUDA-enabled PyTorch install completed. Restarting device detection.")
+
+
+class ManagedImportWorker(QObject):
+    progress = Signal(object)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: ImportConfig, project_dir: Path, catalog_path: Path, partition_id: str, output_root: Path | None) -> None:
+        super().__init__()
+        self.config = config
+        self.project_dir = project_dir
+        self.catalog_path = catalog_path
+        self.partition_id = partition_id
+        self.output_root = output_root
+
+    def run(self) -> None:
+        self.progress.emit(ImportProgress(f"Validating release for {self.partition_id}...", 0, 0))
+        try:
+            with ManagedCatalog(self.catalog_path) as catalog:
+                result = run_managed_import(
+                    self.config,
+                    self.project_dir,
+                    catalog,
+                    self.partition_id,
+                    output_root=self.output_root,
+                )
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.finished.emit(result)
+
+
+class ManagedDedupPreviewWorker(QObject):
+    """Run contract validation and dedup planning without provider or writes."""
+    progress = Signal(object)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config: ImportConfig, project_dir: Path, catalog_path: Path, partition_id: str, output_root: Path | None = None):
+        super().__init__()
+        self.config = config
+        self.project_dir = project_dir
+        self.catalog_path = catalog_path
+        self.partition_id = partition_id
+        self.output_root = output_root
+
+    def run(self) -> None:
+        try:
+            with ManagedCatalog(self.catalog_path) as catalog:
+                result = run_managed_import(self.config, self.project_dir, catalog, self.partition_id, output_root=self.output_root, dry_run=True)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.finished.emit(result)
+
+
+class ManagedDedupReviewWorker(QObject):
+    """Read and validate an already-published dedup ledger."""
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, export_root: Path, release: dict):
+        super().__init__()
+        self.export_root = export_root
+        self.release = release
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(validate_dedup_artifacts(self.export_root, self.release))
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")

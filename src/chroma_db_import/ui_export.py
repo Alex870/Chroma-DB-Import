@@ -13,7 +13,7 @@ from typing import Any
 
 import chroma_db_import.runtime as runtime
 from chroma_db_import.config import ImportConfig
-from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, has_text, sanitize_metadata, summarize_reports, validate_document_items, validate_podcast_metadata
+from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, has_text, partition_identities, sanitize_metadata, summarize_reports, validate_document_items, validate_podcast_metadata
 from chroma_db_import.importer import cache_fingerprint, validate_documents, document_fingerprints, representation_spec
 from chroma_db_import.providers import create_embedding_provider
 from chroma_db_import.reconciliation import ReconciliationPlan, plan_reconciliation, require_delete_confirmation, source_identity
@@ -181,7 +181,10 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     emit_progress(ImportProgress("Validating selected documents...", 0, 0))
     preflight = build_ui_validation_report(plan)
     if not preflight["valid"]:
-        first_error = next((error for item in preflight["files"] for error in item["errors"]), "validation failed")
+        first_error = next(
+            (error for item in preflight["files"] for error in item["errors"]),
+            next(iter((preflight.get("partition_isolation") or {}).get("errors") or []), "validation failed"),
+        )
         raise ValueError(f"Validation failed before import: {first_error}")
 
     staging_root = plan.output_root / f".{safe_folder_name(plan.podcast_name)}.staging-{operation}"
@@ -451,6 +454,7 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
         collection_name=plan.collection_name,
         selected_speakers=sorted({speaker for speakers in plan.included_speakers_by_episode.values() for speaker in speakers}),
         compatibility_warnings=metadata_report.warnings,
+        partition_identity=(preflight.get("partition_isolation") or {}).get("partition") or None,
     )
     manifest["representation"] = spec.as_dict()
     manifest["representation_id"] = spec.representation_id
@@ -530,6 +534,7 @@ def build_ui_validation_report(plan: ImportPlan) -> dict[str, Any]:
     raw_reports = []
     files = []
     warnings = []
+    partition_records: list[dict[str, Any]] = []
     for episode in plan.episodes:
         selected = select_documents_for_episode(episode, plan.included_speakers_by_episode)
         docs = [DocumentLike(doc.page_content, doc.metadata) for doc in selected]
@@ -537,13 +542,78 @@ def build_ui_validation_report(plan: ImportPlan) -> dict[str, Any]:
         raw_reports.append({"path": str(episode.path), "report": report})
         files.append({"path": str(episode.path), **report.as_dict()})
         warnings.extend(report.warnings)
+        identities = partition_identities(
+            {
+                "partition": episode.partition_identity,
+                "documents": [{"metadata": doc.metadata} for doc in selected],
+            }
+        )
+        partition_records.append({"path": str(episode.path), "identities": identities})
+
+    identity_keys = sorted(
+        {
+            str(identity.get("partition_id") or json.dumps(identity, sort_keys=True))
+            for record in partition_records
+            for identity in record["identities"]
+        }
+    )
+    partition_ids = sorted(
+        {
+            str(identity.get("partition_id"))
+            for record in partition_records
+            for identity in record["identities"]
+            if identity.get("partition_id")
+        }
+    )
+    corpus_ids = sorted(
+        {
+            str(identity.get("corpus_id"))
+            for record in partition_records
+            for identity in record["identities"]
+            if identity.get("corpus_id")
+        }
+    )
+    legacy_files = [record["path"] for record in partition_records if not record["identities"]]
+    partition_errors: list[str] = []
+    if len(identity_keys) > 1:
+        partition_errors.append(
+            "Selected processed caches belong to multiple processing spaces: "
+            + ", ".join(identity_keys)
+        )
+    if len(corpus_ids) > 1:
+        partition_errors.append(
+            "Selected processed caches belong to multiple corpus IDs: "
+            + ", ".join(corpus_ids)
+        )
+    if identity_keys and legacy_files:
+        partition_errors.append(
+            "Selected processed caches mix partition-aware files with legacy files without a partition identity: "
+            + ", ".join(legacy_files[:5])
+        )
+    selected_partition = next(
+        (
+            identity
+            for record in partition_records
+            for identity in record["identities"]
+            if identity.get("partition_id")
+        ),
+        {},
+    )
     summary = summarize_reports([item["report"] for item in raw_reports])
     return {
-        "valid": all(item["report"].valid for item in raw_reports),
+        "valid": all(item["report"].valid for item in raw_reports) and not partition_errors,
         "summary": summary,
         "files": files,
         "warnings": warnings,
         "raw_reports": raw_reports,
+        "partition_isolation": {
+            "valid": not partition_errors,
+            "partition": selected_partition,
+            "partition_ids": partition_ids,
+            "corpus_ids": corpus_ids,
+            "legacy_file_count": len(legacy_files),
+            "errors": partition_errors,
+        },
     }
 
 def prune_document_graph(documents: list[ProcessedDocument]) -> list[ProcessedDocument]:
@@ -678,7 +748,7 @@ def episode_metadata_entry(
 ) -> dict[str, Any]:
     speakers = sorted({speaker for doc in selected for speaker in document_speakers(doc.metadata)})
     source_content = episode.source_content_fingerprint or episode.fingerprint
-    return {
+    entry = {
         "source_file": str(episode.path),
         "source_fingerprint": episode.fingerprint,
         "source_content_fingerprint": episode.source_content_fingerprint,
@@ -697,6 +767,10 @@ def episode_metadata_entry(
         "speakers": [{"id": slugify(speaker), "name": speaker} for speaker in speakers],
         "imported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    if episode.partition_identity:
+        entry["partition"] = dict(episode.partition_identity)
+        entry.update(episode.partition_identity)
+    return entry
 
 
 def infer_primary_host_name(plan: ImportPlan, imported_episodes: list[dict[str, Any]]) -> str:
@@ -933,6 +1007,13 @@ def write_podcast_metadata(
             entry["description"] = "Primary host"
         speaker_entries.append(entry)
     dates = [episode["episode_date"] for episode in imported_episodes if episode.get("episode_date")]
+    partition_candidates = [
+        episode.get("partition")
+        for episode in imported_episodes
+        if isinstance(episode.get("partition"), dict)
+        and (episode.get("partition", {}).get("partition_id") or episode.get("partition", {}).get("corpus_id"))
+    ]
+    partition = partition_candidates[0] if partition_candidates else {}
     payload = {
         "podcast_name": plan.podcast_name,
         "database_id": plan.database_id,
@@ -958,4 +1039,7 @@ def write_podcast_metadata(
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "generated_by": "Chroma DB Import UI",
     }
+    if partition:
+        payload["partition"] = dict(partition)
+        payload.update(partition)
     metadata_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")

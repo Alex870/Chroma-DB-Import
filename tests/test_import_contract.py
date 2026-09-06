@@ -4,6 +4,7 @@ from pathlib import Path
 from chroma_db_import import ImportConfig, should_include_document
 from chroma_db_import.contract import (
     build_import_manifest,
+    partition_identities,
     validate_document_items,
     validate_podcast_metadata,
 )
@@ -76,6 +77,33 @@ class ImportContractTests(unittest.TestCase):
 
         self.assertEqual(manifest["manifest_version"], "2.0")
         self.assertEqual(manifest["document_counts"]["document_count"], 2)
+
+    def test_partition_identity_is_preserved_in_manifest(self):
+        payload = {
+            "partition": {
+                "partition_id": "podcast",
+                "partition_display_name": "Podcast",
+                "context_type": "podcast",
+                "workflow_profile": "podcast",
+            },
+            "documents": [{"metadata": {"partition_id": "podcast"}}],
+        }
+
+        identities = partition_identities(payload)
+        manifest = build_import_manifest(
+            config={"collection_name": "test"},
+            source_files=[{"path": "fixture.json", "fingerprint": "abc"}],
+            validation_results=[],
+            embedding_model="model",
+            embedding_dimension=1024,
+            collection_name="collection",
+            partition_identity=identities[0],
+        )
+
+        self.assertEqual([item["partition_id"] for item in identities], ["podcast"])
+        self.assertEqual(manifest["partition_id"], "podcast")
+        self.assertEqual(manifest["corpus_id"], "podcast")
+        self.assertEqual(manifest["partition"]["partition_display_name"], "Podcast")
 
     def test_podcast_metadata_validation(self):
         report = validate_podcast_metadata(

@@ -16,6 +16,9 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+chroma_db_import = ["prompts/*.txt"]
+
 [project.scripts]
 chroma-db-import = "chroma_db_import.cli:main"
 chroma-corpus-release = "chroma_db_import.release_cli:main"

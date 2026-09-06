@@ -104,13 +104,13 @@ conda run -n chroma-db-import python -m chroma_db_import.release_cli plan-releas
   --store ".\state\corpus-releases" `
   --embedding ".\state\embedding-identity.json" `
   --selection "approved-speaker-selection-v1" `
-  --export "D:\Pod Cast RAG\ChromaDB\TFM" `
+  --export "D:\Pod Cast RAG\ChromaDB\podcast" `
   --output ".\state\corpus-release-plan.json"
 
 conda run -n chroma-db-import python -m chroma_db_import.release_cli stage `
   ".\state\corpus-release-plan.json" `
   --store ".\state\corpus-releases" `
-  --export "D:\Pod Cast RAG\ChromaDB\TFM"
+  --export "D:\Pod Cast RAG\ChromaDB\podcast"
 ```
 
 Inspect the release plan before promotion, then provide its exact `plan_id`:
@@ -255,6 +255,103 @@ Each completed CLI import writes `import_manifest.json` inside `persist_dir`. Th
 ## Shared Data Contract
 
 The expected transcript, processed-cache, Chroma metadata, and `podcast.json` fields are documented in [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md). The executable checks live in [`src/chroma_db_import/contract.py`](src/chroma_db_import/contract.py), with a root compatibility wrapper at `chroma_import_contract.py`; use that module when changing any upstream or downstream project so the four-tool pipeline stays compatible.
+
+## Managed contexts
+
+Managed mode creates one independent Chroma database for each Podcast-RAG
+partition. The producer handoff/release manifest is authoritative for
+`partition_id`, `corpus_id`, and `episode_uid`; the importer never assigns a
+partition from a folder or filename. See the authoritative
+[`transcription-handoff-contract.md`](C:/temp/codex/Podcast-RAG-pipeline/transcription-handoff-contract.md).
+
+Use the desktop app's **Contexts** action to link a Podcast-RAG project once,
+discover valid handoffs/releases, inspect each context, and import its newest
+release. Contexts and local preferences are stored in the private
+`state/context_catalog.sqlite3` catalog, so JSON editing is not required.
+
+The equivalent headless workflow is:
+
+```powershell
+chroma-db-import contexts link-source --root "C:\path\to\Podcast-RAG-pipeline" --output-root "D:\RAG\databases"
+chroma-db-import contexts discover
+chroma-db-import contexts list
+chroma-db-import import --partition podcast-history
+chroma-db-import status --partition podcast-history
+chroma-db-import contexts set-dedup --partition podcast-history --profile safe
+chroma-db-import import --partition podcast-history --dry-run
+chroma-db-import contexts review-dedup --partition podcast-history
+```
+
+Each managed export is isolated under
+`<output-root>\partitions\<partition_id>\releases\<release_id>\export` and
+contains `chroma.sqlite3`, `podcast.json`, `import_manifest.json`, and a
+downstream release record. Normal managed imports reject mixed partitions;
+cross-context aggregation requires a separate future aggregation contract.
+
+Managed contexts use a local SQLite catalog rather than hand-edited JSON. New
+producer-defined contexts default to the `safe` deduplication profile. Existing
+catalogs migrate conservatively to `off`; change that choice explicitly with
+`contexts set-dedup`. `safe` suppresses only exact copies with matching source
+span, source revision, producer metadata, and embedding input. `audit` retains
+all eligible records while recording what Safe would suppress. `off` preserves
+the existing v1 export behavior. Near matches are a bounded lexical report and
+never suppress records in v1.
+
+Safe and Audit exports declare `chroma-export-release-v2` and the
+`dedup-aliases-v1` capability. They include a portable occurrence ledger so a
+consumer can resolve direct aliases while retaining original provenance. PodCast
+Chat must explicitly support that capability; this repository does not claim
+live Chat integration. Use `contexts review-dedup` to inspect validated groups,
+reasons, coverage, and near-report completeness before opening a database.
+Changing deduplication, embedding, or representation settings creates a new
+immutable downstream release/vector space. Rebuild-only migration is required
+when adopting legacy flat folders; legacy content is never silently imported as
+a managed context.
+
+### Semantic redundancy assessment
+
+Semantic redundancy is an opt-in, advisory assessment over a validated managed
+v2 release. It never rewrites the active release, deletes evidence, or turns a
+semantic relationship into an exact alias. The default retrieval mode remains
+`ranked`; `semantic_mmr` and `preserve_occurrences` are bundle-side selection
+modes for a consumer that explicitly supports the contract.
+
+The model-free preview and assessment commands are:
+
+```powershell
+$env:PYTHONPATH = Join-Path (Get-Location) 'src'
+python -m chroma_db_import redundancy policy --catalog .\state\context_catalog.sqlite3 --partition podcast-history
+python -m chroma_db_import redundancy configure-judge --catalog .\state\context_catalog.sqlite3 --partition podcast-history --base-url http://localhost:1234/v1 --model <explicit-installed-model-id>
+python -m chroma_db_import redundancy models --base-url http://localhost:1234/v1
+python -m chroma_db_import redundancy preview --catalog .\state\context_catalog.sqlite3 --partition podcast-history --release <release-id>
+python -m chroma_db_import redundancy assess --catalog .\state\context_catalog.sqlite3 --partition podcast-history --release <release-id> --channels lexical,structural
+python -m chroma_db_import redundancy review --bundle <published-bundle>
+python -m chroma_db_import redundancy label-export --bundle <published-bundle> --output .\state\redundancy-labels.json
+python -m chroma_db_import redundancy evaluate --bundle <published-bundle> --labels .\state\redundancy-labels.json --output .\state\redundancy-evaluation.json
+# Optional measured query arm (JSON object: arm -> query_id -> ranked occurrence IDs)
+python -m chroma_db_import redundancy evaluate --bundle <published-bundle> --labels .\state\redundancy-labels.json --queries .\state\redundancy-queries.json --query-results .\state\redundancy-query-results.json --output .\state\redundancy-evaluation.json
+```
+
+The desktop importer exposes the same workflow from the selected Context via
+the **Redundancy** panel: scoped policy/model configuration, Preview, Assess,
+bounded Pilot Judge, Resume/Cancel, bundle Review, label export, and frozen
+evaluation. These actions run away from the UI thread and remain advisory;
+they do not activate a bundle in the consumer.
+
+Dense assessment requires the configured Chroma runtime and uses the stored
+vectors without calling an embedding provider. A local judge pilot additionally
+requires an explicitly configured LM Studio model; the client uses only the
+loopback-compatible `/v1/models` and `/v1/chat/completions` endpoints. Missing
+runtime, model, query measurements, or human-reviewed labels remain explicit
+pending/insufficient-evidence states. A published redundancy bundle is portable
+evidence plus candidate/judgment artifacts; it does not include catalog state,
+credentials, or a request to automatically activate a retrieval mode.
+Shared-input bundles attempt to materialize a separate cosine Chroma collection
+containing one vector per verified identical embedding input, with a portable
+JSON sidecar retained for validation. If Chroma is unavailable, the bundle
+records the JSON fallback explicitly; it is not presented as a live compact
+consumer backend. No semantic relationship deletes or rewrites evidence, and
+full-base recovery remains an explicit consumer choice.
 
 ## Direct Python Usage
 

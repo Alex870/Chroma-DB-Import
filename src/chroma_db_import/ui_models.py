@@ -28,6 +28,7 @@ class Episode:
     node_counts: dict[str, int]
     source_content_fingerprint: str = ""
     schema_version: str = ""
+    partition_identity: dict[str, str] = field(default_factory=dict)
 
     @property
     def sort_key(self) -> tuple[str, str]:

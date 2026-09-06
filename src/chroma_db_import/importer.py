@@ -19,6 +19,12 @@ from chroma_db_import.providers import EmbeddingCompatibilityError, create_embed
 from chroma_db_import.providers import pinned_revision
 from chroma_db_import.representation import recommended_batch_size
 from chroma_db_import.staging import operation_id, staging_collection_name, validate_staged_records
+from chroma_db_import.deduplication import (
+    DEDUP_KEY_VERSION,
+    DedupPlan,
+    DeduplicationError,
+    resolve_dedup_policy,
+)
 
 def cache_fingerprint(path: Path) -> str:
     return file_fingerprint(path)
@@ -28,8 +34,14 @@ def load_processed_payload(cache_path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {"documents": []}
 
 def load_processed_documents(cache_path: Path) -> list[Document]:
-    runtime.load_runtime_deps()
-    Document = runtime.Document
+    try:
+        runtime.load_runtime_deps()
+        Document = runtime.Document
+    except ModuleNotFoundError:
+        class Document:  # type: ignore[no-redef]
+            def __init__(self, page_content: str, metadata: dict[str, Any]):
+                self.page_content = page_content
+                self.metadata = metadata
     payload = json.loads(cache_path.read_text(encoding="utf-8"))
     docs = []
     for item in payload.get("documents", []):
@@ -130,6 +142,8 @@ class ChromaImporter:
         runtime.load_runtime_deps()
         Chroma = runtime.Chroma
         self.config = config
+        if resolve_dedup_policy(config.dedup_policy, default_profile="off")["profile"] != "off" and not config.managed_partition_identity:
+            raise DeduplicationError("deduplication is managed-only; provide validated partition identity")
         self.project_dir = project_dir
         self.spec = representation_spec(config)
         self.embeddings, self.provider_diagnostics = create_embedding_provider(self.spec, config.embedding_device)
@@ -213,10 +227,10 @@ class ChromaImporter:
         write_json(self.batch_state_path(cache_path), state)
 
     def embedding_cache_path(self, doc: Document) -> Path:
-        key = hashlib.sha256(json.dumps({
-            "content_hash": document_content_hash(doc),
-            "representation_id": self.spec.representation_id,
-        }, sort_keys=True).encode("utf-8")).hexdigest()
+        # The cache identity is the exact provider input plus representation,
+        # never the post-import metadata or a normalized-text dedup key.
+        key = embedding_fingerprint(doc.page_content, dict(doc.metadata or {}), self.spec)
+        key = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self.embedding_cache_dir / f"{key}.json"
 
     def cached_embeddings(self, docs: list[Document]) -> tuple[list[list[float] | None], int]:
@@ -231,13 +245,16 @@ class ChromaImporter:
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8"))
                     vector = payload.get("embedding")
-                    expected_content_hash = document_content_hash(doc)
+                    expected_embedding_fingerprint = embedding_fingerprint(
+                        doc.page_content, dict(doc.metadata or {}), self.spec
+                    )
                     if (
-                        payload.get("content_hash") == expected_content_hash
+                        payload.get("cache_format_version") == 2
+                        and payload.get("embedding_fingerprint") == expected_embedding_fingerprint
                         and payload.get("representation_id") == self.spec.representation_id
                         and isinstance(vector, list)
                         and len(vector) == self.embedding_dimension
-                        and all(math.isfinite(float(value)) for value in vector)
+                        and all(not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)) for value in vector)
                     ):
                         cached.append([float(value) for value in vector])
                         hits += 1
@@ -246,38 +263,67 @@ class ChromaImporter:
                     pass
                 invalidations += 1
             cached.append(None)
-        self.last_cache_stats = {"hits": hits, "misses": len(docs) - hits, "invalidations": invalidations, "cache_size": len(list(self.embedding_cache_dir.glob("*.json"))) if self.embedding_cache_dir.exists() else 0}
+        self.last_cache_stats = {"hits": hits, "disk_hit_records": hits, "misses": len(docs) - hits, "invalidations": invalidations, "cache_size": len(list(self.embedding_cache_dir.glob("*.json"))) if self.embedding_cache_dir.exists() else 0}
         return cached, hits
 
     def embed_documents_cached(self, docs: list[Document]) -> tuple[list[list[float]], int]:
         cached, hits = self.cached_embeddings(docs)
         missing_indexes = [idx for idx, vector in enumerate(cached) if vector is None]
+        provider_inputs = 0
+        shared_vector_records = 0
         if missing_indexes:
-            missing_texts = [embedding_text(docs[idx].page_content, dict(docs[idx].metadata or {}), self.spec.contextualization) for idx in missing_indexes]
+            by_fingerprint: dict[str, list[int]] = {}
+            for idx in missing_indexes:
+                fingerprint = embedding_fingerprint(docs[idx].page_content, dict(docs[idx].metadata or {}), self.spec)
+                by_fingerprint.setdefault(fingerprint, []).append(idx)
+            fingerprints = sorted(by_fingerprint)
+            missing_texts = [
+                embedding_text(docs[by_fingerprint[fingerprint][0]].page_content, dict(docs[by_fingerprint[fingerprint][0]].metadata or {}), self.spec.contextualization)
+                for fingerprint in fingerprints
+            ]
+            provider_inputs = len(missing_texts)
             embedded = self.embeddings.embed_documents(missing_texts)
-            for idx, vector in zip(missing_indexes, embedded):
+            if len(embedded) != provider_inputs:
+                raise EmbeddingCompatibilityError(
+                    f"Embedding provider returned {len(embedded)} vectors for {provider_inputs} inputs"
+                )
+            for fingerprint, vector in zip(fingerprints, embedded):
+                if not isinstance(vector, list) or len(vector) != self.embedding_dimension or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in vector):
+                    raise EmbeddingCompatibilityError("Embedding provider returned an invalid vector")
+                for idx in by_fingerprint[fingerprint]:
+                    if len(by_fingerprint[fingerprint]) > 1:
+                        shared_vector_records += 1
+                    cached[idx] = [float(value) for value in vector]
+                idx = by_fingerprint[fingerprint][0]
                 cached[idx] = vector
                 if self.config.cache_embeddings:
                     write_json(
                         self.embedding_cache_path(docs[idx]),
                         {
+                            "cache_format_version": 2,
                             "representation": self.spec.as_dict(),
                             "representation_id": self.spec.representation_id,
-                            "content_hash": document_content_hash(docs[idx]),
-                            "embedding_fingerprint": embedding_fingerprint(docs[idx].page_content, dict(docs[idx].metadata or {}), self.spec),
+                            "embedding_fingerprint": fingerprint,
                             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                            "embedding": vector,
+                            "embedding": [float(value) for value in vector],
                         },
                     )
+        self.last_cache_stats.update({"provider_document_inputs": provider_inputs, "shared_vector_records": shared_vector_records, "disk_hit_records": hits})
         return [vector or [] for vector in cached], hits
 
-    def import_cache(self, cache_path: Path, dry_run: bool = False) -> dict[str, Any]:
+    def import_cache(self, cache_path: Path, dry_run: bool = False, *, dedup_plan: DedupPlan | None = None) -> dict[str, Any]:
         """Import one processed cache file, resuming batch progress when available."""
+        if dedup_plan is not None:
+            resolved_policy = resolve_dedup_policy(self.config.dedup_policy, default_profile="off")
+            if resolved_policy != dedup_plan.policy:
+                raise DeduplicationError("dedup plan policy does not match effective import configuration")
+            if dedup_plan.representation_id and dedup_plan.representation_id != self.spec.representation_id:
+                raise DeduplicationError("dedup plan representation does not match effective import configuration")
         docs = load_processed_documents(cache_path)
         payload = load_processed_payload(cache_path)
         validate_documents(docs, str(cache_path))
         docs = [doc for doc in docs if has_text(doc.page_content) and should_include_document(doc, self.config)]
-        source_cache = str(cache_path.resolve())
+        source_cache = cache_path.name if self.config.portable_artifacts else str(cache_path.resolve())
         episode_id = str((docs[0].metadata if docs else {}).get("episode_id") or payload.get("episode_id") or cache_path.stem)
         source_content_fingerprint = content_fingerprint(cache_path)
         source_record_identity = source_identity(
@@ -291,25 +337,76 @@ class ChromaImporter:
         current: dict[str, dict[str, str]] = {}
         for doc in docs:
             item_id = document_id(doc)
+            if dedup_plan is not None:
+                planned = dedup_plan.inputs.get(item_id)
+                if planned is None:
+                    raise DeduplicationError(f"cache document {item_id} is absent from the release dedup plan")
+                if planned.cache_locator and Path(planned.cache_locator).resolve() != cache_path.resolve():
+                    raise DeduplicationError(f"dedup plan cache binding mismatch for {item_id}")
+                if planned.partition_id and self.config.managed_partition_identity and planned.partition_id != self.config.managed_partition_identity.get("partition_id"):
+                    raise DeduplicationError(f"dedup plan partition mismatch for {item_id}")
+                if planned.verified_cache_fingerprint not in {source_content_fingerprint, str(payload.get("cache_fingerprint") or ""), str(payload.get("source_fingerprint") or "")}:
+                    raise DeduplicationError(f"dedup plan cache fingerprint mismatch for {item_id}")
+                decision = dedup_plan.decisions.get(item_id)
+                if decision is None:
+                    raise DeduplicationError(f"dedup plan is missing decision for {item_id}")
+                if decision.suppressed:
+                    continue
             fingerprints = document_fingerprints(doc, self.spec)
             metadata = sanitize_metadata(doc.metadata)
             metadata.update(fingerprints)
+            if self.config.managed_partition_identity:
+                for key, value in self.config.managed_partition_identity.items():
+                    if value not in (None, ""):
+                        metadata.setdefault(key, value)
+                if not metadata.get("episode_uid") and metadata.get("episode_id"):
+                    metadata["episode_uid"] = (
+                        f"{self.config.managed_partition_identity.get('partition_id')}:{metadata['episode_id']}"
+                    )
+            if self.config.upstream_release_id:
+                metadata["upstream_release_id"] = self.config.upstream_release_id
+            if self.config.handoff_ids:
+                metadata["handoff_ids"] = json.dumps(sorted(set(self.config.handoff_ids)), ensure_ascii=True)
             metadata["import_source_cache"] = source_cache
             metadata["source_content_fingerprint"] = source_content_fingerprint
             metadata["source_identity"] = source_record_identity
             metadata["schema_version"] = str(payload.get("schema_version") or "")
+            if dedup_plan is not None:
+                planned = dedup_plan.inputs[item_id]
+                decision = dedup_plan.decisions[item_id]
+                metadata.update({
+                    "dedup_key_version": DEDUP_KEY_VERSION,
+                    "normalized_text_hash": planned.normalized_text_hash,
+                    "duplicate_status": (
+                        "canonical" if decision.duplicate_group_id and decision.preferred_canonical_id == item_id
+                        else "retained_exact" if decision.duplicate_group_id
+                        else "unique"
+                    ),
+                    "duplicate_method": decision.method if decision.method != "none" else "none",
+                    "duplicate_of": decision.alias_target_id or (decision.preferred_canonical_id if decision.duplicate_group_id and decision.preferred_canonical_id != item_id else ""),
+                    "dedup_policy_version": dedup_plan.policy["policy_version"],
+                })
+                if planned.source_span_hash:
+                    metadata["source_span_hash"] = planned.source_span_hash
+                if decision.duplicate_group_id:
+                    metadata["duplicate_group_id"] = decision.duplicate_group_id
             prepared[item_id] = Document(page_content=doc.page_content, metadata=metadata)
             current[item_id] = {**fingerprints, "source_identity": source_record_identity}
         existing = self.existing_records(list(prepared), source_cache)
         reconciliation = plan_reconciliation(current, existing)
         summary = summarize_documents_for_plan(docs)
+        if dedup_plan is not None:
+            planned_stored = set(dedup_plan.stored_ids)
+            if set(prepared) - planned_stored:
+                raise DeduplicationError("prepared cache contains IDs that are not planned for storage")
         if dry_run:
             return {
                 "documents": len(docs),
                 "inserted": 0,
                 "skipped_existing": len(reconciliation.unchanged),
                 "reconciliation": reconciliation.as_dict(),
-                "summary": summary,
+            "summary": summary,
+                "dedup": dedup_plan.as_counts() if dedup_plan is not None else None,
                 "dry_run": True,
             }
 
@@ -364,6 +461,7 @@ class ChromaImporter:
             "embedding_probe": self.embedding_probe,
             "reconciliation": reconciliation.as_dict(),
             "embedding_cache": getattr(self, "last_cache_stats", {}),
+            "dedup": dedup_plan.as_counts() if dedup_plan is not None else None,
             "staging": validation.as_dict(),
         }
         if not validation.valid:

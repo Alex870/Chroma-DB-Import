@@ -20,5 +20,6 @@
   "update": false,
   "expected_embedding_model": "",
   "selected_speakers": [],
-  "troubleshooting_dir": "state/diagnostics"
+  "troubleshooting_dir": "state/diagnostics",
+  "portable_artifacts": false
 }

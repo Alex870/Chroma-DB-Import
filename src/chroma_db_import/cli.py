@@ -6,6 +6,7 @@ import time
 import hashlib
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import chroma_db_import.runtime as runtime
@@ -25,10 +26,25 @@ from chroma_db_import.importer import ChromaImporter, cache_fingerprint, iter_ca
 from chroma_db_import.state import load_state, save_state
 from chroma_db_import.importer import representation_spec
 from chroma_db_import.providers import download_model
+from chroma_db_import.deduplication import DedupPlan
+from chroma_db_import.deduplication import resolve_dedup_policy, DeduplicationError
 
 
-def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
+def run_import(
+    config: ImportConfig,
+    project_dir: Path,
+    one_file: bool,
+    *,
+    allow_mixed_partitions: bool = False,
+    selected_files: list[Path] | None = None,
+    write_snapshot: bool = True,
+    dedup_plan: DedupPlan | None = None,
+) -> int:
     """Import processed cache files into a Chroma collection with resumable state."""
+    if resolve_dedup_policy(config.dedup_policy, default_profile="off")["profile"] != "off" and not config.managed_partition_identity:
+        raise DeduplicationError("deduplication is managed-only; provide validated managed partition identity")
+    if dedup_plan is not None and resolve_dedup_policy(dedup_plan.policy, default_profile="off")["profile"] != "off" and not config.managed_partition_identity:
+        raise DeduplicationError("deduplication plans require validated managed partition identity")
     runtime.load_runtime_deps()
     from chroma_db_import.config import resolve_path
 
@@ -37,8 +53,13 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
     stop_file = resolve_path(project_dir, config.stop_file)
     state = load_state(state_path)
 
-    files = iter_cache_files(processed_data_dir, config.file_glob)
-    preflight = preflight_files(config, project_dir, files)
+    files = list(selected_files) if selected_files is not None else iter_cache_files(processed_data_dir, config.file_glob)
+    preflight = preflight_files(
+        config,
+        project_dir,
+        files,
+        allow_mixed_partitions=allow_mixed_partitions,
+    )
     preflight_path = write_preflight_report(config, project_dir, preflight)
     print(f"Preflight report written: {preflight_path}")
     print(
@@ -47,6 +68,8 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
     )
     for warning in preflight.get("safety_warnings") or []:
         print(f"  safety warning: {warning}")
+    for error in (preflight.get("partition_isolation") or {}).get("errors") or []:
+        print(f"  partition isolation error: {error}")
     if not preflight["valid"]:
         for source in preflight["source_files"]:
             for error in source["validation"]["errors"][:5]:
@@ -61,7 +84,7 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
     if config.dry_run:
         print("Dry-run reconciliation preview; no Chroma writes will be performed.")
         for path in files:
-            result = importer.import_cache(path, dry_run=True)
+            result = importer.import_cache(path, dry_run=True, dedup_plan=dedup_plan)
             counts = result["reconciliation"]
             print(
                 f"  {path.name}: added={len(counts['added'])}, changed={len(counts['changed'])}, "
@@ -81,15 +104,17 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
     total_inserted = 0
     total_skipped = 0
     total_embedding_hits = 0
+    completed = True
     for idx, (path, fingerprint) in enumerate(pending, 1):
         if stop_file.exists():
             print("Stop file detected before starting next import.")
+            completed = False
             break
 
         print(f"\nFile {idx}/{len(pending)}: {path}")
         try:
             started = time.time()
-            result = importer.import_cache(path, dry_run=False)
+            result = importer.import_cache(path, dry_run=False, dedup_plan=dedup_plan)
             elapsed = max(0.001, time.time() - started)
             total_inserted += int(result.get("inserted") or 0)
             total_skipped += int(result.get("skipped_existing") or 0)
@@ -121,7 +146,31 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
             print("Imported one file; stopping because --one-file was set.")
             break
 
-    manifest_path = write_manifest(config, project_dir, importer, files, preflight)
+    if not completed:
+        print("Import stopped before complete planned coverage; no immutable snapshot was promoted.")
+        return 2
+
+    if dedup_plan is not None:
+        # The plan is the release-wide storage contract.  Check the actual
+        # collection before writing a manifest so a stale state file, partial
+        # reconciliation, or unexpected provider behavior cannot be published
+        # as a valid managed release.
+        try:
+            collection = getattr(importer.vectorstore, "_collection", None)
+            stored_payload = collection.get(include=[]) if collection is not None else importer.vectorstore.get(include=[])
+            stored_ids = {str(item) for item in (stored_payload.get("ids") or [])}
+        except Exception as exc:
+            raise DeduplicationError(f"could not validate the stored ID inventory: {exc}") from exc
+        expected_ids = set(dedup_plan.stored_ids)
+        if stored_ids != expected_ids:
+            missing = sorted(expected_ids - stored_ids)
+            unexpected = sorted(stored_ids - expected_ids)
+            raise DeduplicationError(
+                "stored ID inventory disagrees with the dedup plan "
+                f"(missing={missing[:5]}, unexpected={unexpected[:5]})"
+            )
+
+    manifest_path = write_manifest(config, project_dir, importer, files, preflight, dedup_plan=dedup_plan)
     elapsed_total = max(0.001, time.time() - batch_started)
     print(
         f"Import summary: inserted={total_inserted}, skipped_existing={total_skipped}, "
@@ -129,8 +178,9 @@ def run_import(config: ImportConfig, project_dir: Path, one_file: bool) -> int:
         f"docs_per_second={total_inserted / elapsed_total:.2f}"
     )
     print(f"Import manifest written: {manifest_path}")
-    snapshot_path = write_immutable_export(config, project_dir, importer.persist_dir, manifest_path)
-    print(f"Immutable export written: {snapshot_path}")
+    if write_snapshot:
+        snapshot_path = write_immutable_export(config, project_dir, importer.persist_dir, manifest_path)
+        print(f"Immutable export written: {snapshot_path}")
     print("\nImport complete.")
     return 0
 
@@ -157,11 +207,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contextualization", choices=("none", "minimal", "full"), help="Embedding-only contextual header profile.")
     parser.add_argument("--experimental-bge-m3", action="store_true", help="Build with the pinned experimental BGE-M3 dense provider profile.")
     parser.add_argument("--download-model", action="store_true", help="Explicitly download the configured embedding model, then exit.")
+    parser.add_argument(
+        "--allow-mixed-partitions",
+        action="store_true",
+        help="Explicitly allow importing caches from multiple processing spaces into one collection.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     """CLI entry point for Chroma import, diagnostics, and collection inspection."""
+    if len(sys.argv) > 1 and sys.argv[1] == "redundancy":
+        from chroma_db_import.redundancy_cli import main as redundancy_main
+        return redundancy_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] in {"contexts", "import", "status"}:
+        from chroma_db_import.managed import ManagedContextError, managed_main
+
+        try:
+            return managed_main(sys.argv[1:])
+        except ManagedContextError as exc:
+            print(f"Managed context command failed: {exc}")
+            return 1
     args = parse_args()
     config_path = Path(args.config).expanduser()
     project_dir = config_path.resolve().parent if config_path.exists() else Path.cwd()
@@ -206,7 +272,12 @@ def main() -> int:
         return inspect_collection(config, project_dir)
     if args.delete_collection:
         return delete_collection(config, project_dir)
-    return run_import(config, project_dir, args.one_file)
+    return run_import(
+        config,
+        project_dir,
+        args.one_file,
+        allow_mixed_partitions=args.allow_mixed_partitions,
+    )
 
 
 def write_immutable_export(config: ImportConfig, project_dir: Path, persist_dir: Path, manifest_path: Path) -> Path:
@@ -220,3 +291,7 @@ def write_immutable_export(config: ImportConfig, project_dir: Path, persist_dir:
     shutil.copytree(persist_dir, target)
     (target / "BUILD_IMMUTABLE").write_text(identity + "\n", encoding="ascii")
     return target
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

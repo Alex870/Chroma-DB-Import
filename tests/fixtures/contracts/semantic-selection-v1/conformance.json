@@ -1,0 +1,74 @@
+{
+  "contract_version": "semantic-selection-v1",
+  "cases": [
+    {
+      "name": "same_vectors_choose_orthogonal_alternative",
+      "hits": [
+        {"id": "a", "rank": 0},
+        {"id": "b", "rank": 1},
+        {"id": "c", "rank": 2}
+      ],
+      "vectors": {"a": [1, 0], "b": [1, 0], "c": [0, 1]},
+      "top_k": 2,
+      "mode": "semantic_mmr",
+      "mmr_lambda": 0.75,
+      "selected_ids": ["a", "c"],
+      "fallback_reason": null
+    },
+    {
+      "name": "opposite_vectors_are_not_penalized_below_zero",
+      "hits": [
+        {"id": "a", "rank": 0},
+        {"id": "b", "rank": 1},
+        {"id": "c", "rank": 2}
+      ],
+      "vectors": {"a": [1, 0], "b": [-1, 0], "c": [0, 1]},
+      "top_k": 3,
+      "mode": "semantic_mmr",
+      "mmr_lambda": 0.75,
+      "selected_ids": ["a", "b", "c"],
+      "fallback_reason": null
+    },
+    {
+      "name": "missing_vector_falls_back_for_whole_request",
+      "hits": [
+        {"id": "a", "rank": 0},
+        {"id": "b", "rank": 1}
+      ],
+      "vectors": {"a": [1, 0]},
+      "top_k": 2,
+      "mode": "semantic_mmr",
+      "mmr_lambda": 0.75,
+      "selected_ids": ["a", "b"],
+      "fallback_reason": "vectors_unavailable"
+    },
+    {
+      "name": "preserve_occurrences_keeps_repeated_provenance",
+      "hits": [
+        {"id": "a", "rank": 0, "metadata": {"duplicate_group_id": "g"}},
+        {"id": "b", "rank": 1, "metadata": {"duplicate_group_id": "g"}},
+        {"id": "c", "rank": 2}
+      ],
+      "vectors": null,
+      "top_k": 3,
+      "mode": "preserve_occurrences",
+      "mmr_lambda": 0.75,
+      "selected_ids": ["a", "b", "c"],
+      "fallback_reason": null
+    },
+    {
+      "name": "ranked_mode_collapses_proven_copies",
+      "hits": [
+        {"id": "a", "rank": 0, "metadata": {"duplicate_group_id": "g"}},
+        {"id": "b", "rank": 1, "metadata": {"duplicate_group_id": "g"}},
+        {"id": "c", "rank": 2}
+      ],
+      "vectors": null,
+      "top_k": 3,
+      "mode": "ranked",
+      "mmr_lambda": 0.75,
+      "selected_ids": ["a", "c"],
+      "fallback_reason": null
+    }
+  ]
+}

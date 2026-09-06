@@ -1,11 +1,12 @@
 """M6 release scale, constrained-resource, and clean-machine diagnostics."""
 
 from __future__ import annotations
-import argparse, hashlib, json, shutil, time
+import argparse, gc, hashlib, json, shutil, time
 from pathlib import Path
 from typing import Any
 from .m6_preflight import build_preflight, write_report
 from .releases import inspect_export_work
+from .redundancy_chroma import close_chroma_client
 
 
 def scale_plan(
@@ -123,8 +124,23 @@ def benchmark_collection_writes(
                 ),
             }
         )
-        client._system.stop()
-        chromadb.api.client.SharedSystemClient.clear_system_cache()
+        # Chroma 1.5.x can retain SQLite/segment handles through the
+        # collection object even after the private system is stopped. Release
+        # every local reference before removing the private benchmark store;
+        # otherwise Windows leaves batch-* behind and the cleanup contract
+        # fails nondeterministically.
+        try:
+            client._system.stop()
+        except Exception:
+            pass
+        close_chroma_client(client)
+        collection = None
+        client = None
+        try:
+            chromadb.api.client.SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
+        gc.collect()
         shutil.rmtree(root, ignore_errors=True)
     return {
         "contract_version": "chroma-write-benchmark-1.0",
