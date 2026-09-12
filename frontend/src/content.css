@@ -1,0 +1,41 @@
+.episode-table {
+  border-top: 1px solid #e6ebed;
+  margin: 20px 0;
+  padding-top: 16px;
+}
+
+.episode-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 0.7fr);
+  gap: 14px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid #edf0f2;
+}
+
+.episode-row label {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.episode-row label > span,
+.episode-row small {
+  display: block;
+}
+
+.episode-row small {
+  color: #75848c;
+  margin-top: 3px;
+}
+
+.episode-row > input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #cbd5da;
+  border-radius: 6px;
+}
+
+@media (max-width: 1050px) {
+  .episode-row { grid-template-columns: 1fr; }
+}

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 CONTRACT_VERSION = "runtime-preflight-1.0"
-DEPENDENCY_COMMAND = "python -m pip install -r chroma_db_import_requirements.txt"
+DEPENDENCY_COMMAND = "conda run -n chroma-db-import python -m pip install -r chroma_db_import_requirements.txt"
 
 
 def _hash(v):

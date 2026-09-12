@@ -17,7 +17,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from chroma_db_import.config import ImportConfig, load_config
 from chroma_db_import.contract import (
@@ -39,6 +39,7 @@ from chroma_db_import.dedup_artifacts import validate_dedup_artifacts, write_ded
 from chroma_db_import.managed_lock import ManagedPartitionBusy, ManagedPartitionLock
 from chroma_db_import.redundancy_chroma import close_chroma_client
 from chroma_db_import.redundancy_policy import policy_fingerprint, resolve_redundancy_policy
+from chroma_db_import.representation import QWEN3_MODEL, QWEN3_MODEL_REVISION, QWEN3_PROFILE, resolved_collection_name
 
 
 HANDOFF_CONTRACT = "podcast-rag-transcription-handoff-v1"
@@ -849,18 +850,20 @@ def derive_downstream_release_id(upstream_release_id: str, profile_fingerprint: 
 
 def import_profile_payload(config: ImportConfig) -> dict[str, Any]:
     return {
+        "representation_profile": config.representation_profile,
         "embedding_provider": config.embedding_provider,
         "embedding_model": config.embedding_model,
         "embedding_model_revision": config.embedding_model_revision,
+        "embedding_dimension": config.embedding_dimension,
+        "inference_dtype": config.inference_dtype,
+        "query_instruction_profile": config.query_instruction_profile,
         "normalize_embeddings": config.normalize_embeddings,
         "distance_metric": config.distance_metric,
         "contextualization": config.contextualization,
         "output_dimension": config.output_dimension,
         "matryoshka_compatible": config.matryoshka_compatible,
-        "experimental_bge_m3": config.experimental_bge_m3,
         "selected_speakers": sorted(config.selected_speakers or []),
         "dedup_policy": resolve_dedup_policy(config.dedup_policy, default_profile="safe"),
-        "representation_profile": "bge-m3-shadow" if config.experimental_bge_m3 else "baseline",
         "collection_name": COLLECTION_NAME,
     }
 
@@ -872,9 +875,10 @@ def resolve_managed_config(base_config: ImportConfig, saved_profile: dict[str, A
     payload = saved_profile.get("profile") if isinstance(saved_profile.get("profile"), dict) else saved_profile
     config = replace(base_config)
     for field_name in (
-        "embedding_provider", "embedding_model", "embedding_model_revision",
+        "representation_profile", "embedding_provider", "embedding_model", "embedding_model_revision",
+        "embedding_dimension", "inference_dtype", "query_instruction_profile",
         "normalize_embeddings", "distance_metric", "contextualization",
-        "output_dimension", "matryoshka_compatible", "experimental_bge_m3",
+        "output_dimension", "matryoshka_compatible",
         "selected_speakers", "collection_name",
     ):
         if field_name in payload:
@@ -894,7 +898,12 @@ def _candidate_cache_files(release_path: Path, source_roots: Iterable[Path]) -> 
             continue
         for base in (root, root / "processed_data", root / "processed"):
             if base.exists() and base.is_dir():
-                candidates.update(path for path in base.rglob("*.processed_documents.json") if path.is_file())
+                candidates.update(
+                    path
+                    for path in base.rglob("*.processed_documents.json")
+                    if path.is_file()
+                    and not any(part.casefold() == "reprocess_backups" for part in path.parts)
+                )
     return sorted(candidates)
 
 
@@ -1005,6 +1014,41 @@ def discover(catalog: ManagedCatalog, roots: Iterable[Path] | None = None) -> di
                     report["contexts"].append(context)
             except (OSError, json.JSONDecodeError, ManagedContextError) as exc:
                 report["invalid"].append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+        # A producer partition can legitimately exist before its first release
+        # is published.  Register that validated identity as a release-less
+        # context candidate so the desktop workflow can inspect source status
+        # and publish the first release without requiring manual JSON work.
+        partition_manifests: list[Path] = []
+        direct_partition_manifest = root / "partition.json"
+        if direct_partition_manifest.is_file():
+            partition_manifests.append(direct_partition_manifest)
+        partitions_root = root / "partitions"
+        if partitions_root.is_dir():
+            partition_manifests.extend(sorted(partitions_root.glob("*/partition.json")))
+        for path in partition_manifests:
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not str(payload.get("contract_version") or "").startswith("podcast-rag-partition-"):
+                    continue
+                identity = ContextIdentity.from_mapping(payload, strict=True)
+                if catalog.context(identity.partition_id):
+                    continue
+                _require_registry_mapping(identity, root)
+                partition_payload = payload.get("partition") if isinstance(payload.get("partition"), dict) else payload
+                producer_status = str(partition_payload.get("status") or "active")
+                report["contexts"].append(
+                    catalog.upsert_context(
+                        identity,
+                        source_root=root,
+                        source_manifest=path,
+                        producer_status=producer_status,
+                    )
+                )
+            except (OSError, json.JSONDecodeError, ManagedContextError) as exc:
+                report["invalid"].append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
     return report
 
 
@@ -1098,16 +1142,36 @@ def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstre
                 "imported_at": _now(),
                 **identity.as_dict(),
             }
+    representation = manifest.get("representation") or {}
+    managed_collection_name = resolved_collection_name(
+        str(manifest.get("collection_name") or COLLECTION_NAME),
+        str(representation.get("profile") or QWEN3_PROFILE),
+    )
     podcast = {
         "podcast_name": identity.display_name,
         "database_id": identity.corpus_id,
-        "collection_name": COLLECTION_NAME,
+        "collection_name": managed_collection_name,
         "release_contract_version": DOWNSTREAM_RELEASE_CONTRACT,
         "release_id": downstream_release_id,
         "downstream_release_id": downstream_release_id,
         "representation_id": manifest.get("representation_id") or (manifest.get("representation") or {}).get("representation_id"),
         "embedding_model": manifest.get("embedding_model"),
         "embedding_dimension": manifest.get("embedding_dimension"),
+        "representation_profile": representation.get("profile"),
+        "embedding_provider": representation.get("provider"),
+        "model_revision": representation.get("model_revision"),
+        "embedding_model_revision": representation.get("model_revision"),
+        "inference_dtype": representation.get("inference_dtype"),
+        "query_instruction_profile": representation.get("query_instruction_profile"),
+        "query_document_mode": representation.get("query_document_mode"),
+        "contextualization": representation.get("contextualization"),
+        "context_header_version": representation.get("context_header_version"),
+        "pooling": representation.get("pooling"),
+        "index_schema_version": representation.get("index_schema_version"),
+        "implementation_version": representation.get("implementation_version"),
+        "distance_metric": representation.get("distance_metric"),
+        "normalize_embeddings": representation.get("normalize_embeddings"),
+        "representation": dict(representation),
         "description": f"Managed {identity.context_type} context: {identity.display_name}",
         "episode_count": len(episodes),
         "document_count": sum(int(item.get("document_count") or 0) for item in episodes.values()),
@@ -1123,6 +1187,7 @@ def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstre
     if not podcast_report.valid:
         raise ManagedContextError("generated podcast metadata is invalid: " + "; ".join(podcast_report.errors[:3]))
     manifest["config"] = _portable_config(dict(manifest.get("config") or {}))
+    manifest["collection_name"] = managed_collection_name
     manifest["source_files"] = [{**item, "path": f"processed_data/{Path(str(item.get('path') or '')).name}"} for item in manifest.get("source_files") or []]
     manifest.update(identity.as_dict())
     manifest["partition"] = identity.as_dict()
@@ -1148,6 +1213,21 @@ def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstre
         "representation_id": manifest.get("representation_id") or (manifest.get("representation") or {}).get("representation_id"),
         "embedding_model": manifest.get("embedding_model"),
         "embedding_dimension": manifest.get("embedding_dimension"),
+        "representation_profile": representation.get("profile"),
+        "embedding_provider": representation.get("provider"),
+        "model_revision": representation.get("model_revision"),
+        "embedding_model_revision": representation.get("model_revision"),
+        "inference_dtype": representation.get("inference_dtype"),
+        "query_instruction_profile": representation.get("query_instruction_profile"),
+        "query_document_mode": representation.get("query_document_mode"),
+        "contextualization": representation.get("contextualization"),
+        "context_header_version": representation.get("context_header_version"),
+        "pooling": representation.get("pooling"),
+        "index_schema_version": representation.get("index_schema_version"),
+        "implementation_version": representation.get("implementation_version"),
+        "distance_metric": representation.get("distance_metric"),
+        "normalize_embeddings": representation.get("normalize_embeddings"),
+        "representation": dict(representation),
         "import_profile_fingerprint": profile_fingerprint,
         "created_at": _now(),
     }
@@ -1175,7 +1255,7 @@ def _stamp_collection_identity(export_root: Path, identity: ContextIdentity, ups
     client = None
     try:
         client = chromadb.PersistentClient(path=str(export_root))
-        collection = client.get_collection(COLLECTION_NAME)
+        collection = client.get_collection(resolved_collection_name(COLLECTION_NAME, QWEN3_PROFILE))
         metadata = dict(getattr(collection, "metadata", None) or {})
         metadata.update(
             {
@@ -1188,6 +1268,12 @@ def _stamp_collection_identity(export_root: Path, identity: ContextIdentity, ups
                 "upstream_release_id": upstream_release_id,
                 "chroma_release_id": downstream_release_id,
                 "import_profile_fingerprint": profile_fingerprint,
+                "embedding_model": QWEN3_MODEL,
+                "model_revision": QWEN3_MODEL_REVISION,
+                "profile": QWEN3_PROFILE,
+                "embedding_dimension": 2560,
+                "distance_metric": "cosine",
+                "normalize_embeddings": True,
             }
         )
         if dedup_plan is not None:
@@ -1256,6 +1342,7 @@ def run_managed_import(
     output_root: Path | None = None,
     dry_run: bool = False,
     validation_only: bool = False,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     context = catalog.context(partition_id)
     if not context:
@@ -1284,7 +1371,11 @@ def run_managed_import(
     # only used for local paths and for contexts that have not been cataloged.
     effective_config = resolve_managed_config(config, catalog.profile(partition_id))
 
+    if progress_callback is not None:
+        progress_callback(f"Validating {len(cache_paths)} producer cache(s)...", 0, len(cache_paths))
     preflight = preflight_files(effective_config, project_dir, cache_paths)
+    if progress_callback is not None:
+        progress_callback("Producer cache validation complete", len(cache_paths), len(cache_paths))
     if not preflight["valid"]:
         if not (dry_run or validation_only):
             catalog.update_release(partition_id, release["upstream_release_id"], status="quarantined")
@@ -1300,13 +1391,18 @@ def run_managed_import(
         profile_fingerprint = str(saved_profile["profile_fingerprint"])
     effective_config = resolve_managed_config(effective_config, {"profile": profile, "profile_fingerprint": profile_fingerprint})
     dedup_policy = resolve_dedup_policy(effective_config.dedup_policy, default_profile="off")
+    if progress_callback is not None:
+        progress_callback("Checking duplicate and partition identities...", 0, len(cache_paths))
     dedup_inputs = load_managed_dedup_inputs(
         cache_paths,
         identity,
         upstream,
         representation_spec(effective_config),
         selected_speakers=effective_config.selected_speakers,
+        progress_callback=progress_callback,
     )
+    if progress_callback is not None:
+        progress_callback("Building the release deduplication plan...", 0, 0)
     dedup_plan = build_exact_plan(
         dedup_inputs.inputs,
         dedup_policy,
@@ -1319,6 +1415,8 @@ def run_managed_import(
     output_root = output_root or Path(catalog.get_setting("managed_output_root", str(project_dir / "exports")))
     paths = managed_paths(output_root, partition_id, downstream_release_id)
     if dry_run or validation_only:
+        if progress_callback is not None:
+            progress_callback("Import preview ready", 1, 1)
         return {
             "status": "validated",
             "partition_id": partition_id,
@@ -1329,6 +1427,7 @@ def run_managed_import(
             "preflight": preflight,
             "import_profile_fingerprint": profile_fingerprint,
             "dedup": dedup_plan.as_counts(),
+            "record_ids": dedup_plan.stored_ids,
             "plan_fingerprint": dedup_plan.plan_fingerprint,
         }
     output_root = output_root or Path(catalog.get_setting("managed_output_root", str(project_dir / "exports")))
@@ -1353,6 +1452,7 @@ def run_managed_import(
         managed_config = replace(effective_config)
         managed_config.processed_data_dir = str(cache_paths[0].parent)
         managed_config.persist_dir = str(stage_export)
+        managed_config.storage_path_isolated = True
         managed_config.collection_name = COLLECTION_NAME
         managed_config.portable_artifacts = True
         managed_config.managed_partition_identity = identity.as_dict()
@@ -1370,12 +1470,23 @@ def run_managed_import(
             from chroma_db_import.cli import run_import
             source_fingerprints_before = {path: content_fingerprint(path) for path in cache_paths}
 
-            import_status = run_import(managed_config, project_dir, False, selected_files=cache_paths, write_snapshot=False, dedup_plan=dedup_plan)
+            if progress_callback is not None:
+                progress_callback("Opening the embedding model and staged database...", 0, len(cache_paths))
+            import_kwargs = {
+                "selected_files": cache_paths,
+                "write_snapshot": False,
+                "dedup_plan": dedup_plan,
+            }
+            if progress_callback is not None:
+                import_kwargs["progress_callback"] = progress_callback
+            import_status = run_import(managed_config, project_dir, False, **import_kwargs)
             if import_status not in (0, None):
                 raise ManagedContextError(f"managed import stopped before complete coverage (status {import_status})")
             if any(content_fingerprint(path) != fingerprint for path, fingerprint in source_fingerprints_before.items()):
                 raise ManagedContextError("producer cache changed during managed import; staged release was not promoted")
             manifest_path = stage_export / "import_manifest.json"
+            if progress_callback is not None:
+                progress_callback("Validating the staged Chroma export...", len(cache_paths), len(cache_paths))
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             _stamp_collection_identity(stage_export, identity, release["upstream_release_id"], downstream_release_id, profile_fingerprint, dedup_plan)
             _write_managed_metadata(stage_export, identity, upstream, profile_fingerprint, cache_paths, manifest, upstream_release_id=release["upstream_release_id"], downstream_release_id=downstream_release_id, dedup_plan=dedup_plan if dedup_integration_supported else None)
@@ -1407,6 +1518,8 @@ def run_managed_import(
                 else:
                     raise ManagedContextError(f"managed release already exists with different content: {downstream_release_id}")
             else:
+                if progress_callback is not None:
+                    progress_callback("Promoting the validated database release...", 1, 1)
                 temporary_target = paths["release_root"].with_name(paths["release_root"].name + f".{uuid.uuid4().hex}.tmp")
                 temporary_target.parent.mkdir(parents=True, exist_ok=True)
                 (temporary_target / "export").mkdir(parents=True, exist_ok=True)

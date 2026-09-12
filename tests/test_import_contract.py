@@ -8,6 +8,8 @@ from chroma_db_import.contract import (
     validate_document_items,
     validate_podcast_metadata,
 )
+from chroma_db_import.importer import representation_spec
+from chroma_db_import.representation import QWEN3_MODEL
 
 
 class Doc:
@@ -70,9 +72,10 @@ class ImportContractTests(unittest.TestCase):
             config={"collection_name": "test"},
             source_files=[{"path": "fixture.json", "fingerprint": "abc"}],
             validation_results=[report],
-            embedding_model="model",
-            embedding_dimension=1024,
-            collection_name="collection",
+            embedding_model=QWEN3_MODEL,
+            embedding_dimension=2560,
+            collection_name="collection__qwen3-embedding-4b-shadow",
+            representation=representation_spec(ImportConfig()).as_dict(),
         )
 
         self.assertEqual(manifest["manifest_version"], "2.0")
@@ -94,9 +97,10 @@ class ImportContractTests(unittest.TestCase):
             config={"collection_name": "test"},
             source_files=[{"path": "fixture.json", "fingerprint": "abc"}],
             validation_results=[],
-            embedding_model="model",
-            embedding_dimension=1024,
-            collection_name="collection",
+            embedding_model=QWEN3_MODEL,
+            embedding_dimension=2560,
+            collection_name="collection__qwen3-embedding-4b-shadow",
+            representation=representation_spec(ImportConfig()).as_dict(),
             partition_identity=identities[0],
         )
 
@@ -109,9 +113,10 @@ class ImportContractTests(unittest.TestCase):
         report = validate_podcast_metadata(
             {
                 "database_id": "db",
-                "collection_name": "collection",
-                "embedding_model": "model",
-                "embedding_dimension": 1024,
+                "collection_name": "collection__qwen3-embedding-4b-shadow",
+                "embedding_model": QWEN3_MODEL,
+                "embedding_dimension": 2560,
+                "representation_id": representation_spec(ImportConfig()).representation_id,
                 "speakers": [{"id": "host", "name": "Host"}],
                 "episodes": [{"source_fingerprint": "abc", "episode_date": "2026-01-01", "speakers": [{"name": "Host"}]}],
                 "document_count": 2,

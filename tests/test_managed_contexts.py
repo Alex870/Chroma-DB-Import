@@ -1,11 +1,14 @@
 import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from chroma_db_import.config import ImportConfig
+from chroma_db_import.importer import representation_spec
+from chroma_db_import.representation import QWEN3_MODEL, QWEN3_MODEL_REVISION
 from chroma_db_import.managed import (
     ManagedCatalog,
     ManagedContextError,
@@ -34,6 +37,9 @@ def write_release(root: Path, partition_id: str, corpus_id: str, release_id: str
                 "handoff_ids": [f"handoff-{partition_id}"],
                 "episode_uids": [f"{partition_id}:episode-01"],
                 "cache_schema_version": "2.1",
+                "embedding_model": QWEN3_MODEL,
+                "embedding_model_revision": QWEN3_MODEL_REVISION,
+                "embedding_dimension": 2560,
                 "processed_cache_fingerprints": [cache_fingerprint],
             }
         ),
@@ -92,6 +98,34 @@ def write_handoff(root: Path, *, partition_id: str = "podcast-one", corpus_id: s
 
 
 class ManagedContextTests(unittest.TestCase):
+    def test_discovery_registers_release_less_partition_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            partition_root = root / "partitions" / "podcast-one"
+            partition_root.mkdir(parents=True)
+            (partition_root / "partition.json").write_text(
+                json.dumps(
+                    {
+                        "contract_version": "podcast-rag-partition-1.0",
+                        "partition": {
+                            "partition_id": "podcast-one",
+                            "corpus_id": "podcast-one",
+                            "display_name": "Podcast One",
+                            "context_type": "podcast",
+                            "workflow_profile": "podcast",
+                            "config_fingerprint": "sha256:" + "1" * 64,
+                            "status": "active",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with ManagedCatalog(root / "catalog.sqlite3") as catalog:
+                report = discover(catalog, [root])
+                self.assertFalse(report["invalid"])
+                self.assertEqual(1, len(report["contexts"]))
+                self.assertEqual([], catalog.releases("podcast-one"))
+
     def test_valid_handoff_discovery_checks_identity_and_integrity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -137,11 +171,15 @@ class ManagedContextTests(unittest.TestCase):
                         "partition_display_name": "Podcast One",
                         "context_type": "podcast",
                         "workflow_profile": "podcast",
+                        "embedding_model": QWEN3_MODEL,
                         "documents": [],
                     }
                 ),
                 encoding="utf-8",
             )
+            backup_dir = root / "partitions" / "podcast-one" / "state" / "reprocess_backups" / "backup-01"
+            backup_dir.mkdir(parents=True)
+            shutil.copy2(cache_dir / "same-name.processed_documents.json", backup_dir / "same-name.processed_documents.json")
             release_path = write_release(root, "podcast-one", "corpus-one", "release-01", "cache-one")
             registry_dir = root / "partitions"
             (registry_dir / "registry.json").write_text(
@@ -178,6 +216,7 @@ class ManagedContextTests(unittest.TestCase):
                             "partition_display_name": partition,
                             "context_type": "custom",
                             "workflow_profile": "custom",
+                            "embedding_model": QWEN3_MODEL,
                             "documents": [],
                         }
                     ),
@@ -226,6 +265,7 @@ class ManagedContextTests(unittest.TestCase):
                         "partition_display_name": "Podcast One",
                         "context_type": "podcast",
                         "workflow_profile": "podcast",
+                        "embedding_model": QWEN3_MODEL,
                         "episode_id": "episode-01",
                         "documents": [
                             {"page_content": "evidence", "metadata": {"node_id": "leaf", "node_type": "leaf_chunk", "source": "episode.json", "source_type": "json_transcript", "episode_id": "episode-01", "episode_uid": "podcast-one:episode-01", "episode_title": "Episode", "partition_id": "podcast-one", "corpus_id": "podcast-one", "speaker_scope": "single", "speaker": "Host"}},
@@ -246,13 +286,15 @@ class ManagedContextTests(unittest.TestCase):
                     export = Path(config.persist_dir)
                     export.mkdir(parents=True, exist_ok=True)
                     (export / "chroma.sqlite3").write_bytes(b"fixture")
+                    representation = representation_spec(config).as_dict()
                     (export / "import_manifest.json").write_text(
                         json.dumps(
                             {
                                 "config": {"persist_dir": str(export), "processed_data_dir": str(cache_dir)},
-                                "embedding_model": "fixture-model",
-                                "embedding_dimension": 3,
-                                "representation_id": "fixture-representation",
+                                "embedding_model": representation["model_id"],
+                                "embedding_dimension": representation["dimension"],
+                                "representation_id": representation["representation_id"],
+                                "representation": representation,
                                 "document_counts": {"document_count": 0},
                                 "source_files": [{"path": str(cache), "fingerprint": "cache-one"}],
                             }

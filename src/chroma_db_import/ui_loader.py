@@ -3,6 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from chroma_db_import.asset_filters import (
+    AssetSelection,
+    DEFAULT_ASSET_FILTER,
+    select_asset_files,
+)
 from chroma_db_import.contract import content_fingerprint, partition_identity
 from chroma_db_import.importer import cache_fingerprint
 from chroma_db_import.ui_helpers import document_speakers, first_present
@@ -11,9 +16,18 @@ from chroma_db_import.ui_models import Episode, ProcessedDocument
 class EpisodeLoader:
     """Load processed-document caches and normalize them into episode view models."""
 
-    def load_folder(self, folder: Path) -> list[Episode]:
+    def __init__(self) -> None:
+        self.last_selection = AssetSelection((), (), (), ())
+
+    def load_folder(
+        self,
+        folder: Path,
+        asset_filter: str = DEFAULT_ASSET_FILTER,
+        asset_pattern: str = "",
+    ) -> list[Episode]:
         files = sorted(folder.rglob("*.processed_documents.json"))
-        episodes = [self.load_file(path) for path in files]
+        self.last_selection = select_asset_files(files, asset_filter, asset_pattern)
+        episodes = [self.load_file(path) for path in self.last_selection.selected_paths]
         return sorted(episodes, key=lambda episode: episode.sort_key)
 
     def load_file(self, path: Path) -> Episode:

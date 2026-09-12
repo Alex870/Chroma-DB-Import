@@ -1,0 +1,9 @@
+{
+  "schema_version": "gui-fixture-v1",
+  "selected_variant": "reviewed_speaker_transcript",
+  "documents": [
+    {"page_content": "Host introduces the topic.", "metadata": {"node_id": "ep1-host", "episode_id": "episode-1", "episode_title": "First episode", "episode_date": "2026-01-01", "speaker": "Host", "node_type": "transcript"}},
+    {"page_content": "Host and Guest share context.", "metadata": {"node_id": "ep1-context", "episode_id": "episode-1", "episode_title": "First episode", "episode_date": "2026-01-01", "speakers": ["Host", "Guest"], "node_type": "episode_thesis"}},
+    {"page_content": "Guest explains the example.", "metadata": {"node_id": "ep1-guest", "episode_id": "episode-1", "episode_title": "First episode", "episode_date": "2026-01-01", "speaker": "Guest", "node_type": "transcript"}}
+  ]
+}

@@ -13,11 +13,25 @@ import chroma_db_import.runtime as runtime
 from chroma_db_import.config import ImportConfig, resolve_path
 from chroma_db_import.contract import content_fingerprint, file_fingerprint, has_text, sanitize_metadata, validate_document_items
 from chroma_db_import.state import write_json
-from chroma_db_import.representation import RepresentationSpec, embedding_content_hash, embedding_fingerprint, embedding_text, metadata_fingerprint
+from chroma_db_import.representation import (
+    RepresentationSpec,
+    embedding_content_hash,
+    embedding_fingerprint,
+    embedding_text,
+    metadata_fingerprint,
+    recommended_batch_size,
+    resolve_representation_spec,
+    resolved_collection_name,
+    resolved_profile_path,
+)
 from chroma_db_import.reconciliation import plan_reconciliation, require_delete_confirmation, source_identity
-from chroma_db_import.providers import EmbeddingCompatibilityError, create_embedding_provider, probe_embedding_provider
-from chroma_db_import.providers import pinned_revision
-from chroma_db_import.representation import recommended_batch_size
+from chroma_db_import.providers import (
+    EmbeddingCompatibilityError,
+    EmbeddingMemoryError,
+    create_embedding_provider,
+    preflight_embedding_memory,
+    probe_embedding_provider,
+)
 from chroma_db_import.staging import operation_id, staging_collection_name, validate_staged_records
 from chroma_db_import.deduplication import (
     DEDUP_KEY_VERSION,
@@ -68,20 +82,7 @@ def document_content_hash(doc: Document) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 def representation_spec(config: ImportConfig, dimension: int | None = None) -> RepresentationSpec:
-    model_id = "BAAI/bge-m3" if config.experimental_bge_m3 else config.embedding_model
-    spec = RepresentationSpec(
-        provider=config.embedding_provider,
-        model_id=model_id,
-        model_revision=pinned_revision(model_id, "" if config.experimental_bge_m3 else config.embedding_model_revision),
-        dimension=dimension,
-        normalize_embeddings=config.normalize_embeddings,
-        distance_metric=config.distance_metric,
-        contextualization=config.contextualization,
-        output_dimension=config.output_dimension,
-        matryoshka_compatible=config.matryoshka_compatible,
-    )
-    spec.validate()
-    return spec
+    return resolve_representation_spec(config, dimension)
 
 def document_fingerprints(doc: Document, spec: RepresentationSpec) -> dict[str, str]:
     return {
@@ -147,28 +148,68 @@ class ChromaImporter:
         self.project_dir = project_dir
         self.spec = representation_spec(config)
         self.embeddings, self.provider_diagnostics = create_embedding_provider(self.spec, config.embedding_device)
-        self.persist_dir = resolve_path(project_dir, config.persist_dir)
+        self.embedding_dimension = detect_embedding_dimension(self.embeddings) or self.spec.dimension
+        self.spec = representation_spec(config, self.embedding_dimension)
+        self.provider_diagnostics.update(
+            {
+                "dimension": self.embedding_dimension,
+                "representation_id": self.spec.representation_id,
+            }
+        )
+        self.collection_name = resolved_collection_name(config.collection_name, self.spec.profile)
+        configured_persist_dir = resolve_path(project_dir, config.persist_dir)
+        self.persist_dir = (
+            configured_persist_dir
+            if config.storage_path_isolated
+            else resolved_profile_path(configured_persist_dir, self.spec.profile)
+        )
+        batch_size = max(
+            1,
+            int(
+                config.import_batch_size
+                or recommended_batch_size(
+                    self.provider_diagnostics["device"],
+                    model_id=self.spec.model_id,
+                    profile=self.spec.profile,
+                )
+            ),
+        )
+        self.memory_preflight = (
+            preflight_embedding_memory(
+                self.embeddings,
+                self.spec,
+                device=self.provider_diagnostics["device"],
+                batch_size=batch_size,
+                safety_margin_bytes=config.embedding_memory_safety_margin_bytes,
+            )
+            if config.enable_embedding_memory_preflight
+            else {"status": "disabled", "batch_size": batch_size}
+        )
         self.vectorstore = Chroma(
             embedding_function=self.embeddings,
             persist_directory=str(self.persist_dir),
-            collection_name=config.collection_name,
+            collection_name=self.collection_name,
         )
         existing_metadata = getattr(self.vectorstore._collection, "metadata", None) or {}
+        existing_model = str(existing_metadata.get("model_id") or existing_metadata.get("embedding_model") or "")
+        if existing_model and existing_model != self.spec.model_id:
+            raise EmbeddingCompatibilityError(
+                f"Target collection embedding model {existing_model!r} is incompatible with Qwen3-only imports. "
+                "Create a fresh export; existing vectors were not changed."
+            )
         existing_representation = str(existing_metadata.get("representation_id") or "")
         if existing_representation and existing_representation != self.spec.representation_id:
             raise EmbeddingCompatibilityError(
                 "Target collection embedding representation is incompatible with the requested import. "
                 "Create a new export or run an explicit migration; existing vectors were not changed."
             )
-        self.embedding_dimension = detect_embedding_dimension(self.embeddings)
-        self.spec = representation_spec(config, self.embedding_dimension)
         self.embedding_probe = probe_embedding_provider(self.embeddings, expected_dimension=self.embedding_dimension)
         if existing_metadata.get("embedding_dimension") not in (None, "", self.embedding_dimension):
             raise EmbeddingCompatibilityError(
                 f"Target collection dimension {existing_metadata.get('embedding_dimension')} does not match provider {self.embedding_dimension}."
             )
-        self.embedding_cache_dir = resolve_path(project_dir, config.embedding_cache_dir)
-        self.import_state_dir = resolve_path(project_dir, config.import_state_dir)
+        self.embedding_cache_dir = resolved_profile_path(resolve_path(project_dir, config.embedding_cache_dir), self.spec.profile)
+        self.import_state_dir = resolved_profile_path(resolve_path(project_dir, config.import_state_dir), self.spec.profile)
         self.last_cache_stats = {"hits": 0, "misses": 0, "invalidations": 0, "cache_size": 0}
 
     def existing_ids(self, ids: list[str]) -> set[str]:
@@ -282,7 +323,17 @@ class ChromaImporter:
                 for fingerprint in fingerprints
             ]
             provider_inputs = len(missing_texts)
-            embedded = self.embeddings.embed_documents(missing_texts)
+            try:
+                embedded = self.embeddings.embed_documents(missing_texts)
+            except Exception as exc:
+                from chroma_db_import.providers import is_cuda_oom
+
+                if is_cuda_oom(exc):
+                    raise EmbeddingMemoryError(
+                        f"Embedding batch of {len(missing_texts)} ran out of CUDA memory. "
+                        "Lower import_batch_size to 1 or select the CPU device; no candidate was promoted."
+                    ) from exc
+                raise
             if len(embedded) != provider_inputs:
                 raise EmbeddingCompatibilityError(
                     f"Embedding provider returned {len(embedded)} vectors for {provider_inputs} inputs"
@@ -313,6 +364,12 @@ class ChromaImporter:
 
     def import_cache(self, cache_path: Path, dry_run: bool = False, *, dedup_plan: DedupPlan | None = None) -> dict[str, Any]:
         """Import one processed cache file, resuming batch progress when available."""
+        # ``Document`` is intentionally loaded lazily with the other heavy
+        # runtime dependencies.  Keep a local constructor for the normalized
+        # records created below; the loader's local fallback is not visible
+        # here when the runtime package is unavailable.
+        runtime.load_runtime_deps()
+        document_class = runtime.Document
         if dedup_plan is not None:
             resolved_policy = resolve_dedup_policy(self.config.dedup_policy, default_profile="off")
             if resolved_policy != dedup_plan.policy:
@@ -390,7 +447,7 @@ class ChromaImporter:
                     metadata["source_span_hash"] = planned.source_span_hash
                 if decision.duplicate_group_id:
                     metadata["duplicate_group_id"] = decision.duplicate_group_id
-            prepared[item_id] = Document(page_content=doc.page_content, metadata=metadata)
+            prepared[item_id] = document_class(page_content=doc.page_content, metadata=metadata)
             current[item_id] = {**fingerprints, "source_identity": source_record_identity}
         existing = self.existing_records(list(prepared), source_cache)
         reconciliation = plan_reconciliation(current, existing)
@@ -420,7 +477,17 @@ class ChromaImporter:
         embedding_hits = 0
         batch_state = self.load_batch_state(cache_path)
         completed_batches = set(batch_state.get("completed_batches") or [])
-        batch_size = max(1, int(self.config.import_batch_size or recommended_batch_size(self.provider_diagnostics["device"])))
+        batch_size = max(
+            1,
+            int(
+                self.config.import_batch_size
+                or recommended_batch_size(
+                    self.provider_diagnostics["device"],
+                    model_id=self.spec.model_id,
+                    profile=self.spec.profile,
+                )
+            ),
+        )
         staged_ids: list[str] = []
         staged_docs: list[Document] = []
         staged_embeddings: list[list[float]] = []
@@ -463,17 +530,37 @@ class ChromaImporter:
             "embedding_cache": getattr(self, "last_cache_stats", {}),
             "dedup": dedup_plan.as_counts() if dedup_plan is not None else None,
             "staging": validation.as_dict(),
+            "resource_measurements": {
+                "provider": self.provider_diagnostics,
+                "memory_preflight": self.memory_preflight,
+                "batch_size": batch_size,
+                "device": self.provider_diagnostics.get("device"),
+            },
         }
         if not validation.valid:
             write_json(failure_path, report)
             raise ValueError("Staging validation failed: " + "; ".join(validation.errors[:5]))
 
-        staging_name = staging_collection_name(self.config.collection_name, operation)
+        staging_name = staging_collection_name(self.collection_name, operation)
         client = getattr(self.vectorstore, "_client", None)
         stage_collection = None
         try:
             if client is not None:
-                stage_collection = client.get_or_create_collection(staging_name, metadata={"representation_id": self.spec.representation_id})
+                stage_collection = client.get_or_create_collection(
+                    staging_name,
+                    metadata={
+                        "representation_id": self.spec.representation_id,
+                        "embedding_dimension": self.embedding_dimension,
+                        "profile": self.spec.profile,
+                        "embedding_model": self.spec.model_id,
+                        "model_revision": self.spec.model_revision,
+                        "provider": self.spec.provider,
+                        "normalize_embeddings": self.spec.normalize_embeddings,
+                        "distance_metric": self.spec.distance_metric,
+                        "query_instruction_profile": self.spec.query_instruction_profile,
+                        "query_document_mode": self.spec.query_document_mode,
+                    },
+                )
                 if staged_ids:
                     stage_collection.upsert(
                         ids=staged_ids,
@@ -495,7 +582,21 @@ class ChromaImporter:
             if staged_ids:
                 self.vectorstore._collection.upsert(ids=staged_ids, documents=[doc.page_content for doc in staged_docs], metadatas=[doc.metadata for doc in staged_docs], embeddings=staged_embeddings)
             try:
-                self.vectorstore._collection.modify(metadata={"representation_id": self.spec.representation_id, "embedding_dimension": self.embedding_dimension, "index_schema_version": self.spec.index_schema_version})
+                self.vectorstore._collection.modify(
+                    metadata={
+                        "representation_id": self.spec.representation_id,
+                        "embedding_dimension": self.embedding_dimension,
+                        "index_schema_version": self.spec.index_schema_version,
+                        "profile": self.spec.profile,
+                        "embedding_model": self.spec.model_id,
+                        "model_revision": self.spec.model_revision,
+                        "provider": self.spec.provider,
+                        "normalize_embeddings": self.spec.normalize_embeddings,
+                        "distance_metric": self.spec.distance_metric,
+                        "query_instruction_profile": self.spec.query_instruction_profile,
+                        "query_document_mode": self.spec.query_document_mode,
+                    }
+                )
             except Exception:
                 pass
             report["status"] = "promoted"
@@ -538,6 +639,7 @@ class ChromaImporter:
             "source_classification": reconciliation.source_classification,
             "reconciliation": reconciliation.as_dict(),
             "summary": summary,
+            "resource_measurements": report.get("resource_measurements", {}),
         }
 
 def iter_cache_files(processed_data_dir: Path, file_glob: str) -> list[Path]:

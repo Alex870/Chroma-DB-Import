@@ -6,11 +6,11 @@ contains no model transcripts or credentials.
 ## Baseline — 2026-09-06
 
 - Repository: `C:\temp\codex\Chroma DB Import`
-- Interpreter: `C:\Users\Alex\miniconda3\python.exe` (Python 3.13.12)
+- Interpreter: `C:\Users\Alex\miniconda3\envs\chroma-db-import\python.exe` (Python 3.13.12)
 - Optional dependency probe: `chromadb`, `sentence_transformers`, `numpy`,
   `PySide6`, and `langchain_chroma` are not installed in the configured
   interpreter.
-- Command: `$env:PYTHONPATH = Join-Path (Get-Location) 'src'; python -m unittest discover -s tests -v`
+- Command: `conda run -n chroma-db-import python -m unittest discover -s tests -v`
 - Result before implementation: 89 tests ran; 83 passed, 2 skipped, and 2 failed because the existing
   Chroma integration tests import the unavailable `chromadb` package. The UI
   smoke tests and one Chroma integration test were skipped for the same missing
@@ -33,7 +33,7 @@ contains no model transcripts or credentials.
 
 ## Final local run — 2026-09-06
 
-- Command: `$env:PYTHONPATH = Join-Path (Get-Location) 'src'; python -m unittest discover -s tests -v`
+- Command: `conda run -n chroma-db-import python -m unittest discover -s tests -v`
 - Result: 148 tests ran; 142 passed, 4 skipped, and 2 existing Chroma integration
   tests errored at their direct `import chromadb` calls because the configured
   interpreter does not have Chroma installed. The new semantic-redundancy
@@ -41,7 +41,7 @@ contains no model transcripts or credentials.
   tests remain skipped.
 - Project-environment recheck: `C:\Users\Alex\miniconda3\envs\chroma-db-import\python.exe`
   has Chroma 1.5.9, NumPy, sentence-transformers, LangChain Chroma, and PySide6
-  installed. `python -m unittest discover -s tests -q` ran 152 tests with 0
+  installed. `conda run -n chroma-db-import python -m unittest discover -s tests -q` ran 152 tests with 0
   failures and 0 skips, exercising real private Chroma inventory,
   compact-vector materialization/validation/retrieval, and UI smoke paths.
 - That real-runtime run exposed and fixed float32 storage-rounding validation,
@@ -49,8 +49,8 @@ contains no model transcripts or credentials.
   fake-export handling in managed metadata stamping. The focused
   artifact/integration/inventory recheck and the full redundancy suite both
   pass in that environment.
-- Focused plan-aligned redundancy run: `python -m unittest discover -s tests -p 'test_redundancy*.py' -q` — 44 tests passed.
-- Focused semantic selection/local-judge run: `python -m unittest tests.test_local_judge_client tests.test_semantic_selection -q` — 9 tests passed.
+- Focused plan-aligned redundancy run: `conda run -n chroma-db-import python -m unittest discover -s tests -p 'test_redundancy*.py' -q` — 44 tests passed.
+- Focused semantic selection/local-judge run: `conda run -n chroma-db-import python -m unittest tests.test_local_judge_client tests.test_semantic_selection -q` — 9 tests passed.
 - `compileall` passed after adding the worker-thread importer UI workflow. The default configured interpreter still lacks PySide6, while the project environment exercised the UI smoke paths.
 - UI assessment cancellation uses a private cooperative marker; the CLI checks it between candidate/judge/publication stages and records the frozen job as `cancelled`, leaving private work resumable.
 - Chroma vector inspection, when available, is performed against a repository-local private snapshot; tracked release/ledger/import-manifest hashes are captured before and after inspection.

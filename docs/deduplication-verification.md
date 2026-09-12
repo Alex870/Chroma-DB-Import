@@ -20,13 +20,12 @@ metadata (apart from stable/node IDs).
 
 ## Verification commands
 
-Run from the repository root with the configured Python runtime:
+Run from the repository root with the `chroma-db-import` Conda environment:
 
 ```powershell
-$env:PYTHONPATH = (Join-Path (Get-Location) 'src')
-python -m unittest tests.test_deduplication tests.test_dedup_artifacts tests.test_dedup_embeddings tests.test_dedup_managed tests.test_retrieval_dedup -v
-python -m unittest tests.test_managed_contexts -v
-python -m unittest discover -s tests -v
+conda run -n chroma-db-import python -m unittest tests.test_deduplication tests.test_dedup_artifacts tests.test_dedup_embeddings tests.test_dedup_managed tests.test_retrieval_dedup -v
+conda run -n chroma-db-import python -m unittest tests.test_managed_contexts -v
+conda run -n chroma-db-import python -m unittest discover -s tests -v
 git diff --check
 ```
 
@@ -51,7 +50,7 @@ portable occurrence ledger, and the dedup manifest before atomic promotion.
 The bundled dependency runtime used for repository checks is:
 
 ```text
-C:\Users\Alex\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe
+C:\Users\Alex\miniconda3\envs\chroma-db-import\python.exe
 ```
 
 The pre-implementation baseline suite ran 69 tests. The final dependency-runtime

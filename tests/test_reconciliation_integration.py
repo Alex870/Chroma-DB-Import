@@ -9,6 +9,7 @@ from chroma_db_import.config import ImportConfig
 from chroma_db_import.importer import document_fingerprints, representation_spec
 from chroma_db_import.ui_export import preview_ui_reconciliation
 from chroma_db_import.ui_models import Episode, ImportPlan, ProcessedDocument
+from chroma_db_import.representation import QWEN3_MODEL, resolved_collection_name
 
 
 @unittest.skipUnless(find_spec("chromadb"), "chromadb is not installed in this environment")
@@ -29,13 +30,23 @@ class ReconciliationIntegrationTests(unittest.TestCase):
                 processed_data_dir=root,
                 output_root=output,
                 collection_name="fixture",
-                embedding_model="BAAI/bge-large-en-v1.5",
+                embedding_model=QWEN3_MODEL,
                 embedding_device="cpu",
                 episodes=[],
                 included_speakers_by_episode={},
             )
             plan.export_dir.mkdir(parents=True)
-            spec = representation_spec(ImportConfig())
+            spec = representation_spec(
+                ImportConfig(
+                    representation_profile=plan.resolved_profile,
+                    embedding_model=plan.embedding_model,
+                    embedding_model_revision=plan.embedding_model_revision,
+                    inference_dtype=plan.inference_dtype,
+                    query_instruction_profile=plan.query_instruction_profile,
+                    embedding_device=plan.embedding_device,
+                    contextualization=plan.contextualization,
+                )
+            )
 
             def document(item_id, text, note):
                 return ProcessedDocument(text, {
@@ -61,7 +72,7 @@ class ReconciliationIntegrationTests(unittest.TestCase):
             plan.included_speakers_by_episode = {episode.fingerprint: {"Host"}}
 
             client = chromadb.PersistentClient(path=str(plan.export_dir))
-            collection = client.create_collection("fixture")
+            collection = client.create_collection(resolved_collection_name("fixture", plan.resolved_profile))
             ids, documents, metadatas, embeddings = [], [], [], []
             for index, (item_id, item) in enumerate(old.items()):
                 metadata = dict(item.metadata)

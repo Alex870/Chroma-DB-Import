@@ -5,7 +5,7 @@ from pathlib import Path
 from chroma_db_import.providers import EmbeddingCompatibilityError, probe_embedding_provider
 from chroma_db_import.reconciliation import classify_source_records, source_identity
 from chroma_db_import.representation import RepresentationSpec
-from chroma_db_import.staging import validate_staged_records
+from chroma_db_import.staging import staging_collection_name, validate_staged_records
 from chroma_db_import.ui_export import embed_ui_documents_cached
 from chroma_db_import.ui_export import update_should_skip_episode
 from chroma_db_import.ui_models import Episode
@@ -32,12 +32,12 @@ class FakeDocument:
 
 class Stage4ContractTests(unittest.TestCase):
     def test_representation_fingerprint_contains_full_embedding_governance(self):
-        first = RepresentationSpec(pooling="mean", query_document_mode="document", implementation_version="v1")
-        second = RepresentationSpec(pooling="cls", query_document_mode="document", implementation_version="v1")
+        first = RepresentationSpec(pooling="mean", query_document_mode="separate-query-instruction", implementation_version="v1")
+        second = RepresentationSpec(pooling="cls", query_document_mode="separate-query-instruction", implementation_version="v1")
         self.assertNotEqual(first.representation_id, second.representation_id)
         payload = first.as_dict()
         self.assertEqual(payload["pooling"], "mean")
-        self.assertEqual(payload["query_document_mode"], "document")
+        self.assertEqual(payload["query_document_mode"], "separate-query-instruction")
         self.assertEqual(payload["implementation_version"], "v1")
         self.assertEqual(payload["representation_id"], first.representation_id)
 
@@ -78,6 +78,14 @@ class Stage4ContractTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertTrue(any("non-finite" in error for error in result.errors))
         self.assertTrue(any("not a Chroma scalar" in error for error in result.errors))
+
+    def test_staging_collection_name_is_chroma_compatible(self):
+        name = staging_collection_name(
+            "rag_documents",
+            "ui-update-20260907T220408505338Z-c35d9aef",
+        )
+        self.assertRegex(name, r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,510}[a-zA-Z0-9]$")
+        self.assertNotIn("__stage04__", name)
 
     def test_embedding_cache_reuses_exact_representation_matches(self):
         import tempfile

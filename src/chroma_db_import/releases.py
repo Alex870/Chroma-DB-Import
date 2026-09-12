@@ -11,6 +11,12 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
+from .representation import (
+    QWEN3_MODEL,
+    QWEN3_MODEL_REVISION,
+    QWEN3_PROFILE,
+    QWEN3_QUERY_INSTRUCTION_PROFILE,
+)
 
 CONTRACT = "corpus-release-v1"
 MUTABLE = {"notes", "display_label", "ui_state", "release_id", "plan_id"}
@@ -105,6 +111,23 @@ def plan_release(delta: Mapping[str, Any], *, parent_release_id: str | None,
         raise ReleaseError("invalid removal mode")
     if delta.get("contract_version") != "processed-delta-v1" or not delta.get("delta_id"):
         raise ReleaseError("a validated processed-delta-v1 is required")
+    embedding_model = str(requested_embedding.get("model") or requested_embedding.get("model_id") or "")
+    if embedding_model != QWEN3_MODEL:
+        raise ReleaseError(f"only {QWEN3_MODEL} releases are supported")
+    if requested_embedding.get("model_revision") != QWEN3_MODEL_REVISION:
+        raise ReleaseError("release embedding identity must use the pinned Qwen3 revision")
+    if requested_embedding.get("dimension") != 2560 and requested_embedding.get("dimensions") != 2560:
+        raise ReleaseError("release embedding identity must declare dimension 2560")
+    if requested_embedding.get("provider") not in (None, "sentence_transformers"):
+        raise ReleaseError("release embedding provider must be sentence_transformers")
+    if requested_embedding.get("normalize_embeddings") not in (None, True):
+        raise ReleaseError("release embeddings must be normalized")
+    if requested_embedding.get("distance_metric") not in (None, "cosine"):
+        raise ReleaseError("release distance metric must be cosine")
+    if requested_embedding.get("profile") not in (None, QWEN3_PROFILE):
+        raise ReleaseError("release embedding profile must be the Qwen3 production profile")
+    if requested_embedding.get("query_instruction_profile") not in (None, QWEN3_QUERY_INSTRUCTION_PROFILE):
+        raise ReleaseError("release query instruction profile must be podcast-retrieval-v1")
     mismatch = active_embedding is not None and active_embedding != requested_embedding
     added = len(delta.get("added_document_ids", [])); changed = len(delta.get("changed_document_ids", []))
     removed = len(delta.get("removed_document_ids", []))
@@ -165,6 +188,20 @@ def validate_release(release: Mapping[str, Any]) -> None:
         raise ReleaseError("unsupported corpus release contract")
     if release.get("release_id") != _id(release, "release"):
         raise ReleaseError("corpus release identity mismatch")
+    embedding = release.get("embedding_identity") or {}
+    model = str(embedding.get("model") or embedding.get("model_id") or "")
+    if model != QWEN3_MODEL:
+        raise ReleaseError(f"release declares unsupported embedding model: {model or '<missing>'}")
+    if embedding.get("model_revision") != QWEN3_MODEL_REVISION:
+        raise ReleaseError("release does not declare the pinned Qwen3 revision")
+    if embedding.get("dimension", embedding.get("dimensions")) != 2560:
+        raise ReleaseError("release does not declare embedding dimension 2560")
+    if embedding.get("provider", "sentence_transformers") != "sentence_transformers":
+        raise ReleaseError("release embedding provider must be sentence_transformers")
+    if embedding.get("normalize_embeddings", True) is not True:
+        raise ReleaseError("release embeddings must be normalized")
+    if embedding.get("distance_metric", "cosine") != "cosine":
+        raise ReleaseError("release distance metric must be cosine")
     ops = release.get("vector_operations", {})
     if any(not isinstance(ops.get(key), int) or ops[key] < 0 for key in ("add", "update", "remove_advisory")):
         raise ReleaseError("invalid vector operation counts")
@@ -245,6 +282,9 @@ class ReleaseStore:
         if sum(int((plan.get("vector_operations") or {}).get(key) or 0) for key in ("add", "update")) and not staging.get("smoke_query_ids"):
             raise ReleaseError("import manifest does not contain a successful pinned retrieval smoke query")
         representation_id = str(manifest.get("representation_id") or (manifest.get("representation") or {}).get("representation_id") or "")
+        podcast_representation_id = str(podcast.get("representation_id") or "")
+        if podcast_representation_id != representation_id:
+            raise ReleaseError("podcast representation_id does not match import manifest")
         expected_vector_representation = str(plan.get("vector_representation_id") or plan.get("representation_fingerprint") or "")
         if representation_id != expected_vector_representation:
             raise ReleaseError("export vector representation does not match release plan")
@@ -255,10 +295,19 @@ class ReleaseStore:
             raise ReleaseError("export embedding model does not match release plan")
         representation = manifest.get("representation") or {}
         embedding_checks = {
+            "profile": representation.get("profile"),
+            "model_id": representation.get("model_id") or manifest.get("embedding_model"),
             "provider": representation.get("provider"),
             "dimensions": manifest.get("embedding_dimension") or representation.get("dimension"),
             "dimension": manifest.get("embedding_dimension") or representation.get("dimension"),
             "model_revision": representation.get("model_revision"),
+            "output_dimension": representation.get("output_dimension"),
+            "normalize_embeddings": representation.get("normalize_embeddings"),
+            "distance_metric": representation.get("distance_metric"),
+            "contextualization": representation.get("contextualization"),
+            "context_header_version": representation.get("context_header_version"),
+            "query_instruction_profile": representation.get("query_instruction_profile"),
+            "implementation_version": representation.get("implementation_version"),
         }
         for key, actual in embedding_checks.items():
             expected = embedding.get(key)

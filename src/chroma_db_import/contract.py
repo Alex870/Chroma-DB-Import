@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .representation import (
+    QWEN3_MODEL,
+    QWEN3_MODEL_REVISION,
+    QWEN3_PROFILE,
+    QWEN3_QUERY_INSTRUCTION_PROFILE,
+)
 
 IMPORTER_VERSION = "0.3.0"
 IMPORT_MANIFEST_VERSION = "2.0"
@@ -342,6 +348,36 @@ def build_import_manifest(
     partition_identity: dict[str, Any] | None = None,
     dedup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if embedding_model != QWEN3_MODEL:
+        raise ValueError(
+            f"Qwen3-only exports require embedding_model={QWEN3_MODEL!r}; got {embedding_model!r}"
+        )
+    if embedding_dimension != 2560:
+        raise ValueError(
+            f"Qwen3-only exports require embedding_dimension=2560; got {embedding_dimension!r}"
+        )
+    if not str(collection_name).endswith("__qwen3-embedding-4b-shadow"):
+        raise ValueError("Qwen3-only exports require a Qwen3-scoped collection name")
+    representation_payload = dict(representation or {})
+    required_representation = {
+        "model_id": QWEN3_MODEL,
+        "model_revision": QWEN3_MODEL_REVISION,
+        "dimension": 2560,
+        "provider": "sentence_transformers",
+        "normalize_embeddings": True,
+        "distance_metric": "cosine",
+        "profile": QWEN3_PROFILE,
+        "query_instruction_profile": QWEN3_QUERY_INSTRUCTION_PROFILE,
+        "query_document_mode": "separate-query-instruction",
+    }
+    for field, expected in required_representation.items():
+        if representation_payload.get(field) != expected:
+            raise ValueError(
+                f"Qwen3-only exports require representation.{field}={expected!r}; "
+                f"got {representation_payload.get(field)!r}"
+            )
+    if not representation_payload.get("representation_id"):
+        raise ValueError("Qwen3-only exports require representation.representation_id")
     summary = summarize_reports(validation_results)
     manifest = {
         "manifest_version": IMPORT_MANIFEST_VERSION,
@@ -359,8 +395,8 @@ def build_import_manifest(
             "files": [report.as_dict() for report in validation_results],
         },
         "compatibility_warnings": compatibility_warnings or [],
-        "representation": representation or {},
-        "representation_id": (representation or {}).get("representation_id") or "",
+        "representation": representation_payload,
+        "representation_id": representation_payload.get("representation_id") or "",
         "operation": operation or {},
         "staging": staging or {},
         "reconciliation": reconciliation or {},
@@ -387,10 +423,44 @@ def validate_podcast_metadata(payload: dict[str, Any]) -> ValidationReport:
         errors.append("podcast.json missing database_id")
     if not payload.get("collection_name"):
         errors.append("podcast.json missing collection_name")
+    elif not str(payload.get("collection_name")).endswith("__qwen3-embedding-4b-shadow"):
+        errors.append("podcast.json collection_name is not Qwen3-scoped")
     if not payload.get("embedding_model"):
         errors.append("podcast.json missing embedding_model")
+    elif payload.get("embedding_model") != QWEN3_MODEL:
+        errors.append(
+            f"podcast.json declares unsupported embedding_model={payload.get('embedding_model')!r}; "
+            f"only {QWEN3_MODEL!r} is supported"
+        )
     if payload.get("embedding_dimension") in (None, ""):
-        warnings.append("podcast.json missing embedding_dimension")
+        errors.append("podcast.json missing embedding_dimension")
+    elif payload.get("embedding_dimension") != 2560:
+        errors.append(
+            f"podcast.json must declare embedding_dimension=2560; got {payload.get('embedding_dimension')!r}"
+        )
+    if not payload.get("representation_id"):
+        errors.append("podcast.json missing representation_id")
+    declared_revision = payload.get("embedding_model_revision") or payload.get("model_revision")
+    if declared_revision not in (None, "", QWEN3_MODEL_REVISION):
+        errors.append("podcast.json declares an unsupported Qwen3 model revision")
+    representation = payload.get("representation")
+    if isinstance(representation, dict):
+        if representation.get("representation_id") != payload.get("representation_id"):
+            errors.append("podcast.json representation_id does not match representation.representation_id")
+        checks = {
+            "profile": QWEN3_PROFILE,
+            "model_id": QWEN3_MODEL,
+            "model_revision": QWEN3_MODEL_REVISION,
+            "dimension": 2560,
+            "provider": "sentence_transformers",
+            "normalize_embeddings": True,
+            "distance_metric": "cosine",
+            "query_instruction_profile": QWEN3_QUERY_INSTRUCTION_PROFILE,
+            "query_document_mode": "separate-query-instruction",
+        }
+        for field, expected in checks.items():
+            if representation.get(field) != expected:
+                errors.append(f"podcast.json representation.{field} does not match Qwen3")
     if not isinstance(episodes, list):
         errors.append("podcast.json episodes must be a list")
         episodes = []

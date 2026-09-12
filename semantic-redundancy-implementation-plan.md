@@ -28,7 +28,7 @@ From importer root in PowerShell:
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
-python -m unittest discover -s tests -v
+conda run -n chroma-db-import python -m unittest discover -s tests -v
 ```
 
 If `python` is not the configured executable, replace it consistently in all commands. All later module paths are below `src/chroma_db_import/` unless another root is specified.
@@ -317,9 +317,9 @@ Importer root:
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
-python -m unittest discover -s tests -p 'test_redundancy*.py' -v
-python -m unittest tests.test_local_judge_client tests.test_semantic_selection -v
-python -m unittest discover -s tests -v
+conda run -n chroma-db-import python -m unittest discover -s tests -p 'test_redundancy*.py' -v
+conda run -n chroma-db-import python -m unittest tests.test_local_judge_client tests.test_semantic_selection -v
+conda run -n chroma-db-import python -m unittest discover -s tests -v
 git diff --check
 git status --short
 ```
@@ -328,8 +328,8 @@ Consumer root, with its interpreter/environment:
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
-python -m unittest tests.test_redundancy_bundle tests.test_semantic_selection tests.test_redundancy_services -v
-python -m unittest discover -s tests -v
+conda run -n chroma-db-import python -m unittest tests.test_redundancy_bundle tests.test_semantic_selection tests.test_redundancy_services -v
+conda run -n chroma-db-import python -m unittest discover -s tests -v
 git diff --check
 git status --short
 ```

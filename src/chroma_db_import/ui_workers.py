@@ -13,9 +13,10 @@ from chroma_db_import.ui_export import export_chroma, preview_ui_import_plan
 from chroma_db_import.ui_models import ImportPlan, ImportProgress
 from chroma_db_import.ui_support import TORCH_CUDA_INDEX_URL
 from chroma_db_import.staging import operation_id
-from chroma_db_import.managed import ManagedCatalog, run_managed_import
+from chroma_db_import.managed import ManagedCatalog, discover, run_managed_import
 from chroma_db_import.config import ImportConfig
 from chroma_db_import.dedup_artifacts import validate_dedup_artifacts
+from chroma_db_import.podcast_rag_adapter import PodcastRagSourceAdapter
 
 
 class RedundancyWorker(QObject):
@@ -180,29 +181,130 @@ class ManagedImportWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, config: ImportConfig, project_dir: Path, catalog_path: Path, partition_id: str, output_root: Path | None) -> None:
+    def __init__(
+        self,
+        config: ImportConfig,
+        project_dir: Path,
+        catalog_path: Path,
+        partition_id: str,
+        output_root: Path | None,
+        upstream_release_id: str | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.project_dir = project_dir
         self.catalog_path = catalog_path
         self.partition_id = partition_id
         self.output_root = output_root
+        self.upstream_release_id = upstream_release_id
 
     def run(self) -> None:
         self.progress.emit(ImportProgress(f"Validating release for {self.partition_id}...", 0, 0))
         try:
             with ManagedCatalog(self.catalog_path) as catalog:
+                def report(message: str, current: int, total: int) -> None:
+                    self.progress.emit(ImportProgress(message, current, total))
+
                 result = run_managed_import(
                     self.config,
                     self.project_dir,
                     catalog,
                     self.partition_id,
+                    upstream_release_id=self.upstream_release_id,
                     output_root=self.output_root,
+                    progress_callback=report,
                 )
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
         self.finished.emit(result)
+
+
+class ManagedContextWorkflowWorker(QObject):
+    """Inspect published source artifacts and prepare a Chroma import."""
+
+    progress = Signal(object)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        config: ImportConfig,
+        project_dir: Path,
+        catalog_path: Path,
+        partition_id: str,
+        output_root: Path | None,
+        operation: str,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.project_dir = project_dir
+        self.catalog_path = catalog_path
+        self.partition_id = partition_id
+        self.output_root = output_root
+        self.operation = operation
+
+    def run(self) -> None:
+        try:
+            with ManagedCatalog(self.catalog_path) as catalog:
+                context = catalog.context(self.partition_id)
+                if not context:
+                    raise ValueError(f"unknown managed context: {self.partition_id}")
+                source_root_value = str(context.get("source_root") or "")
+                if not source_root_value:
+                    raise ValueError("selected context has no linked producer source root")
+                adapter = PodcastRagSourceAdapter(Path(source_root_value), self.partition_id)
+
+                self.progress.emit(ImportProgress("Checking producer processing status...", 0, 0))
+                status = adapter.inspect()
+                catalog.set_setting(
+                    f"producer_status:{self.partition_id}",
+                    json.dumps(status.as_dict(), ensure_ascii=False, sort_keys=True),
+                )
+                if self.operation == "inspect":
+                    self.finished.emit({"status": "inspected", "source_status": status.as_dict()})
+                    return
+
+                if self.operation == "resume":
+                    self.finished.emit({
+                        "status": "producer_action_external",
+                        "source_status": status.as_dict(),
+                    })
+                    return
+
+                if not status.ready_to_publish:
+                    self.finished.emit({"status": "blocked_pending", "source_status": status.as_dict()})
+                    return
+
+                release = adapter.publish_release(
+                    lambda message: self.progress.emit(ImportProgress(message, 0, 0))
+                )
+                self.progress.emit(ImportProgress("Discovering the published release...", 0, 0))
+                discover(catalog, [Path(source_root_value)])
+                self.progress.emit(ImportProgress("Validating the prospective Chroma import...", 0, 0))
+                def report(message: str, current: int, total: int) -> None:
+                    self.progress.emit(ImportProgress(message, current, total))
+
+                preview = run_managed_import(
+                    self.config,
+                    self.project_dir,
+                    catalog,
+                    self.partition_id,
+                    upstream_release_id=str(release["release_id"]),
+                    output_root=self.output_root,
+                    dry_run=True,
+                    progress_callback=report,
+                )
+                self.finished.emit(
+                    {
+                        "status": "ready_for_import",
+                        "source_status": status.as_dict(),
+                        "release": release,
+                        "preview": preview,
+                    }
+                )
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
 class ManagedDedupPreviewWorker(QObject):
@@ -222,7 +324,18 @@ class ManagedDedupPreviewWorker(QObject):
     def run(self) -> None:
         try:
             with ManagedCatalog(self.catalog_path) as catalog:
-                result = run_managed_import(self.config, self.project_dir, catalog, self.partition_id, output_root=self.output_root, dry_run=True)
+                def report(message: str, current: int, total: int) -> None:
+                    self.progress.emit(ImportProgress(message, current, total))
+
+                result = run_managed_import(
+                    self.config,
+                    self.project_dir,
+                    catalog,
+                    self.partition_id,
+                    output_root=self.output_root,
+                    dry_run=True,
+                    progress_callback=report,
+                )
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return

@@ -1,13 +1,15 @@
 param(
-    [string]$Config,
-    [string]$CondaEnvName = "chroma-db-import"
+    [string]$Config
 )
 
+$CondaEnvName = "chroma-db-import"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ConfigPath = Join-Path $ProjectRoot "chroma_db_import_config.json"
 $ConfigExamplePath = Join-Path $ProjectRoot "examples\\chroma_db_import_config.example.json"
 $RequirementsPath = Join-Path $ProjectRoot "chroma_db_import_requirements.txt"
 $TorchCudaIndexUrl = "https://download.pytorch.org/whl/cu128"
+$env:PYTHONNOUSERSITE = "1"
+$env:PIP_USER = "0"
 
 if (-not $Config) {
     $Config = $ConfigPath

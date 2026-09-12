@@ -1,0 +1,3 @@
+# Kept separate from the legacy importer requirements so existing CUDA/model
+# installs remain unchanged.
+pywebview==6.2.1

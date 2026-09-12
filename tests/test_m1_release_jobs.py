@@ -4,7 +4,7 @@ from pathlib import Path
 
 from chroma_db_import.release_jobs import ReleaseJobStore, backup_store, plan_job, restore_store, run_job
 from chroma_db_import.releases import ReleaseStore, export_fingerprint, plan_release
-from tests.test_releases import DELTA, ReleaseTests
+from tests.test_releases import DELTA, QWEN_EMBEDDING, ReleaseTests
 
 
 class MilestoneOneReleaseJobTests(unittest.TestCase):
@@ -13,7 +13,7 @@ class MilestoneOneReleaseJobTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=scratch) as temporary:
             root = Path(temporary); export = ReleaseTests().write_export(root)
             plan = plan_release(DELTA, parent_release_id=None, active_embedding=None,
-                requested_embedding={"model": "a"}, selection_fingerprint="m1", removal_mode="reconcile_approved",
+                requested_embedding=QWEN_EMBEDDING, selection_fingerprint="m1", removal_mode="reconcile_approved",
                 export_bundle_fingerprint=export_fingerprint(export), vector_representation_id="repr-1")
             jobs = ReleaseJobStore(root / "jobs")
             job = plan_job(plan, export, root / "store", jobs)
@@ -29,7 +29,7 @@ class MilestoneOneReleaseJobTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=scratch) as temporary:
             root = Path(temporary); export = ReleaseTests().write_export(root)
             plan = plan_release(DELTA, parent_release_id=None, active_embedding=None,
-                requested_embedding={"model": "a"}, selection_fingerprint="cancel", removal_mode="reconcile_approved",
+                requested_embedding=QWEN_EMBEDDING, selection_fingerprint="cancel", removal_mode="reconcile_approved",
                 export_bundle_fingerprint=export_fingerprint(export), vector_representation_id="repr-1")
             jobs = ReleaseJobStore(root / "jobs"); job = plan_job(plan, export, root / "store", jobs)
             jobs.cancel(job["job_id"])

@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from chroma_db_import.asset_filters import DEFAULT_ASSET_FILTER
 from chroma_db_import.ui_helpers import safe_folder_name
+from chroma_db_import.representation import PRIMARY_PROFILE, QWEN3_PROFILE, profile_storage_suffix, resolved_collection_name
 
 @dataclass(frozen=True)
 class DeviceOption:
@@ -29,6 +31,9 @@ class Episode:
     source_content_fingerprint: str = ""
     schema_version: str = ""
     partition_identity: dict[str, str] = field(default_factory=dict)
+    # Modern jobs may read an immutable copy while preserving original
+    # provenance for manifests and user-facing metadata.
+    source_file_path: Path | None = None
 
     @property
     def sort_key(self) -> tuple[str, str]:
@@ -44,15 +49,34 @@ class ImportPlan:
     embedding_model: str
     embedding_device: str
     contextualization: str = "minimal"
-    experimental_bge_m3: bool = False
+    asset_filter: str = DEFAULT_ASSET_FILTER
+    asset_pattern: str = ""
+    representation_profile: str = PRIMARY_PROFILE
+    embedding_model_revision: str = ""
+    inference_dtype: str = "bfloat16"
+    query_instruction_profile: str = "podcast-retrieval-v1"
     allow_delete_missing: bool = False
     reconcile: bool = False
     episodes: list[Episode] = field(default_factory=list)
     included_speakers_by_episode: dict[str, set[str]] = field(default_factory=dict)
+    # Modern workflow callers may bind an exact final destination. Legacy
+    # callers continue to derive it from output_root/podcast_name.
+    final_export_dir: Path | None = None
+
+    @property
+    def resolved_profile(self) -> str:
+        return self.representation_profile or QWEN3_PROFILE
 
     @property
     def export_dir(self) -> Path:
-        return self.output_root / safe_folder_name(self.podcast_name)
+        if self.final_export_dir is not None:
+            return Path(self.final_export_dir)
+        base = self.output_root / safe_folder_name(self.podcast_name)
+        return base / profile_storage_suffix(self.resolved_profile)
+
+    @property
+    def resolved_collection_name(self) -> str:
+        return resolved_collection_name(self.collection_name, self.resolved_profile)
 
 @dataclass
 class ImportProgress:

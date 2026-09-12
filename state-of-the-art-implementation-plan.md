@@ -4,14 +4,14 @@ Last updated: July 2026
 
 ## Objective
 
-Evolve Chroma DB Import from a reliable single-vector index builder into a versioned, measurable indexing platform that can safely produce contextualized dense, lexical, and experimental representations without weakening its local-first workflow, resumability, or downstream compatibility.
+Evolve Chroma DB Import from a reliable Qwen3-only single-vector index builder into a versioned, measurable indexing platform that can safely add lexical and other separately approved representations without weakening its local-first workflow, resumability, or downstream compatibility.
 
 The plan front-loads changes that are fully contained in this repository. Cross-repository work begins only after local schemas, adapters, fixtures, and compatibility behavior are stable. Hard research migrations are intentionally last.
 
 ## Guiding Constraints
 
-- Preserve the current Chroma export as the default until an alternative wins on judged queries.
-- Keep existing exports readable throughout the migration.
+- Preserve the pinned Qwen3 representation as the only supported default.
+- Reject incompatible BGE and other legacy exports; rebuild them as fresh Qwen3 exports.
 - Treat every representation change as a versioned index migration, not an in-place mutation.
 - Preserve stable document IDs and primary-evidence provenance.
 - Support CPU operation; GPU acceleration may improve throughput but must not be mandatory.
@@ -24,7 +24,7 @@ The plan front-loads changes that are fully contained in this repository. Cross-
 | 1 | Representation and manifest contracts | Easy-medium | Repo-local | None |
 | 2 | Content-addressed reconciliation | Easy-medium | Repo-local | None |
 | 3 | Deterministic contextual headers | Medium | Repo-local | None |
-| 4 | Embedding provider and dense shadow indexes | Medium | Repo-local | None initially |
+| 4 | Pinned Qwen3 provider and fresh-export workflow | Medium | Repo-local | None initially |
 | 5 | Matryoshka-ready dimension experiments | Medium | Repo-local | None initially |
 | 6 | Lexical sidecar index generation | Medium | Repo-local first | `PodCast Chat`, later `RAGScope` |
 | 7 | Shared judged-query and run contracts | Medium | Multi-repo | `RAGScope`, `PodCast Chat`; optionally `Podcast-RAG-pipeline` |
@@ -99,25 +99,25 @@ Tests and exit criteria:
 - Original display/citation text remains unchanged.
 - Cache keys change when contextualization changes.
 
-## Phase 4: Embedding Provider and Dense Shadow Indexes
+## Phase 4: Pinned Qwen3 Provider and Fresh-Export Workflow
 
 Scope: repo-local initially.
 
-Decouple model loading and encoding from Chroma writes, then support side-by-side dense experiments such as BGE-M3 dense mode.
+Keep model loading and encoding decoupled from Chroma writes while enforcing the single pinned Qwen3 representation and explicit rebuild boundaries.
 
 Deliverables:
 
 - Define an embedding provider interface for model load, encode, normalize, dimension discovery, device selection, and model revision reporting.
-- Adapt the existing Sentence Transformers path to the interface without behavioral change.
-- Add a BGE-M3 dense provider/profile behind an experimental flag.
-- Write each representation to a separate versioned export directory or collection alias.
-- Add a shadow-build command that builds baseline and candidate indexes from one validated source inventory.
+- Adapt the Sentence Transformers path to the Qwen3-only provider interface.
+- Reject non-Qwen models, revisions, dimensions, caches, collections, and upstream releases before embedding or writing.
+- Write Qwen3 exports to representation-scoped directories and collections.
+- Add a fresh-export/rebuild workflow from one validated source inventory; never reconcile Qwen3 vectors into an incompatible collection.
 - Report import time, throughput, memory, dimension, and disk footprint.
 
 Tests and exit criteria:
 
-- The default provider produces vectors compatible with current behavior.
-- Candidate and baseline indexes cannot overwrite each other.
+- The provider produces normalized 2,560-dimensional Qwen3 vectors with the pinned revision.
+- Qwen3 exports cannot overwrite or reconcile incompatible indexes.
 - Manifest and collection metadata uniquely identify each representation.
 - CPU and CUDA selection fail gracefully with actionable diagnostics.
 
@@ -288,4 +288,3 @@ Decision gate: no production adoption without measurable gains, reproducible reb
 ## Recommended First Release Boundary
 
 The first implementation release should include Phases 1-4. It will provide versioned contracts, correct incremental reconciliation, contextual embeddings, and safe shadow indexes entirely within this repository. Phase 5 is optional based on resource needs. Phase 6 can then produce the first cross-repo frontier artifact without disrupting the current dense export.
-

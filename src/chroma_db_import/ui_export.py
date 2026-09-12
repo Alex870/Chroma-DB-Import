@@ -9,23 +9,42 @@ import hashlib
 import math
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import chroma_db_import.runtime as runtime
 from chroma_db_import.config import ImportConfig
 from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, has_text, partition_identities, sanitize_metadata, summarize_reports, validate_document_items, validate_podcast_metadata
-from chroma_db_import.importer import cache_fingerprint, validate_documents, document_fingerprints, representation_spec
-from chroma_db_import.providers import create_embedding_provider
+from chroma_db_import.importer import cache_fingerprint, validate_documents, document_fingerprints, representation_spec, detect_embedding_dimension
+from chroma_db_import.providers import create_embedding_provider, preflight_embedding_memory
 from chroma_db_import.reconciliation import ReconciliationPlan, plan_reconciliation, require_delete_confirmation, source_identity
-from chroma_db_import.representation import embedding_content_hash, embedding_text, recommended_batch_size
+from chroma_db_import.representation import embedding_content_hash, embedding_text, recommended_batch_size, resolved_collection_name
 from chroma_db_import.staging import operation_id, staging_collection_name, validate_staged_records
 from chroma_db_import.ui_helpers import document_speakers, slugify, safe_folder_name
 from chroma_db_import.ui_models import Episode, ImportPlan, ImportProgress, ImportSummary, ProcessedDocument
 from chroma_db_import.ui_support import resolve_embedding_device
+from chroma_db_import.workflow.target_lock import TargetLock
 
 ALWAYS_INCLUDE_NODE_TYPES = {"episode_thesis"}
 SUMMARY_NODE_TYPES = {"cluster_summary"}
 TOPIC_INDEX_FILENAME = "topic_index.json"
+
+
+def _plan_config(plan: ImportPlan, *, device: str | None = None) -> ImportConfig:
+    return ImportConfig(
+        representation_profile=plan.resolved_profile,
+        embedding_model=plan.embedding_model,
+        embedding_model_revision=plan.embedding_model_revision or "",
+        inference_dtype=plan.inference_dtype,
+        query_instruction_profile=plan.query_instruction_profile,
+        embedding_device=device or plan.embedding_device,
+        contextualization=plan.contextualization,
+        asset_filter=plan.asset_filter,
+        asset_pattern=plan.asset_pattern,
+    )
+
+
+def _plan_collection_name(plan: ImportPlan) -> str:
+    return resolved_collection_name(plan.collection_name, representation_spec(_plan_config(plan)).profile)
 
 
 def embed_ui_documents_cached(
@@ -89,59 +108,69 @@ def embed_ui_documents_cached(
 def preview_ui_reconciliation(plan: ImportPlan) -> ReconciliationPlan:
     """Inspect an existing desktop export without loading or downloading an embedding model."""
     combined = ReconciliationPlan()
-    config = ImportConfig(
-        embedding_model=plan.embedding_model,
-        contextualization=plan.contextualization,
-        experimental_bge_m3=plan.experimental_bge_m3,
-    )
+    config = _plan_config(plan)
     spec = representation_spec(config)
     collection = None
+    client = None
+    owns_chroma_system = False
     if (plan.export_dir / "chroma.sqlite3").exists():
         import chromadb
+        from chromadb.api.client import SharedSystemClient
 
+        existing_systems = list(SharedSystemClient._identifier_to_system.values())
         client = chromadb.PersistentClient(path=str(plan.export_dir))
+        owns_chroma_system = not any(system is getattr(client, "_system", None) for system in existing_systems)
         try:
-            collection = client.get_collection(plan.collection_name)
+            collection = client.get_collection(_plan_collection_name(plan))
         except Exception:
             collection = None
-    for episode in plan.episodes:
-        source_cache = str(episode.path.resolve())
-        selected = [doc for doc in select_documents_for_episode(episode, plan.included_speakers_by_episode) if has_text(doc.page_content)]
-        current = {}
-        for doc in selected:
-            item = DocumentLike(doc.page_content, sanitize_metadata(doc.metadata))
-            current[str(doc.metadata.get("node_id"))] = document_fingerprints(item, spec)
-        existing = {}
-        if collection is not None:
-            payloads = [collection.get(ids=list(current), include=["metadatas"])] if current else []
+    try:
+        for episode in plan.episodes:
+            source_cache = str((episode.source_file_path or episode.path).resolve())
+            selected = [doc for doc in select_documents_for_episode(episode, plan.included_speakers_by_episode) if has_text(doc.page_content)]
+            current = {}
+            for doc in selected:
+                item = DocumentLike(doc.page_content, sanitize_metadata(doc.metadata))
+                current[str(doc.metadata.get("node_id"))] = document_fingerprints(item, spec)
+            existing = {}
+            if collection is not None:
+                payloads = [collection.get(ids=list(current), include=["metadatas"])] if current else []
+                try:
+                    payloads.append(collection.get(where={"import_source_cache": source_cache}, include=["metadatas"]))
+                except Exception:
+                    pass
+                for payload in payloads:
+                    for item_id, metadata in zip(payload.get("ids") or [], payload.get("metadatas") or []):
+                        metadata = metadata or {}
+                        existing[str(item_id)] = {
+                            "embedding_fingerprint": str(metadata.get("embedding_fingerprint") or ""),
+                            "metadata_fingerprint": str(metadata.get("metadata_fingerprint") or ""),
+                        }
+            episode_plan = plan_reconciliation(current, existing)
+            for field_name in ("added", "changed", "metadata_only", "unchanged", "removed"):
+                getattr(combined, field_name).extend(getattr(episode_plan, field_name))
+        for field_name in ("added", "changed", "metadata_only", "unchanged", "removed"):
+            setattr(combined, field_name, sorted(set(getattr(combined, field_name))))
+        return combined
+    finally:
+        if client is not None and owns_chroma_system:
             try:
-                payloads.append(collection.get(where={"import_source_cache": source_cache}, include=["metadatas"]))
+                client._system.stop()
             except Exception:
                 pass
-            for payload in payloads:
-                for item_id, metadata in zip(payload.get("ids") or [], payload.get("metadatas") or []):
-                    metadata = metadata or {}
-                    existing[str(item_id)] = {
-                        "embedding_fingerprint": str(metadata.get("embedding_fingerprint") or ""),
-                        "metadata_fingerprint": str(metadata.get("metadata_fingerprint") or ""),
-                    }
-        episode_plan = plan_reconciliation(current, existing)
-        for field_name in ("added", "changed", "metadata_only", "unchanged", "removed"):
-            getattr(combined, field_name).extend(getattr(episode_plan, field_name))
-    for field_name in ("added", "changed", "metadata_only", "unchanged", "removed"):
-        setattr(combined, field_name, sorted(set(getattr(combined, field_name))))
-    return combined
+            try:
+                import chromadb
+
+                SharedSystemClient.clear_system_cache()
+            except Exception:
+                pass
 
 
 def preview_ui_import_plan(plan: ImportPlan, mode: str = "update") -> dict[str, Any]:
     """Return the complete, displayable plan before model loading or writes."""
     validation = build_ui_validation_report(plan)
     reconciliation = preview_ui_reconciliation(plan) if mode in {"update", "reconcile"} else ReconciliationPlan()
-    config = ImportConfig(
-        embedding_model=plan.embedding_model,
-        contextualization=plan.contextualization,
-        experimental_bge_m3=plan.experimental_bge_m3,
-    )
+    config = _plan_config(plan)
     spec = representation_spec(config)
     existing_manifest: dict[str, Any] = {}
     manifest_path = plan.export_dir / "import_manifest.json"
@@ -168,7 +197,32 @@ def preview_ui_import_plan(plan: ImportPlan, mode: str = "update") -> dict[str, 
     }
 
 
-def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary:  # type: ignore[no-untyped-def]
+def export_chroma(
+    plan: ImportPlan,
+    mode: str,
+    emit_progress,
+    *,
+    operation_id_override: str | None = None,
+    journal_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    lock_held: bool = False,
+) -> ImportSummary:  # type: ignore[no-untyped-def]
+    """Export while coordinating with modern and legacy writers."""
+    final_destination = Path(plan.export_dir)
+    operation = operation_id_override or operation_id(f"ui-{mode}")
+    if lock_held:
+        return _export_chroma_locked(plan, mode, emit_progress, operation_id_override=operation, journal_callback=journal_callback)
+    with TargetLock(final_destination, operation):
+        return _export_chroma_locked(plan, mode, emit_progress, operation_id_override=operation, journal_callback=journal_callback)
+
+
+def _export_chroma_locked(
+    plan: ImportPlan,
+    mode: str,
+    emit_progress,
+    *,
+    operation_id_override: str | None = None,
+    journal_callback: Callable[[str, dict[str, Any]], None] | None = None,
+) -> ImportSummary:  # type: ignore[no-untyped-def]
     """Create or update a self-contained Chroma export for the selected episodes."""
     emit_progress(ImportProgress("Loading runtime dependencies...", 0, 0))
     runtime.load_runtime_deps()
@@ -177,7 +231,8 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
 
     started_at = time.time()
     original_plan = plan
-    operation = operation_id(f"ui-{mode}")
+    final_destination = Path(original_plan.export_dir)
+    operation = operation_id_override or operation_id(f"ui-{mode}")
     emit_progress(ImportProgress("Validating selected documents...", 0, 0))
     preflight = build_ui_validation_report(plan)
     if not preflight["valid"]:
@@ -187,10 +242,11 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
         )
         raise ValueError(f"Validation failed before import: {first_error}")
 
-    staging_root = plan.output_root / f".{safe_folder_name(plan.podcast_name)}.staging-{operation}"
-    plan = replace(plan, output_root=staging_root, reconcile=(mode == "reconcile" or plan.reconcile))
-    if mode == "update" and original_plan.export_dir.exists():
-        shutil.copytree(original_plan.export_dir, plan.export_dir)
+    staging_root = final_destination.parent / f".{final_destination.name}.staging-{operation}"
+    staging_export_dir = staging_root / final_destination.name
+    plan = replace(plan, output_root=staging_root, final_export_dir=staging_export_dir, reconcile=(mode == "reconcile" or plan.reconcile))
+    if mode == "update" and final_destination.exists():
+        shutil.copytree(final_destination, plan.export_dir)
     plan.export_dir.mkdir(parents=True, exist_ok=True)
 
     metadata_path = plan.export_dir / "podcast.json"
@@ -214,12 +270,7 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
 
     embedding_device = resolve_embedding_device(plan.embedding_device)
     emit_progress(ImportProgress(f"Loading embedding model on {embedding_device}...", 0, 0))
-    provider_config = ImportConfig(
-        embedding_model=plan.embedding_model,
-        embedding_device=plan.embedding_device,
-        contextualization=plan.contextualization,
-        experimental_bge_m3=plan.experimental_bge_m3,
-    )
+    provider_config = _plan_config(plan, device=plan.embedding_device)
     spec = representation_spec(provider_config)
     existing_manifest_path = original_plan.export_dir / "import_manifest.json"
     if mode in {"update", "reconcile"} and existing_manifest_path.exists():
@@ -234,15 +285,56 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
                 "Use a new export or an explicit migration path; the existing export was retained."
             )
     embeddings, provider_diagnostics = create_embedding_provider(spec, embedding_device)
-    embedding_dimension = detect_embedding_dimension(embeddings)
-    cache_dir = original_plan.output_root / "state" / "embedding_cache"
+    embedding_dimension = detect_embedding_dimension(embeddings) or spec.dimension
+    spec = representation_spec(provider_config, embedding_dimension)
+    provider_diagnostics.update({"dimension": embedding_dimension, "representation_id": spec.representation_id})
+    batch_size = recommended_batch_size(provider_diagnostics["device"], model_id=spec.model_id, profile=spec.profile)
+    memory_preflight = preflight_embedding_memory(
+        embeddings,
+        spec,
+        device=provider_diagnostics["device"],
+        batch_size=batch_size,
+        safety_margin_bytes=provider_config.embedding_memory_safety_margin_bytes,
+    )
+    cache_dir = original_plan.output_root / "state" / "embedding_cache" / spec.profile
     cache_stats = {"hits": 0, "misses": 0, "invalidations": 0, "cache_size": 0}
     emit_progress(ImportProgress("Opening Chroma collection...", 0, 0))
+    from chromadb.api.client import SharedSystemClient
+
+    existing_systems = list(SharedSystemClient._identifier_to_system.values())
     vectorstore = Chroma(
         embedding_function=embeddings,
         persist_directory=str(plan.export_dir),
-        collection_name=plan.collection_name,
+        collection_name=_plan_collection_name(plan),
     )
+    owns_chroma_system = not any(system is getattr(vectorstore._client, "_system", None) for system in existing_systems)
+    collection_metadata = getattr(vectorstore._collection, "metadata", None) or {}
+    existing_model = str(collection_metadata.get("embedding_model") or collection_metadata.get("model_id") or "")
+    if existing_model and existing_model != spec.model_id:
+        raise ValueError("Existing Chroma collection uses a non-Qwen embedding model; create a fresh export.")
+    existing_dimension = collection_metadata.get("embedding_dimension")
+    if existing_dimension not in (None, "", spec.dimension):
+        raise ValueError("Existing Chroma collection dimension is incompatible with Qwen3.")
+    existing_representation = str(collection_metadata.get("representation_id") or "")
+    if existing_representation and existing_representation != spec.representation_id:
+        raise ValueError("Existing Chroma collection representation is incompatible with Qwen3.")
+    try:
+        vectorstore._collection.modify(
+            metadata={
+                "representation_id": spec.representation_id,
+                "embedding_model": spec.model_id,
+                "model_revision": spec.model_revision,
+                "embedding_dimension": spec.dimension,
+                "provider": spec.provider,
+                "normalize_embeddings": spec.normalize_embeddings,
+                "distance_metric": spec.distance_metric,
+                "query_instruction_profile": spec.query_instruction_profile,
+                "query_document_mode": spec.query_document_mode,
+                "profile": spec.profile,
+            }
+        )
+    except Exception:
+        pass
 
     episodes_to_import: list[Episode] = []
     for episode in plan.episodes:
@@ -294,7 +386,7 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
         selected = select_documents_for_episode(episode, plan.included_speakers_by_episode)
         validate_documents([Document(page_content=doc.page_content, metadata=doc.metadata) for doc in selected], str(episode.path))
         documents = []
-        source_cache = str(episode.path.resolve())
+        source_cache = str((episode.source_file_path or episode.path).resolve())
         for doc in selected:
             if not has_text(doc.page_content):
                 continue
@@ -336,7 +428,11 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
         ids = reconciliation.added + reconciliation.changed
         documents = [by_id[item] for item in ids]
 
-        batch_size = recommended_batch_size(provider_diagnostics["device"])
+        batch_size = recommended_batch_size(
+            provider_diagnostics["device"],
+            model_id=spec.model_id,
+            profile=spec.profile,
+        )
         for start in range(0, len(documents), batch_size):
             batch_docs = documents[start : start + batch_size]
             batch_ids = ids[start : start + batch_size]
@@ -417,6 +513,7 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
         topic_count=int(export_topic_index.get("topic_count") or 0) if export_topic_index else 0,
         topic_profile_count=topic_profile_count,
         representation_id=spec.representation_id,
+        representation=spec.as_dict(),
     )
     metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata_report = validate_podcast_metadata(metadata_payload)
@@ -426,14 +523,16 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     manifest = build_import_manifest(
         config={
             "database_id": plan.database_id,
-            "collection_name": plan.collection_name,
+            "collection_name": _plan_collection_name(plan),
             "embedding_model": plan.embedding_model,
             "embedding_device": plan.embedding_device,
+            "asset_filter": plan.asset_filter,
+            "asset_pattern": plan.asset_pattern,
             "mode": mode,
         },
         source_files=[
             {
-                "path": str(episode.path),
+                "path": str(episode.source_file_path or episode.path),
                 "fingerprint": episode.fingerprint,
                 "content_fingerprint": content_fingerprint(episode.path),
                 "source_identity": source_identity(
@@ -449,9 +548,10 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
             for episode in plan.episodes
         ],
         validation_results=[item["report"] for item in preflight["raw_reports"]],
-        embedding_model=plan.embedding_model,
+        embedding_model=spec.model_id,
         embedding_dimension=embedding_dimension,
-        collection_name=plan.collection_name,
+        collection_name=_plan_collection_name(plan),
+        representation=spec.as_dict(),
         selected_speakers=sorted({speaker for speakers in plan.included_speakers_by_episode.values() for speaker in speakers}),
         compatibility_warnings=metadata_report.warnings,
         partition_identity=(preflight.get("partition_isolation") or {}).get("partition") or None,
@@ -459,6 +559,12 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     manifest["representation"] = spec.as_dict()
     manifest["representation_id"] = spec.representation_id
     manifest["provider_diagnostics"] = provider_diagnostics
+    manifest["resource_measurements"] = {
+        "provider": provider_diagnostics,
+        "memory_preflight": memory_preflight,
+        "batch_size": batch_size,
+        "device": provider_diagnostics.get("device"),
+    }
     manifest["operation"] = {
         "operation_id": operation,
         "mode": mode,
@@ -470,23 +576,47 @@ def export_chroma(plan: ImportPlan, mode: str, emit_progress) -> ImportSummary: 
     manifest["embedding_cache"] = cache_stats
     manifest_path = plan.export_dir / "import_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8")
+    if owns_chroma_system:
+        try:
+            vectorstore._client._system.stop()
+        finally:
+            SharedSystemClient.clear_system_cache()
     immutable_id = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode("utf-8")).hexdigest()[:12]
-    profile = "bge-m3-shadow" if plan.experimental_bge_m3 else "baseline"
+    profile = spec.profile
     immutable_dir = original_plan.output_root / "exports" / profile / immutable_id
     if not immutable_dir.exists():
         immutable_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(plan.export_dir, immutable_dir)
         (immutable_dir / "BUILD_IMMUTABLE").write_text(immutable_id + "\n", encoding="ascii")
     staged_export = plan.export_dir
-    destination = original_plan.export_dir
+    destination = final_destination
     backup = destination.with_name(destination.name + f".previous-{operation}")
+    journal_detail = {
+        "operation_id": operation,
+        "target": str(destination),
+        "stage": str(staging_root),
+        "backup": str(backup),
+        "mode": mode,
+    }
+    if journal_callback:
+        journal_callback("staged_validated", journal_detail)
     if destination.exists():
+        if journal_callback:
+            journal_callback("backup_intent", journal_detail)
         shutil.move(str(destination), str(backup))
+        if journal_callback:
+            journal_callback("target_moved_to_backup", journal_detail)
+    if journal_callback:
+        journal_callback("activation_intent", journal_detail)
     shutil.move(str(staged_export), str(destination))
+    if journal_callback:
+        journal_callback("new_target_active", journal_detail)
     if backup.exists():
         shutil.rmtree(backup)
     if staging_root.exists():
         shutil.rmtree(staging_root)
+    if journal_callback:
+        journal_callback("completed", journal_detail)
     return ImportSummary(
         inserted=inserted,
         skipped_episodes=skipped,
@@ -647,7 +777,8 @@ def existing_entry_for_episode(
     existing_by_fingerprint: dict[str, dict[str, Any]],
     existing_by_source_file: dict[str, dict[str, Any]],
 ) -> dict[str, Any] | None:
-    return existing_by_fingerprint.get(episode.fingerprint) or existing_by_source_file.get(str(episode.path))
+    source_path = episode.source_file_path or episode.path
+    return existing_by_fingerprint.get(episode.fingerprint) or existing_by_source_file.get(str(source_path))
 
 def selected_speakers_for_episode(
     episode: Episode,
@@ -749,7 +880,7 @@ def episode_metadata_entry(
     speakers = sorted({speaker for doc in selected for speaker in document_speakers(doc.metadata)})
     source_content = episode.source_content_fingerprint or episode.fingerprint
     entry = {
-        "source_file": str(episode.path),
+        "source_file": str(episode.source_file_path or episode.path),
         "source_fingerprint": episode.fingerprint,
         "source_content_fingerprint": episode.source_content_fingerprint,
         "schema_version": episode.schema_version,
@@ -991,6 +1122,7 @@ def write_podcast_metadata(
     topic_count: int = 0,
     topic_profile_count: int = 0,
     representation_id: str = "",
+    representation: dict[str, Any] | None = None,
 ) -> None:
     all_speakers = sorted(
         {
@@ -1014,14 +1146,31 @@ def write_podcast_metadata(
         and (episode.get("partition", {}).get("partition_id") or episode.get("partition", {}).get("corpus_id"))
     ]
     partition = partition_candidates[0] if partition_candidates else {}
+    spec = representation_spec(_plan_config(plan))
+    representation_payload = dict(representation or spec.as_dict())
     payload = {
         "podcast_name": plan.podcast_name,
         "database_id": plan.database_id,
-        "collection_name": plan.collection_name,
-        "embedding_model": plan.embedding_model,
+        "collection_name": _plan_collection_name(plan),
+        "embedding_model": representation_payload["model_id"],
+        "embedding_model_revision": representation_payload["model_revision"],
         "representation_id": representation_id,
-        "embedding_dimension": embedding_dimension,
+        "embedding_dimension": representation_payload["dimension"],
+        "representation_profile": representation_payload["profile"],
+        "embedding_provider": representation_payload["provider"],
+        "normalize_embeddings": representation_payload["normalize_embeddings"],
+        "distance_metric": representation_payload["distance_metric"],
+        "contextualization": representation_payload["contextualization"],
+        "context_header_version": representation_payload["context_header_version"],
+        "pooling": representation_payload["pooling"],
+        "query_instruction_profile": representation_payload["query_instruction_profile"],
+        "query_document_mode": representation_payload["query_document_mode"],
+        "index_schema_version": representation_payload["index_schema_version"],
+        "implementation_version": representation_payload["implementation_version"],
+        "representation": representation_payload,
         "embedding_device": plan.embedding_device,
+        "asset_filter": plan.asset_filter,
+        "asset_pattern": plan.asset_pattern,
         "description": f"Generated from processed RAG output in {plan.processed_data_dir}",
         "date_range": {
             "start": min(dates) if dates else "",

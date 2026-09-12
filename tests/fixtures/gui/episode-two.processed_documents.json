@@ -1,0 +1,8 @@
+{
+  "schema_version": "gui-fixture-v1",
+  "selected_variant": "reviewed_speaker_transcript",
+  "documents": [
+    {"page_content": "A second episode begins.", "metadata": {"node_id": "ep2-host", "episode_id": "episode-2", "episode_title": "Second episode", "episode_date": "2026-01-08", "speaker": "Host", "node_type": "transcript"}},
+    {"page_content": "Guest adds a second viewpoint.", "metadata": {"node_id": "ep2-guest", "episode_id": "episode-2", "episode_title": "Second episode", "episode_date": "2026-01-08", "speaker": "Guest", "node_type": "transcript"}}
+  ]
+}

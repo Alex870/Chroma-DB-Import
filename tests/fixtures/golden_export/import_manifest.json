@@ -1,15 +1,16 @@
 {
   "manifest_version": "2.0",
   "importer_version": "0.3.0",
-  "collection_name": "golden_fixture",
-  "embedding_model": "BAAI/bge-large-en-v1.5",
-  "embedding_dimension": 4,
-  "representation_id": "golden-representation-v1",
+  "collection_name": "golden_fixture__qwen3-embedding-4b-shadow",
+  "embedding_model": "Qwen/Qwen3-Embedding-4B",
+  "embedding_dimension": 2560,
+  "representation_id": "083c69c2e9a1ed3eb5d1552929b0ffdc67647e51c2f0e80172e69ebfdcaa00dd",
   "representation": {
+    "profile": "qwen3-embedding-4b-shadow",
     "provider": "sentence_transformers",
-    "model_id": "BAAI/bge-large-en-v1.5",
-    "model_revision": "d4aa6901d3a41ba39fb536a557fa166f842b0e09",
-    "dimension": 4,
+    "model_id": "Qwen/Qwen3-Embedding-4B",
+    "model_revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+    "dimension": 2560,
     "normalize_embeddings": true,
     "distance_metric": "cosine",
     "contextualization": "minimal",
@@ -18,9 +19,10 @@
     "matryoshka_compatible": false,
     "index_schema_version": "1.0",
     "pooling": "mean",
-    "query_document_mode": "document",
-    "implementation_version": "stage-04-v1",
-    "representation_id": "golden-representation-v1"
+    "query_instruction_profile": "podcast-retrieval-v1",
+    "query_document_mode": "separate-query-instruction",
+    "implementation_version": "stage-04-v2",
+    "representation_id": "083c69c2e9a1ed3eb5d1552929b0ffdc67647e51c2f0e80172e69ebfdcaa00dd"
   },
   "source_files": [
     {
@@ -34,7 +36,7 @@
   "document_counts": {"document_count": 1, "error_count": 0, "warning_count": 0},
   "validation": {"valid": true, "files": []},
   "operation": {"mode": "generate", "status": "promoted"},
-  "staging": {"valid": true, "dimension": 4, "smoke_query_ids": ["node-001"]},
+  "staging": {"valid": true, "dimension": 2560, "smoke_query_ids": ["node-001"]},
   "reconciliation": {"added": ["node-001"], "changed": [], "unchanged": [], "removed": []},
   "embedding_cache": {"hits": 0, "misses": 1, "invalidations": 0, "cache_size": 1}
 }

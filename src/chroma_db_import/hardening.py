@@ -55,7 +55,7 @@ def scale_plan(
             "embedding_batch_size": batch,
             "collection_write_batch_size": min(1000, max(100, batch * 8)),
             "retain_active_release_during_stage": True,
-            "shadow_release_isolated": True,
+            "release_isolated": True,
         },
         "blockers": blockers,
         "runnable": not blockers,

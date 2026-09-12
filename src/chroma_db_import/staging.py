@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,8 +40,18 @@ def operation_id(prefix: str = "import") -> str:
 
 
 def staging_collection_name(collection_name: str, operation: str) -> str:
-    safe = "".join(char if char.isalnum() or char in "-_" else "-" for char in collection_name)
-    return f"__stage04__{safe[:48]}__{operation[-24:]}"
+    """Return a temporary collection name accepted by Chroma.
+
+    Chroma permits only ASCII letters, digits, ``.``, ``_`` and ``-`` and
+    requires an alphanumeric first and last character.  Keep the operation
+    suffix so concurrent imports still get distinct temporary collections,
+    while making the helper safe for both generated and caller-provided IDs.
+    """
+    safe_collection = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(collection_name)).strip("._-")
+    safe_operation = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(operation)).strip("._-")
+    collection_part = safe_collection[:48] or "collection"
+    operation_part = safe_operation[-24:] or uuid.uuid4().hex[:8]
+    return f"stage04-{collection_part}-{operation_part}"
 
 
 def validate_staged_records(

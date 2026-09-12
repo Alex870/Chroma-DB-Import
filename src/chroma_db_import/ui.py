@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -24,8 +25,18 @@ __all__ = [
 
 def main() -> int:
     """Launch the desktop UI for export planning and import execution."""
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="Launch the Chroma DB Import desktop application.")
+    parser.add_argument(
+        "--workspace",
+        choices=("default", "contexts"),
+        default="default",
+        help="Workspace to show when the application opens.",
+    )
+    arguments = parser.parse_args()
+    app = QApplication([sys.argv[0]])
     apply_dark_theme(app)
     window = MainWindow()
     window.show()
+    if arguments.workspace == "contexts":
+        window.show_contexts()
     return app.exec()

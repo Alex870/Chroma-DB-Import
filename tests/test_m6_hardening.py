@@ -39,7 +39,7 @@ class M6HardeningTests(unittest.TestCase):
             )
             self.assertFalse(value["runnable"])
             self.assertEqual(8, value["recommendation"]["embedding_batch_size"])
-            self.assertTrue(value["recommendation"]["shadow_release_isolated"])
+            self.assertTrue(value["recommendation"]["release_isolated"])
             pre = build_preflight(
                 "import",
                 root,
@@ -54,7 +54,7 @@ class M6HardeningTests(unittest.TestCase):
                 if item["capability"] == "m6_missing_dependency"
             )
             self.assertEqual(
-                "python -m pip install -r chroma_db_import_requirements.txt",
+                "conda run -n chroma-db-import python -m pip install -r chroma_db_import_requirements.txt",
                 missing["remediation_command"],
             )
 

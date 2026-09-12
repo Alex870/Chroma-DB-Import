@@ -42,6 +42,9 @@ identity rules.
    The importer-local catalog may contain local paths, but Chat must not depend
    on that catalog.
 10. Producer files and upstream release files are read-only to PodCast Chat.
+11. The sole supported vector representation is Qwen3-Embedding-4B. This is
+    an identity migration within the existing v1 handoff contract; it does not
+    require a contract-version bump. Older BGE releases must fail closed.
 
 ## 2. Terminology
 
@@ -203,8 +206,15 @@ Its v1 contract is:
   "episode_uids": ["partition_podcast:podcast-2026-01-03"],
   "processed_cache_fingerprints": ["sha256:..."],
   "representation_id": "<stable-representation-fingerprint>",
-  "embedding_model": "BAAI/bge-large-en-v1.5",
-  "embedding_dimension": 1024,
+  "embedding_model": "Qwen/Qwen3-Embedding-4B",
+  "embedding_model_revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+  "embedding_dimension": 2560,
+  "representation_profile": "qwen3-embedding-4b-shadow",
+  "provider": "sentence_transformers",
+  "normalize_embeddings": true,
+  "distance_metric": "cosine",
+  "query_instruction_profile": "podcast-retrieval-v1",
+  "query_document_mode": "separate-query-instruction",
   "import_profile_fingerprint": "sha256:...",
   "created_at": "2026-09-05T18:30:00+00:00"
 }
@@ -246,9 +256,11 @@ Minimum schema:
 {
   "podcast_name": "Podcast",
   "database_id": "partition_podcast",
-  "collection_name": "rag_documents",
-  "embedding_model": "BAAI/bge-large-en-v1.5",
-  "embedding_dimension": 1024,
+  "collection_name": "rag_documents__qwen3-embedding-4b-shadow",
+  "embedding_model": "Qwen/Qwen3-Embedding-4B",
+  "embedding_model_revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+  "embedding_dimension": 2560,
+  "representation_id": "<stable-representation-fingerprint>",
   "description": "Managed podcast context: Podcast",
   "episode_count": 1,
   "document_count": 248,
@@ -290,9 +302,11 @@ Minimum schema:
 ```
 
 Required top-level fields are `database_id`, `collection_name`,
-`embedding_model`, `episodes`, and `speakers`. A managed export must also have
+`embedding_model`, `embedding_dimension`, `representation_id`, `episodes`, and
+`speakers`. A managed export must also have
 the complete partition identity and `upstream_release_id`. `database_id` must
-equal `corpus_id`; `collection_name` defaults to `rag_documents`.
+equal `corpus_id`; the Qwen3 collection name is derived as
+`<base>__qwen3-embedding-4b-shadow` and must be used consistently.
 
 `source_file` is a portable basename or logical source name. It is not a local
 filesystem path and must not be used to locate the source transcript.
@@ -311,32 +325,34 @@ The importer emits `manifest_version: "2.0"` with this required minimum:
   "importer_version": "0.3.0",
   "imported_at": "2026-09-05T18:30:00+00:00",
   "config": {
-    "embedding_model": "BAAI/bge-large-en-v1.5",
-    "embedding_model_revision": "immutable-model-revision",
+    "embedding_model": "Qwen/Qwen3-Embedding-4B",
+    "embedding_model_revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
     "embedding_provider": "sentence_transformers",
     "normalize_embeddings": true,
     "distance_metric": "cosine",
     "contextualization": "minimal",
-    "collection_name": "rag_documents",
+    "collection_name": "rag_documents__qwen3-embedding-4b-shadow",
     "portable_artifacts": true
   },
-  "collection_name": "rag_documents",
-  "embedding_model": "BAAI/bge-large-en-v1.5",
-  "embedding_dimension": 1024,
+  "collection_name": "rag_documents__qwen3-embedding-4b-shadow",
+  "embedding_model": "Qwen/Qwen3-Embedding-4B",
+  "embedding_model_revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+  "embedding_dimension": 2560,
   "selected_speakers": [],
   "representation": {
     "provider": "sentence_transformers",
-    "model_id": "BAAI/bge-large-en-v1.5",
-    "model_revision": "immutable-model-revision",
-    "dimension": 1024,
+    "model_id": "Qwen/Qwen3-Embedding-4B",
+    "model_revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+    "dimension": 2560,
     "normalize_embeddings": true,
     "distance_metric": "cosine",
     "contextualization": "minimal",
     "context_header_version": "1.0",
     "pooling": "mean",
-    "query_document_mode": "document",
+    "query_instruction_profile": "podcast-retrieval-v1",
+    "query_document_mode": "separate-query-instruction",
     "index_schema_version": "1.0",
-    "implementation_version": "stage-04-v1",
+    "implementation_version": "stage-04-v2",
     "representation_id": "<stable-representation-fingerprint>"
   },
   "representation_id": "<stable-representation-fingerprint>",
@@ -368,14 +384,24 @@ The `representation` object is authoritative when present. The top-level
 
 PodCast Chat must embed user queries with the same effective representation:
 
-- same provider and model ID;
-- same model revision, when the producer records one;
+- provider `sentence_transformers` and model ID `Qwen/Qwen3-Embedding-4B`;
+- model revision `5cf2132abc99cad020ac570b19d031efec650f2b`;
 - same pooling and query/document mode;
 - same normalization setting;
 - same distance metric;
 - same contextualization profile and context-header version;
 - same output dimension;
 - same representation implementation/index schema version.
+
+For Qwen3, Chat must format the query exactly as:
+
+```text
+Instruct: Retrieve podcast passages that best answer the user’s question, preserving speaker, episode, and viewpoint relevance.
+Query: <user question>
+```
+
+This instruction is used for queries only. Documents retain the importer’s
+contextualized document text and never receive the query instruction.
 
 If the exact model revision is unavailable, Chat must report the database as
 temporarily unavailable or use a precomputed compatible query-embedding
@@ -387,7 +413,7 @@ Each managed partition/release has a physically separate Chroma persistence
 directory. The default collection is:
 
 ```text
-rag_documents
+rag_documents__qwen3-embedding-4b-shadow
 ```
 
 The `collection_name` in `podcast.json`, `import_manifest.json`, and the

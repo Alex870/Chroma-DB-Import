@@ -1,6 +1,8 @@
 param(
-    [ValidateSet("Prompt", "RunUi", "Debug", "Migrate", "CreateCondaEnv")]
-    [string]$Action = "Prompt"
+    [ValidateSet("Prompt", "RunUi", "ManagedContexts", "Debug", "Migrate", "CreateCondaEnv")]
+    [string]$Action = "Prompt",
+    [ValidateSet("Legacy", "Modern")]
+    [string]$Ui = "Modern"
 )
 
 function Wait-ForExitPrompt {
@@ -85,14 +87,16 @@ if ($Action -eq "Prompt") {
     Write-Host "  2. Run the desktop UI"
     Write-Host "  3. Migrate settings and state from a legacy directory"
     Write-Host "  4. Create or refresh the CLI and UI environments"
+    Write-Host "  5. Open the managed context import workspace"
     Write-Host "  Q. Quit"
-    $selection = (Read-Host "Enter 1, 2, 3, 4, or Q").Trim()
+    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, or Q").Trim()
 
     switch ($selection.ToUpperInvariant()) {
         "1" { $Action = "Debug" }
         "2" { $Action = "RunUi" }
         "3" { $Action = "Migrate" }
         "4" { $Action = "CreateCondaEnv" }
+        "5" { $Action = "ManagedContexts" }
         "Q" { Exit-Script 0 }
         default {
             Write-Host "Unrecognized selection. Exiting."
@@ -106,7 +110,10 @@ switch ($Action) {
         Invoke-LauncherScript -Path $DebugScript
     }
     "RunUi" {
-        Invoke-LauncherScript -Path $UiScript
+        Invoke-LauncherScript -Path $UiScript -Parameters @{ Ui = $Ui }
+    }
+    "ManagedContexts" {
+        Invoke-LauncherScript -Path $UiScript -Parameters @{ Workspace = "Contexts"; Ui = $Ui }
     }
     "Migrate" {
         Invoke-LauncherScript -Path $MigrationScript
@@ -116,7 +123,7 @@ switch ($Action) {
         if ($cliExitCode -ne 0) {
             Exit-Script $cliExitCode
         }
-        $uiExitCode = Invoke-LauncherScriptAndReturn -Path $UiScript -Parameters @{ InstallCudaTorch = $true; NoLaunch = $true }
+        $uiExitCode = Invoke-LauncherScriptAndReturn -Path $UiScript -Parameters @{ NoLaunch = $true; Ui = $Ui }
         Exit-Script $uiExitCode
     }
 }

@@ -29,14 +29,26 @@ from chroma_db_import.importer import (
 )
 from chroma_db_import.state import write_json
 from chroma_db_import.contracts import require_compatible_contract
-from chroma_db_import.representation import INDEX_SCHEMA_VERSION
+from chroma_db_import.representation import (
+    INDEX_SCHEMA_VERSION,
+    QWEN3_MODEL,
+    QWEN3_MODEL_REVISION,
+    QWEN3_QUERY_INSTRUCTION_PROFILE,
+    recommended_batch_size,
+    resolve_representation_spec,
+    resolved_collection_name,
+    resolved_profile_path,
+)
 from chroma_db_import.deduplication import DedupPlan
 
 def config_payload(config: ImportConfig) -> dict[str, Any]:
     return {field.name: getattr(config, field.name) for field in fields(ImportConfig)}
 
 def existing_manifest(config: ImportConfig, project_dir: Path) -> dict[str, Any] | None:
-    path = resolve_path(project_dir, config.persist_dir) / config.manifest_path
+    spec = resolve_representation_spec(config)
+    configured_persist_dir = resolve_path(project_dir, config.persist_dir)
+    persist_dir = configured_persist_dir if config.storage_path_isolated else resolved_profile_path(configured_persist_dir, spec.profile)
+    path = persist_dir / config.manifest_path
     if not path.exists():
         return None
     try:
@@ -58,22 +70,20 @@ def rebuild_safety_warnings(config: ImportConfig, project_dir: Path, files: list
     manifest = existing_manifest(config, project_dir)
     if not manifest:
         return warnings
+    requested_spec = resolve_representation_spec(config)
+    requested_collection = resolved_collection_name(config.collection_name, requested_spec.profile)
     if manifest.get("embedding_model") and manifest.get("embedding_model") != config.embedding_model:
         warnings.append(
             f"Existing manifest embedding_model={manifest.get('embedding_model')} differs from requested {config.embedding_model}."
         )
-    if manifest.get("collection_name") and manifest.get("collection_name") != config.collection_name:
+    if manifest.get("collection_name") and manifest.get("collection_name") != requested_collection:
         warnings.append(
-            f"Existing manifest collection_name={manifest.get('collection_name')} differs from requested {config.collection_name}."
+            f"Existing manifest collection_name={manifest.get('collection_name')} differs from requested {requested_collection}."
         )
     previous_sources = {item.get("content_fingerprint") for item in manifest.get("source_files", []) if isinstance(item, dict)}
     current_sources = {content_fingerprint(path) for path in files}
     if previous_sources and previous_sources != current_sources:
         warnings.append("Selected source cache files differ from the existing manifest.")
-    if config.expected_embedding_model and config.expected_embedding_model != config.embedding_model:
-        warnings.append(
-            f"Chat compatibility warning: expected embedding model {config.expected_embedding_model}, import config uses {config.embedding_model}."
-        )
     return warnings
 
 def preflight_files(
@@ -92,6 +102,25 @@ def preflight_files(
         docs = load_processed_documents(path)
         docs = [doc for doc in docs if should_include_document(doc, config)]
         report = validate_document_items(docs, str(path))
+        payload_representation = payload.get("representation") if isinstance(payload.get("representation"), dict) else {}
+        declared_model = str(payload.get("embedding_model") or payload_representation.get("model_id") or "").strip()
+        if declared_model and declared_model != QWEN3_MODEL:
+            report.errors.append(
+                f"{path} declares unsupported embedding_model={declared_model!r}; only {QWEN3_MODEL!r} is supported"
+            )
+            report.valid = False
+        declared_revision = str(payload.get("embedding_model_revision") or payload.get("model_revision") or payload_representation.get("model_revision") or "").strip()
+        if declared_revision and declared_revision != QWEN3_MODEL_REVISION:
+            report.errors.append(f"{path} declares unsupported Qwen3 model revision")
+            report.valid = False
+        declared_dimension = payload.get("embedding_dimension") or payload_representation.get("dimension")
+        if declared_dimension not in (None, "", 2560):
+            report.errors.append(f"{path} declares unsupported embedding_dimension={declared_dimension!r}; Qwen3 requires 2560")
+            report.valid = False
+        declared_query_profile = str(payload.get("query_instruction_profile") or payload_representation.get("query_instruction_profile") or "").strip()
+        if declared_query_profile and declared_query_profile != QWEN3_QUERY_INSTRUCTION_PROFILE:
+            report.errors.append(f"{path} declares unsupported query_instruction_profile={declared_query_profile!r}")
+            report.valid = False
         reports.append(report)
         source_files.append(
             {
@@ -101,6 +130,10 @@ def preflight_files(
                 "schema_version": payload.get("schema_version"),
                 "pipeline_version": payload.get("pipeline_version"),
                 "prompt_version": payload.get("prompt_version"),
+                "embedding_model": declared_model,
+                "embedding_model_revision": declared_revision,
+                "embedding_dimension": declared_dimension,
+                "query_instruction_profile": declared_query_profile,
                 "document_count": len(docs),
                 "validation": report.as_dict(),
             }
@@ -159,6 +192,7 @@ def preflight_files(
     )
     summary = summarize_reports(reports)
     safety_warnings = rebuild_safety_warnings(config, project_dir, files)
+    representation = resolve_representation_spec(config)
     report = {
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "importer_version": IMPORTER_VERSION,
@@ -168,6 +202,11 @@ def preflight_files(
         "summary": summary,
         "source_files": source_files,
         "safety_warnings": safety_warnings,
+        "representation": representation.as_dict(),
+        "representation_storage": {
+            "collection_name": resolved_collection_name(config.collection_name, representation.profile),
+            "profile": representation.profile,
+        },
         "partition_isolation": {
             "valid": not partition_errors,
             "partition": selected_partition,
@@ -181,7 +220,8 @@ def preflight_files(
     return report
 
 def write_preflight_report(config: ImportConfig, project_dir: Path, report: dict[str, Any]) -> Path:
-    path = resolve_path(project_dir, config.preflight_report_path)
+    spec = resolve_representation_spec(config)
+    path = resolved_profile_path(resolve_path(project_dir, config.preflight_report_path), spec.profile)
     write_json(path, report)
     return path
 
@@ -206,9 +246,9 @@ def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImpo
         config=config_payload(config),
         source_files=source_files,
         validation_results=validation_results,
-        embedding_model=config.embedding_model,
+        embedding_model=importer.spec.model_id,
         embedding_dimension=importer.embedding_dimension,
-        collection_name=config.collection_name,
+        collection_name=importer.collection_name,
         selected_speakers=sorted(selected_speaker_set(config)),
         compatibility_warnings=preflight.get("safety_warnings") or [],
         representation={**importer.spec.as_dict(), "representation_id": importer.spec.representation_id},
@@ -226,6 +266,22 @@ def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImpo
         manifest["partition_ids"] = list(partition_info["partition_ids"])
     manifest["index_schema_version"] = INDEX_SCHEMA_VERSION
     manifest["representation"] = importer.spec.as_dict()
+    manifest["provider_diagnostics"] = importer.provider_diagnostics
+    manifest["resource_measurements"] = {
+        "memory_preflight": importer.memory_preflight,
+        "batch_size": max(
+            1,
+            int(
+                config.import_batch_size
+                or recommended_batch_size(
+                    importer.provider_diagnostics.get("device", "cpu"),
+                    model_id=importer.spec.model_id,
+                    profile=importer.spec.profile,
+                )
+            ),
+        ),
+        "device": importer.provider_diagnostics.get("device"),
+    }
     if dedup_plan is not None:
         manifest["dedup"] = {
             "policy": dedup_plan.policy,
@@ -238,18 +294,24 @@ def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImpo
 
 def benchmark_embeddings(config: ImportConfig, project_dir: Path) -> int:
     runtime.load_runtime_deps()
-    embeddings = runtime.HuggingFaceEmbeddings(model_name=config.embedding_model)
+    from chroma_db_import.providers import create_embedding_provider, probe_embedding_provider
+
+    spec = resolve_representation_spec(config)
+    embeddings, diagnostics = create_embedding_provider(spec, config.embedding_device)
     samples = ["benchmark sample text for chroma import"] * max(1, min(128, config.import_batch_size))
     started = time.time()
     vectors = embeddings.embed_documents(samples)
     elapsed = max(0.001, time.time() - started)
     dim = len(vectors[0]) if vectors else None
     print("Embedding benchmark")
-    print(f"  model: {config.embedding_model}")
+    print(f"  profile: {spec.profile}")
+    print(f"  model: {spec.model_id}@{spec.model_revision}")
     print(f"  batch_size: {len(samples)}")
     print(f"  embedding_dimension: {dim}")
     print(f"  docs_per_second: {len(samples) / elapsed:.2f}")
-    print("  recommendation: use CUDA when available; reduce import_batch_size if memory warnings appear.")
+    print(f"  dtype: {diagnostics.get('actual_dtype', spec.inference_dtype)}")
+    print(f"  representation_id: {spec.representation_id}")
+    print("  recommendation: use CUDA when available; reduce import_batch_size to 1 if memory is constrained.")
     return 0
 
 def memory_snapshot() -> dict[str, Any]:
@@ -298,10 +360,14 @@ def write_diagnostic_bundle(config: ImportConfig, project_dir: Path) -> int:
 def chroma_client(config: ImportConfig, project_dir: Path) -> Any:
     import chromadb
 
-    return chromadb.PersistentClient(path=str(resolve_path(project_dir, config.persist_dir)))
+    spec = resolve_representation_spec(config)
+    configured_persist_dir = resolve_path(project_dir, config.persist_dir)
+    persist_dir = configured_persist_dir if config.storage_path_isolated else resolved_profile_path(configured_persist_dir, spec.profile)
+    return chromadb.PersistentClient(path=str(persist_dir))
 
 def list_collections(config: ImportConfig, project_dir: Path) -> int:
     runtime.load_runtime_deps()
+    spec = resolve_representation_spec(config)
     client = chroma_client(config, project_dir)
     collections = client.list_collections()
     print(f"Collections in {resolve_path(project_dir, config.persist_dir)}:")
@@ -312,13 +378,16 @@ def list_collections(config: ImportConfig, project_dir: Path) -> int:
 
 def inspect_collection(config: ImportConfig, project_dir: Path) -> int:
     runtime.load_runtime_deps()
+    spec = resolve_representation_spec(config)
+    collection_name = resolved_collection_name(config.collection_name, spec.profile)
     client = chroma_client(config, project_dir)
-    collection = client.get_collection(config.collection_name)
-    print(f"Collection: {config.collection_name}")
+    collection = client.get_collection(collection_name)
+    print(f"Collection: {collection_name}")
     print(f"  count: {collection.count()}")
     print(f"  metadata: {getattr(collection, 'metadata', None)}")
     manifest = existing_manifest(config, project_dir)
     if manifest:
+        print(f"  manifest_profile: {(manifest.get('representation') or {}).get('profile', spec.profile)}")
         print(f"  manifest_embedding_model: {manifest.get('embedding_model')}")
         print(f"  manifest_embedding_dimension: {manifest.get('embedding_dimension')}")
         print(f"  manifest_source_files: {len(manifest.get('source_files', []))}")
@@ -326,14 +395,16 @@ def inspect_collection(config: ImportConfig, project_dir: Path) -> int:
 
 def delete_collection(config: ImportConfig, project_dir: Path) -> int:
     runtime.load_runtime_deps()
+    spec = resolve_representation_spec(config)
+    collection_name = resolved_collection_name(config.collection_name, spec.profile)
     client = chroma_client(config, project_dir)
-    client.delete_collection(config.collection_name)
-    print(f"Deleted collection: {config.collection_name}")
+    client.delete_collection(collection_name)
+    print(f"Deleted collection: {collection_name}")
     return 0
 
 def release_build(project_dir: Path) -> int:
     version_path = project_dir / "VERSION.json"
     write_json(version_path, {"importer_version": IMPORTER_VERSION, "created_at": dt.datetime.now(dt.timezone.utc).isoformat()})
     print(f"Release metadata written: {version_path}")
-    print("Create a clean environment with: python -m venv .release_venv; .release_venv\\Scripts\\pip install -r chroma_db_import_requirements.txt")
+    print("Install the pinned dependencies into the managed environment with: conda run -n chroma-db-import python -m pip install -r chroma_db_import_requirements.txt")
     return 0

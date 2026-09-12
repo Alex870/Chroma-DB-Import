@@ -1,6 +1,5 @@
 param(
     [string]$Config,
-    [string]$CondaEnvName = "chroma-db-import",
     [string]$ProcessedDataDir,
     [string]$PersistDir,
     [string]$CollectionName,
@@ -21,10 +20,19 @@ param(
     [switch]$SkipDependencyCheck
 )
 
+$CondaEnvName = "chroma-db-import"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ConfigPath = Join-Path $ProjectRoot "chroma_db_import_config.json"
 $ConfigExamplePath = Join-Path $ProjectRoot "examples\\chroma_db_import_config.example.json"
 $RequirementsPath = Join-Path $ProjectRoot "chroma_db_import_requirements.txt"
+$env:PYTHONNOUSERSITE = "1"
+$env:PIP_USER = "0"
+$ProjectSourcePath = Join-Path $ProjectRoot "src"
+if ([string]::IsNullOrWhiteSpace($env:PYTHONPATH)) {
+    $env:PYTHONPATH = $ProjectSourcePath
+} else {
+    $env:PYTHONPATH = "$ProjectSourcePath;$env:PYTHONPATH"
+}
 
 if (-not $Config) {
     $Config = $ConfigPath
@@ -45,6 +53,32 @@ function Test-CondaEnv {
     return $false
 }
 
+function Assert-CondaEnvWritable {
+    $probe = @"
+import site
+import uuid
+from pathlib import Path
+
+target = Path(site.getsitepackages()[0]) / (".chroma_import_write_probe_" + uuid.uuid4().hex)
+try:
+    target.write_text("probe", encoding="ascii")
+    target.unlink()
+except Exception as exc:
+    print(f"Conda site-packages is not writable: {type(exc).__name__}: {exc}")
+    raise SystemExit(1)
+"@
+    $probePath = Join-Path ([System.IO.Path]::GetTempPath()) ("chroma_import_write_check_{0}.py" -f [guid]::NewGuid().ToString("N"))
+    $probe | Set-Content -LiteralPath $probePath -Encoding UTF8
+    try {
+        Invoke-ProjectPython -Arguments @($probePath)
+        if ($LASTEXITCODE -ne 0) {
+            throw "The '$CondaEnvName' environment is not writable. Refusing to install packages into the user site. Repair or recreate the Conda environment, then retry."
+        }
+    } finally {
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function New-ProjectCondaEnv {
     if (-not (Test-CondaEnv)) {
         & conda create -y -n $CondaEnvName python=3.11 pip
@@ -54,6 +88,7 @@ function New-ProjectCondaEnv {
     } else {
         Write-Host "Refreshing existing Conda environment: $CondaEnvName"
     }
+    Assert-CondaEnvWritable
     if ($LASTEXITCODE -eq 0) {
         & conda run --no-capture-output -n $CondaEnvName python -m pip install --upgrade pip
     }
@@ -69,6 +104,7 @@ function New-ProjectCondaEnv {
 }
 
 function Install-CudaTorch {
+    Assert-CondaEnvWritable
     & conda run --no-capture-output -n $CondaEnvName python -m pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url $TorchCudaIndexUrl
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE

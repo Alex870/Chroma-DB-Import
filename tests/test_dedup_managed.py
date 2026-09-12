@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from chroma_db_import.config import ImportConfig
+from chroma_db_import.importer import representation_spec
 from chroma_db_import.managed import ContextIdentity, ManagedCatalog, discover, managed_paths, run_managed_import
 from tests.test_managed_contexts import write_release
 
@@ -98,7 +99,8 @@ class ManagedDedupTests(unittest.TestCase):
                     export = Path(config.persist_dir)
                     export.mkdir(parents=True, exist_ok=True)
                     (export / "chroma.sqlite3").write_bytes(b"fixture")
-                    (export / "import_manifest.json").write_text(json.dumps({"embedding_model": "fixture", "embedding_dimension": 3, "representation_id": "rep", "document_counts": {"document_count": 1}, "source_files": []}), encoding="utf-8")
+                    representation = representation_spec(config).as_dict()
+                    (export / "import_manifest.json").write_text(json.dumps({"embedding_model": representation["model_id"], "embedding_dimension": representation["dimension"], "representation_id": representation["representation_id"], "representation": representation, "document_counts": {"document_count": 1}, "source_files": []}), encoding="utf-8")
                 with patch("chroma_db_import.cli.run_import", fake_run):
                     first = run_managed_import(ImportConfig(), root, catalog, "p", output_root=root / "exports")
                     second = run_managed_import(ImportConfig(), root, catalog, "p", output_root=root / "exports")

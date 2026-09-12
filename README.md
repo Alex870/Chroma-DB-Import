@@ -4,7 +4,7 @@ Imports pre-processed podcast RAG documents into a persistent Chroma collection.
 
 This project intentionally does not call LM Studio and does not perform transcript preprocessing. It expects processed cache files produced by `Podcast-RAG-pipeline` under `processed_data`.
 
-The desktop UI is the primary workflow. A headless CLI path still exists for automation, diagnostics, and recovery, but it now lives behind the script launcher and Python package entrypoint instead of a root compatibility wrapper.
+The modern React database manager is the default desktop workflow. The existing Qt window remains available through the explicit Legacy launcher. A headless CLI path still exists for automation, diagnostics, and recovery.
 
 ## Repository Layout
 
@@ -16,6 +16,9 @@ The desktop UI is the primary workflow. A headless CLI path still exists for aut
 - `docs/`: shared data-contract notes and roadmap material
 - `tests/`: focused unit coverage for contract checks and update-import behavior
 - `chroma_db_import_ui.py`: compatibility entry point for legacy UI commands
+- `frontend/`: locked React/Vite source for the modern library and review screens
+- `src/chroma_db_import/workflow/`: UI-independent catalog, preview, selection, job, and adapter services
+- `src/chroma_db_import/desktop/`: pywebview host and generated local assets
 
 The direct Python dependencies are exact-pinned in `chroma_db_import_requirements.txt`. Use `scripts/Test-ChromaDbImportEnvironment.ps1` for the clean-machine CUDA/CPU, config, staging-recovery, and output-contract diagnostics before launching the UI.
 
@@ -41,6 +44,7 @@ It gives you a simple choice:
 2. Run the desktop UI
 3. Migrate settings and state from a legacy directory
 4. Create or refresh the CLI and UI environments
+5. Open the managed context import workspace
 
 If you already have an older working directory with import state or a populated local Chroma export, choose `3`. The migration assistant opens a folder picker, warns once before overwriting or merging into existing targets, copies forward the runtime config plus durable state/assets, and rewrites repo-local absolute config paths to portable repo-relative paths in the new `chroma_db_import_config.json`.
 
@@ -50,7 +54,20 @@ If you already have an older working directory with import state or a populated 
 .\Run Chroma DB Import.ps1
 ```
 
-Choose `2` for the desktop UI. The lower-level script remains available at `.\scripts\Run-ChromaDbImportUi.ps1` when you want to bypass the menu.
+Choose `2` for the desktop UI, or `5` to open directly in the managed context
+import workspace. The lower-level script remains available at
+`.\scripts\Run-ChromaDbImportUi.ps1` when you want to bypass the menu.
+
+The modern UI uses the existing `chroma-db-import` Conda environment and loads a
+compiled local bundle; it does not run Node at runtime. Build/setup once with:
+
+```powershell
+.\scripts\Run-ChromaDbImportUi.ps1 -InstallDependencies -Ui Modern -NoLaunch
+```
+
+The root bootstrap now launches Modern by default. Use `-Ui Legacy` when the
+existing Qt window is needed; both paths keep the same numbered launcher
+actions and use the existing Python importer.
 
 Use the toolbar from left to right:
 
@@ -63,7 +80,7 @@ Use the toolbar from left to right:
 - `Settings`: edit podcast/output/settings/speaker selections. Use `Save Settings` / `Load Settings` inside this page to persist and restore them.
 - `Guide`: view the expected new-export and update workflows.
 
-The UI startup script prints a CUDA/PyTorch diagnosis before launching. To install a CUDA-enabled PyTorch build into the UI virtual environment, run:
+The UI startup script prints a CUDA/PyTorch diagnosis before launching. To install a CUDA-enabled PyTorch build into the `chroma-db-import` Conda environment, run:
 
 ```powershell
 .\scripts\Run-ChromaDbImportUi.ps1 -InstallCudaTorch
@@ -148,8 +165,11 @@ exported embedding space, for example:
 ```json
 {
   "provider": "sentence_transformers",
-  "model": "BAAI/bge-large-en-v1.5",
-  "dimensions": 1024
+  "profile": "qwen3-embedding-4b-shadow",
+  "model": "Qwen/Qwen3-Embedding-4B",
+  "revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+  "dimensions": 2560,
+  "query_instruction_profile": "podcast-retrieval-v1"
 }
 ```
 
@@ -161,17 +181,17 @@ identity with the requested release.
 
 ## Embeddings
 
-The default embedding model is:
+The sole embedding model is:
 
 ```text
-BAAI/bge-large-en-v1.5
+Qwen/Qwen3-Embedding-4B
 ```
 
-This model converts each selected RAG document into a dense vector before insertion into Chroma. `PodCast Chat` later embeds the user's question with the same model and asks Chroma for nearby vectors, which is how the chat app finds semantically relevant podcast viewpoints before sending context to LM Studio.
+This model converts each selected RAG document into a dense vector before insertion into Chroma. `PodCast Chat` must later embed the user's question with the same pinned model and the matching `podcast-retrieval-v1` query instruction before asking Chroma for nearby vectors.
 
-`bge-large-en-v1.5` was chosen as the default because it is a strong general-purpose English retrieval embedding model with good semantic search behavior for natural-language questions, transcript excerpts, summaries, and viewpoint-style passages. It is also widely available through Hugging Face tooling, works on CPU, and can be accelerated with CUDA PyTorch when a compatible NVIDIA GPU environment is installed. That makes it a good fit for a Windows desktop workflow where reliability and easy setup matter, while still allowing faster imports on GPU-equipped machines.
+Qwen3 uses bfloat16 inference, produces 2,560-dimensional normalized vectors, and applies the pinned podcast-retrieval query instruction only to queries. CUDA batch size defaults to 2, with a memory preflight and batch-size-1 fallback for constrained GPUs. Qwen3 is the sole supported representation; existing non-Qwen exports must be rebuilt and are rejected by the importer.
 
-The embedding model is configurable in the UI and in the CLI config, but the Chroma export and the chat client must agree on the model. If a database is generated with one embedding model and queried with another, vector distances become unreliable because the vectors no longer live in the same embedding space. The generated `podcast.json` records the embedding model and detected embedding dimension so `PodCast Chat` can display and use the expected values.
+The model fields are fixed by the Qwen3 profile and are not user-selectable. The generated collection name is profile-scoped (for example, `whisper_rag_v2__qwen3-embedding-4b-shadow`), and `podcast.json`, `import_manifest.json`, and `release.json` record the complete representation identity so `PodCast Chat` can fail closed on any mismatch.
 
 ## Setup
 
@@ -180,11 +200,11 @@ The embedding model is configurable in the UI and in the CLI config, but the Chr
 Copy-Item .\examples\chroma_db_import_config.example.json .\chroma_db_import_config.json
 ```
 
-Choose `4` to create or refresh both the CLI Conda environment and the desktop UI virtual environment.
+Choose `4` to create or refresh the `chroma-db-import` Conda environment used by both the CLI and desktop UI.
 
 Edit `chroma_db_import_config.json` so `processed_data_dir` points at the preprocessed cache directory and `persist_dir` points at the Chroma database directory you want to populate.
 
-Option `4` installs CUDA-enabled PyTorch into both environments automatically. For direct CLI environment setup, run:
+Option `4` installs CUDA-enabled PyTorch into the same environment automatically. For direct environment setup, run:
 
 ```powershell
 .\scripts\Run-ChromaDbImport.ps1 -CreateCondaEnv -InstallCudaTorch
@@ -196,10 +216,10 @@ or, for an existing environment:
 .\scripts\Run-ChromaDbImport.ps1 -InstallCudaTorch -SkipDependencyCheck
 ```
 
-For the desktop UI environment only:
+To install or refresh the UI dependencies in the same Conda environment without launching the UI:
 
 ```powershell
-.\scripts\Run-ChromaDbImportUi.ps1 -InstallCudaTorch -NoLaunch
+.\scripts\Run-ChromaDbImportUi.ps1 -InstallDependencies -InstallCudaTorch -NoLaunch
 ```
 
 ## Test
@@ -264,10 +284,32 @@ partition. The producer handoff/release manifest is authoritative for
 partition from a folder or filename. See the authoritative
 [`transcription-handoff-contract.md`](C:/temp/codex/Podcast-RAG-pipeline/transcription-handoff-contract.md).
 
-Use the desktop app's **Contexts** action to link a Podcast-RAG project once,
-discover valid handoffs/releases, inspect each context, and import its newest
-release. Contexts and local preferences are stored in the private
+Use `Run Chroma DB Import.ps1` and choose **5. Open the managed context import
+workspace**. The workspace links a Podcast-RAG project once, reads producer
+processing status, resumes pending managed work when requested, publishes a
+validated producer release, previews the Chroma import, and asks for
+confirmation before activation. The UI invokes producer operations in the
+background; the user does not need to run producer or importer commands in a
+terminal.
+
+The existing **Contexts** action remains available for discovery, profile
+management, review, and direct import of an already-published release.
+Contexts and local preferences are stored in the private
 `state/context_catalog.sqlite3` catalog, so JSON editing is not required.
+
+The managed workspace keeps producer processing pending separate from Chroma
+import pending. Producer pending work blocks release publication until the
+user chooses **Resume Source Processing** and the source reports that all
+declared episodes have valid caches. Once processing is ready, **Prepare and
+Import Latest** publishes or reuses the matching upstream release, discovers
+it, runs the importer dry-run and deduplication preview, and then offers
+**Import and Activate**. A failed preparation or import leaves the previous
+active database untouched.
+
+The discovery screen also registers a validated producer `partition.json` as
+a release-less context candidate. This is what enables the first release to
+be published from a completed partition; the candidate is not importable until
+the producer release passes validation.
 
 The equivalent headless workflow is:
 
@@ -319,17 +361,16 @@ modes for a consumer that explicitly supports the contract.
 The model-free preview and assessment commands are:
 
 ```powershell
-$env:PYTHONPATH = Join-Path (Get-Location) 'src'
-python -m chroma_db_import redundancy policy --catalog .\state\context_catalog.sqlite3 --partition podcast-history
-python -m chroma_db_import redundancy configure-judge --catalog .\state\context_catalog.sqlite3 --partition podcast-history --base-url http://localhost:1234/v1 --model <explicit-installed-model-id>
-python -m chroma_db_import redundancy models --base-url http://localhost:1234/v1
-python -m chroma_db_import redundancy preview --catalog .\state\context_catalog.sqlite3 --partition podcast-history --release <release-id>
-python -m chroma_db_import redundancy assess --catalog .\state\context_catalog.sqlite3 --partition podcast-history --release <release-id> --channels lexical,structural
-python -m chroma_db_import redundancy review --bundle <published-bundle>
-python -m chroma_db_import redundancy label-export --bundle <published-bundle> --output .\state\redundancy-labels.json
-python -m chroma_db_import redundancy evaluate --bundle <published-bundle> --labels .\state\redundancy-labels.json --output .\state\redundancy-evaluation.json
+conda run -n chroma-db-import python -m chroma_db_import redundancy policy --catalog .\state\context_catalog.sqlite3 --partition podcast-history
+conda run -n chroma-db-import python -m chroma_db_import redundancy configure-judge --catalog .\state\context_catalog.sqlite3 --partition podcast-history --base-url http://localhost:1234/v1 --model <explicit-installed-model-id>
+conda run -n chroma-db-import python -m chroma_db_import redundancy models --base-url http://localhost:1234/v1
+conda run -n chroma-db-import python -m chroma_db_import redundancy preview --catalog .\state\context_catalog.sqlite3 --partition podcast-history --release <release-id>
+conda run -n chroma-db-import python -m chroma_db_import redundancy assess --catalog .\state\context_catalog.sqlite3 --partition podcast-history --release <release-id> --channels lexical,structural
+conda run -n chroma-db-import python -m chroma_db_import redundancy review --bundle <published-bundle>
+conda run -n chroma-db-import python -m chroma_db_import redundancy label-export --bundle <published-bundle> --output .\state\redundancy-labels.json
+conda run -n chroma-db-import python -m chroma_db_import redundancy evaluate --bundle <published-bundle> --labels .\state\redundancy-labels.json --output .\state\redundancy-evaluation.json
 # Optional measured query arm (JSON object: arm -> query_id -> ranked occurrence IDs)
-python -m chroma_db_import redundancy evaluate --bundle <published-bundle> --labels .\state\redundancy-labels.json --queries .\state\redundancy-queries.json --query-results .\state\redundancy-query-results.json --output .\state\redundancy-evaluation.json
+conda run -n chroma-db-import python -m chroma_db_import redundancy evaluate --bundle <published-bundle> --labels .\state\redundancy-labels.json --queries .\state\redundancy-queries.json --query-results .\state\redundancy-query-results.json --output .\state\redundancy-evaluation.json
 ```
 
 The desktop importer exposes the same workflow from the selected Context via
@@ -356,7 +397,7 @@ full-base recovery remains an explicit consumer choice.
 ## Direct Python Usage
 
 ```powershell
-python -m chroma_db_import --config .\chroma_db_import_config.json
-python -m chroma_db_import --dry-run
-python -m chroma_db_import --inspect-collection
+conda run -n chroma-db-import python -m chroma_db_import --config .\chroma_db_import_config.json
+conda run -n chroma-db-import python -m chroma_db_import --dry-run
+conda run -n chroma-db-import python -m chroma_db_import --inspect-collection
 ```

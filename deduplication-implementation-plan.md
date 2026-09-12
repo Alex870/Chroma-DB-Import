@@ -32,7 +32,7 @@ PowerShell baseline (use an existing environment with project dependencies):
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
-python -m unittest discover -s tests -v
+conda run -n chroma-db-import python -m unittest discover -s tests -v
 ```
 
 If `python` is not the configured runtime, use its actual executable for all later commands. Record that executable. Do not install arbitrary dependencies to conceal an environment problem. If baseline failures are unrelated, document them separately; new/changed tests must still pass. Required real-Chroma/UI checks cannot be declared passed merely because they skipped.
@@ -50,7 +50,7 @@ If `python` is not the configured runtime, use its actual executable for all lat
 
 Tests must assert actual normalized strings: NFC composed/decomposed accent equality; repeated whitespace; preserved case, punctuation, `not`, `10` versus `100`, markup, and diacritics. Test singular/list/JSON-list spans, duplicate span entries, disagreement, empty entries, malformed JSON, numeric values, and absent spans.
 
-**Check:** `python -m unittest tests.test_deduplication -v`.
+**Check:** `conda run -n chroma-db-import python -m unittest tests.test_deduplication -v`.
 
 ## 2. Complete release inventory and exact plan
 
@@ -206,8 +206,8 @@ Build fixtures from the existing managed tests, with explicit valid identities/h
 Run targeted new suites, then existing full suite:
 
 ```powershell
-python -m unittest tests.test_deduplication tests.test_dedup_artifacts tests.test_dedup_embeddings tests.test_dedup_managed tests.test_retrieval_dedup -v
-python -m unittest discover -s tests -v
+conda run -n chroma-db-import python -m unittest tests.test_deduplication tests.test_dedup_artifacts tests.test_dedup_embeddings tests.test_dedup_managed tests.test_retrieval_dedup -v
+conda run -n chroma-db-import python -m unittest discover -s tests -v
 git diff --check
 git status --short
 ```

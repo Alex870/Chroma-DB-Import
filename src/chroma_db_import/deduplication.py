@@ -15,7 +15,7 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .contract import content_fingerprint, has_text
 from .lexical_index import tokenize
@@ -715,6 +715,7 @@ def load_managed_dedup_inputs(
     spec: RepresentationSpec | None = None,
     *,
     selected_speakers: Iterable[str] | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> DedupInventory:
     """Validate raw producer rows across the complete release.
 
@@ -730,7 +731,9 @@ def load_managed_dedup_inputs(
     seen_ids: set[str] = set()
     excluded_reasons: dict[str, int] = defaultdict(int)
     total = 0
-    for path in sorted(Path(value) for value in cache_paths):
+    sorted_paths = sorted(Path(value) for value in cache_paths)
+    total_paths = len(sorted_paths)
+    for path_index, path in enumerate(sorted_paths, 1):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -809,6 +812,8 @@ def load_managed_dedup_inputs(
                 excluded_reasons[reason] += 1
                 continue
             rows.append((path, raw, copied_metadata, verified_fingerprint))
+        if progress_callback is not None:
+            progress_callback(f"Validated producer cache {path_index}/{total_paths}: {path.name}", path_index, total_paths)
     inputs: list[DedupInput] = []
     for path, raw, metadata, fingerprint in rows:
         effective_id = str(metadata.get("stable_document_id") or metadata.get("node_id") or raw.get("stable_document_id") or raw.get("node_id") or "").strip()

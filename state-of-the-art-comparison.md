@@ -4,7 +4,7 @@ Last reviewed: July 2026
 
 ## Scope and Current Baseline
 
-Chroma DB Import is the indexing and packaging stage of the local podcast RAG system. It validates processed documents, filters speakers, embeds selected records with a configurable Sentence Transformers model, writes a persistent Chroma collection, caches embeddings, supports resumable batches, and emits manifests for downstream compatibility. The default representation is a single dense vector from `BAAI/bge-large-en-v1.5` for each source, summary, position, or topic document.
+Chroma DB Import is the indexing and packaging stage of the local podcast RAG system. It validates processed documents, filters speakers, embeds selected records with the pinned `Qwen/Qwen3-Embedding-4B` Sentence Transformers provider, writes a persistent Chroma collection, caches embeddings, supports resumable batches, and emits manifests for downstream compatibility. The current representation is a normalized 2,560-dimensional Qwen3 vector for each source, summary, position, or topic document. Older BGE exports are unsupported and must be rebuilt.
 
 This is a sound, practical baseline. Its strongest qualities are reproducibility, local operation, stable document IDs, explicit provenance, preflight validation, and strict agreement between the importer and query client. The main distance from the research frontier is not basic vector quality; it is the reliance on one dense representation and one vector index, with no lexical channel, learned reranking representation, contextual chunk embedding, graph index, or judged retrieval benchmark.
 
@@ -12,7 +12,7 @@ This is a sound, practical baseline. Its strongest qualities are reproducibility
 
 | Capability | Current project | Research / frontier direction | Migration worthiness and ease |
 |---|---|---|---|
-| Embedding model | Configurable single-vector Sentence Transformers model; default `bge-large-en-v1.5` | BGE-M3-style dense, learned-sparse, and multi-vector representations from one model; long-input and multilingual encoders | **High worth, medium ease for dense-only trial.** A model adapter and full re-index are straightforward. Sparse and multi-vector modes require new index/export contracts and are harder. |
+| Embedding model | Fixed, pinned `Qwen/Qwen3-Embedding-4B` single-vector Sentence Transformers representation | Alternative dense, learned-sparse, and multi-vector representations from other models | **Current choice.** Any alternative requires a separately specified representation, fresh exports, and coordinated downstream migration. |
 | Retrieval signals stored | Dense vectors plus metadata in Chroma | Hybrid dense + BM25 or learned sparse retrieval, fused with Reciprocal Rank Fusion | **Very high worth, medium effort.** Exact names, dates, quotations, and niche terms are common in podcasts. Add normalized lexical text and a sidecar sparse index before changing vector storage. |
 | Document representation | Each processed document is embedded independently | Late chunking or deterministic contextual headers that carry episode, speaker, topic, and parent context into the vector | **High worth, medium effort.** Contextual headers are easy and reversible; true late chunking needs token-level pooling and careful source-span alignment. |
 | Fine-grained matching | One vector per document | ColBERT-style late interaction or other multi-vector token representations | **Medium-high worth, hard migration.** Likely better for quotations and nuanced claims, but storage and query execution no longer fit the present Chroma-only contract. |
@@ -28,7 +28,7 @@ This is a sound, practical baseline. Its strongest qualities are reproducibility
 
 ### 1. Multi-Function Embeddings
 
-[BGE-M3](https://arxiv.org/abs/2402.03216) supports dense, learned-sparse, and multi-vector retrieval, more than 100 languages, and inputs up to 8192 tokens. It is a natural research candidate because the importer already centralizes embedding creation and records model identity.
+[BGE-M3](https://arxiv.org/abs/2402.03216) supports dense, learned-sparse, and multi-vector retrieval, more than 100 languages, and inputs up to 8192 tokens. It remains a possible future research comparison, but it is not an accepted importer profile and cannot be mixed with the Qwen3 representation.
 
 Advantages:
 
@@ -44,7 +44,7 @@ Disadvantages:
 - More representations increase storage, import time, operational complexity, and manifest surface area.
 - Benchmark gains may not transfer to speaker-scoped podcast belief retrieval.
 
-Recommendation: add an embedding-provider interface and run a BGE-M3 dense-only shadow index. Do not enable sparse or multi-vector output until RAGScope demonstrates a specific recall or ranking gap.
+Recommendation: keep the Qwen3 provider as the sole importer implementation. Evaluate any future alternative in an isolated migration experiment, and do not enable sparse or multi-vector output until RAGScope demonstrates a specific recall or ranking gap.
 
 ### 2. Hybrid Dense and Lexical Indexing
 
@@ -147,7 +147,7 @@ Recommendation: defer until index size or latency is a demonstrated bottleneck.
 2. Extend manifests with representation type, contextualization method, sparse-index identity, and index schema version.
 3. Add deterministic contextual headers and compare them with the current dense baseline.
 4. Export normalized lexical text and a BM25 sidecar; fuse results downstream with Reciprocal Rank Fusion.
-5. Add versioned shadow exports so the same corpus can be indexed by `bge-large-en-v1.5` and BGE-M3 dense mode.
+5. Add versioned candidate exports only for a separately approved future representation; never update the Qwen3 collection in place.
 6. Measure quality, import time, query latency, memory, disk size, and GPU/CPU behavior in RAGScope.
 7. Add deterministic graph edges over existing provenance only if multi-hop queries remain weak.
 8. Consider late interaction or domain adaptation only after cheaper retrieval and reranking improvements plateau.
@@ -156,4 +156,4 @@ Recommendation: defer until index size or latency is a demonstrated bottleneck.
 
 The current importer is closer to production quality than many research prototypes because it handles validation, resumability, provenance, and compatibility. Those operational strengths should be preserved.
 
-The best near-term frontier migration is a measured hybrid index: contextualized dense vectors plus lexical retrieval, exported behind a versioned contract. BGE-M3 dense experiments are worthwhile, but replacing the entire storage model with learned sparse, multi-vector, or graph retrieval is not yet justified. Evaluation and shadow indexing should precede every irreversible database rebuild.
+The current dense baseline is Qwen3 behind a strict versioned contract. The best near-term frontier work is a measured hybrid sidecar—contextualized dense vectors plus lexical retrieval—without changing the Qwen3 identity. Any future model experiment must precede an irreversible rebuild with its own representation and release identity.

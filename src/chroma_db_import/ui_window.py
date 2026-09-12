@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from chroma_db_import.asset_filters import (
+    ASSET_FILTER_CHOICES,
+    ASSET_FILTER_LABELS,
+    DEFAULT_ASSET_FILTER,
+    normalize_asset_filter,
+    select_asset_files,
+)
 from chroma_db_import.config import ImportConfig
 from chroma_db_import.contract import validate_podcast_metadata
 from chroma_db_import.managed import ManagedCatalog, discover, import_profile_payload
@@ -53,16 +61,25 @@ from chroma_db_import.ui_support import (
     pytorch_cuda_is_available,
     resolve_embedding_device,
 )
-from chroma_db_import.ui_workers import ChromaExportWorker, CudaTorchInstallWorker, ManagedDedupPreviewWorker, ManagedDedupReviewWorker, ManagedImportWorker, RedundancyWorker
+from chroma_db_import.ui_workers import ChromaExportWorker, CudaTorchInstallWorker, ManagedContextWorkflowWorker, ManagedDedupPreviewWorker, ManagedDedupReviewWorker, ManagedImportWorker, RedundancyWorker
+from chroma_db_import.representation import PRIMARY_PROFILE, QWEN3_MODEL, QWEN3_MODEL_REVISION, QWEN3_PROFILE
 
 class ProcessedFolderPreviewDialog(QDialog):
     """Browse for a processed-data folder and preview compatible files before accepting."""
 
-    def __init__(self, parent: QWidget | None = None, start_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        start_path: Path | None = None,
+        asset_filter: str = DEFAULT_ASSET_FILTER,
+        asset_pattern: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Open processed RAG output folder")
         self.resize(1040, 620)
         self.selected_path: Path | None = None
+        self.asset_filter = normalize_asset_filter(asset_filter)
+        self.asset_pattern = asset_pattern
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self.refresh_preview)
@@ -196,7 +213,9 @@ class ProcessedFolderPreviewDialog(QDialog):
         self.selected_path = folder
         self.path_edit.setText(str(folder))
         self.status_label.setText("Scanning folder...")
-        self.detail_label.setText("Looking for *.processed_documents.json files...")
+        self.detail_label.setText(
+            f"Looking for {ASSET_FILTER_LABELS[self.asset_filter]} among *.processed_documents.json files..."
+        )
         self.metrics_label.setText("")
         self.sample_list.clear()
         self.open_button.setEnabled(False)
@@ -207,7 +226,8 @@ class ProcessedFolderPreviewDialog(QDialog):
         if folder is None:
             return
         files = sorted(folder.rglob("*.processed_documents.json"))
-        compatible_count = len(files)
+        selection = select_asset_files(files, self.asset_filter, self.asset_pattern)
+        compatible_count = selection.selected_count
 
         if not files:
             self.status_label.setText("No compatible processed episode files were found in this folder.")
@@ -219,16 +239,13 @@ class ProcessedFolderPreviewDialog(QDialog):
             self.open_button.setEnabled(False)
             return
 
-        sample_names = [path.name for path in files[:12]]
+        sample_names = [path.name for path in selection.selected_paths[:12]]
         for name in sample_names:
             self.sample_list.addItem(name)
 
         date_tokens: list[str] = []
-        cleaned_count = 0
         for path in files:
             stem = path.stem
-            if "_cleaned_" in stem:
-                cleaned_count += 1
             compact = "".join(ch for ch in stem if ch.isdigit())
             if len(compact) >= 8:
                 date_tokens.append(compact[:8])
@@ -236,16 +253,24 @@ class ProcessedFolderPreviewDialog(QDialog):
         extra = ""
         if len(files) > len(sample_names):
             extra = f" Showing the first {len(sample_names)} file names."
-        self.status_label.setText(f"Found {compatible_count} compatible processed episode file(s).")
-        self.detail_label.setText("This folder looks usable for Chroma DB Import." + extra)
+        self.status_label.setText(
+            f"Found {compatible_count} matching asset(s) out of {len(files)} processed cache file(s)."
+        )
+        self.detail_label.setText(
+            f"Filter: {ASSET_FILTER_LABELS[self.asset_filter]}. "
+            "This folder looks usable for Chroma DB Import." + extra
+        )
         if date_tokens:
             pretty_dates = sorted(date_tokens)
             metrics = (
                 f"Date range: {pretty_dates[0]} -> {pretty_dates[-1]} | "
-                f"Cleaned caches: {cleaned_count} | Original caches: {compatible_count - cleaned_count}"
+                f"Matching assets: {compatible_count} | "
+                f"Excluded by filter: {len(selection.excluded_paths)}"
             )
         else:
-            metrics = f"Cleaned caches: {cleaned_count} | Original caches: {compatible_count - cleaned_count}"
+            metrics = (
+                f"Matching assets: {compatible_count} | Excluded by filter: {len(selection.excluded_paths)}"
+            )
         self.metrics_label.setText(metrics)
         self.open_button.setEnabled(True)
 
@@ -261,6 +286,9 @@ class MainWindow(QMainWindow):
         self.context_catalog_path = self.project_root / "state" / "context_catalog.sqlite3"
         self.context_catalog = ManagedCatalog(self.context_catalog_path)
         self.context_selected_partition = ""
+        self.context_source_status: dict[str, Any] | None = None
+        self.context_pending_release_id: str | None = None
+        self.context_import_after_prepare = False
         self._loading_state = False
 
         self.loader = EpisodeLoader()
@@ -292,11 +320,21 @@ class MainWindow(QMainWindow):
         self.podcast_name = QLineEdit("Podcast Chat Export")
         self.database_id = QLineEdit("podcast-chat-export")
         self.collection_name = QLineEdit("whisper_rag_v2")
-        self.embedding_model = QLineEdit("BAAI/bge-large-en-v1.5")
+        self.asset_filter = QComboBox()
+        for filter_name in ASSET_FILTER_CHOICES:
+            self.asset_filter.addItem(ASSET_FILTER_LABELS[filter_name], filter_name)
+        self.asset_pattern = QLineEdit()
+        self.asset_pattern.setPlaceholderText("*_reviewed_speaker_transcript.json")
+        self.asset_pattern.setEnabled(False)
+        self.representation_profile = QComboBox()
+        self.representation_profile.addItem("Qwen3 Embedding 4B — 2,560 dimensions, high VRAM", QWEN3_PROFILE)
+        self.embedding_model = QLineEdit(QWEN3_MODEL)
+        self.embedding_model.setReadOnly(True)
+        self.embedding_model_revision = QLineEdit(QWEN3_MODEL_REVISION)
+        self.embedding_model_revision.setReadOnly(True)
         self.embedding_device = QComboBox()
         self.contextualization = QComboBox()
         self.contextualization.addItems(["minimal", "full", "none"])
-        self.experimental_bge_m3 = QCheckBox("Use pinned BGE-M3 dense shadow profile")
         self.dedup_profile = QComboBox()
         self.dedup_profile.addItems(["off", "safe", "audit"])
         self.dedup_near_enabled = QCheckBox("Report near repetitions")
@@ -316,6 +354,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
+        self.progress_started_at: float | None = None
+        self.progress_message = "Idle"
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setInterval(1000)
+        self.progress_timer.timeout.connect(self.refresh_progress_status)
         self.cuda_install_button: QPushButton | None = None
 
         self.populate_embedding_devices()
@@ -442,9 +485,64 @@ class MainWindow(QMainWindow):
         action.setWhatsThis(text)
 
     def connect_prerequisite_signals(self) -> None:
-        for field in (self.podcast_name, self.database_id, self.collection_name, self.embedding_model):
+        for field in (self.podcast_name, self.database_id, self.collection_name, self.embedding_model, self.embedding_model_revision):
             field.textChanged.connect(self.handle_persistent_state_changed)
         self.embedding_device.currentIndexChanged.connect(self.handle_persistent_state_changed)
+        self.representation_profile.currentIndexChanged.connect(self.handle_representation_profile_changed)
+        self.asset_filter.currentIndexChanged.connect(self.handle_asset_filter_changed)
+        self.asset_pattern.editingFinished.connect(self.handle_asset_pattern_changed)
+
+    def selected_asset_filter(self) -> str:
+        return normalize_asset_filter(self.asset_filter.currentData() or DEFAULT_ASSET_FILTER)
+
+    def select_asset_filter(self, selected: str) -> None:
+        normalized = normalize_asset_filter(selected)
+        for index in range(self.asset_filter.count()):
+            if self.asset_filter.itemData(index) == normalized:
+                self.asset_filter.setCurrentIndex(index)
+                break
+        self.asset_pattern.setEnabled(normalized == "custom")
+
+    def reload_processed_assets(self) -> None:
+        if not self.processed_data_dir:
+            self.episodes = []
+            return
+        self.episodes = self.loader.load_folder(
+            self.processed_data_dir,
+            self.selected_asset_filter(),
+            self.asset_pattern.text().strip(),
+        )
+        for episode in self.episodes:
+            self.included_speakers_by_episode.setdefault(episode.fingerprint, set(episode.speakers))
+
+    def handle_asset_filter_changed(self) -> None:
+        selected = self.selected_asset_filter()
+        self.asset_pattern.setEnabled(selected == "custom")
+        if not self._loading_state and self.processed_data_dir:
+            self.reload_processed_assets()
+            self.rebuild_tree(("global", ""))
+            selection = self.loader.last_selection
+            self.log.appendPlainText(
+                f"Asset filter '{ASSET_FILTER_LABELS[selected]}' selected "
+                f"{selection.selected_count} of {selection.discovered_count} processed asset(s)."
+            )
+        self.handle_persistent_state_changed()
+
+    def handle_asset_pattern_changed(self) -> None:
+        if self.selected_asset_filter() != "custom":
+            return
+        if not self._loading_state and self.processed_data_dir:
+            self.reload_processed_assets()
+            self.rebuild_tree(("global", ""))
+        self.handle_persistent_state_changed()
+
+    def handle_representation_profile_changed(self) -> None:
+        self.representation_profile.setCurrentIndex(0)
+        self.embedding_model.setText(QWEN3_MODEL)
+        self.embedding_model_revision.setText(QWEN3_MODEL_REVISION)
+        self.embedding_model.setReadOnly(True)
+        self.embedding_model_revision.setReadOnly(True)
+        self.handle_persistent_state_changed()
 
     def handle_persistent_state_changed(self) -> None:
         self.update_action_states()
@@ -505,6 +603,11 @@ class MainWindow(QMainWindow):
         self.update_action.setToolTip(
             "Append only episodes not already recorded in the existing podcast.json. " + detail
         )
+        self.reconcile_action.setEnabled(enabled)
+        self.reconcile_action.setToolTip(
+            "Preview and explicitly remove records no longer eligible because source episodes or speaker selection changed. "
+            + detail
+        )
         if self.cuda_install_button:
             has_cuda_option = any(
                 str(self.embedding_device.itemData(index)).startswith("cuda")
@@ -524,14 +627,17 @@ class MainWindow(QMainWindow):
 
     def open_processed_folder(self) -> None:
         start_path = self.processed_data_dir or self.project_root
-        dialog = ProcessedFolderPreviewDialog(self, start_path)
+        dialog = ProcessedFolderPreviewDialog(
+            self,
+            start_path,
+            self.selected_asset_filter(),
+            self.asset_pattern.text().strip(),
+        )
         if dialog.exec() != QDialog.Accepted or not dialog.selected_path:
             return
         self.processed_data_dir = dialog.selected_path
-        self.episodes = self.loader.load_folder(self.processed_data_dir)
-        self.included_speakers_by_episode = {
-            episode.fingerprint: set(episode.speakers) for episode in self.episodes
-        }
+        self.included_speakers_by_episode = {}
+        self.reload_processed_assets()
         if self.episodes:
             self.podcast_name.setText(self.processed_data_dir.parent.name or "Podcast Export")
             self.database_id.setText(slugify(self.podcast_name.text()))
@@ -540,17 +646,17 @@ class MainWindow(QMainWindow):
         self.update_action_states()
         self.save_persistent_state()
         self.log.appendPlainText(
-            f"Loaded {len(self.episodes)} processed episode file(s) from {self.processed_data_dir}."
+            f"Loaded {self.loader.last_selection.selected_count} of "
+            f"{self.loader.last_selection.discovered_count} processed asset(s) from "
+            f"{self.processed_data_dir}."
         )
-        if hasattr(self, "reconcile_action"):
-            self.reconcile_action.setEnabled(enabled)
-            self.reconcile_action.setToolTip("Explicitly reconcile removals after a review. " + detail)
 
     def choose_output_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose output folder")
         if not folder:
             return
         self.output_root = Path(folder)
+        self.context_catalog.set_setting("managed_output_root", str(self.output_root.expanduser().resolve()))
         self.log.appendPlainText(f"Output folder: {self.output_root}")
         self.rebuild_tree()
         self.update_action_states()
@@ -692,11 +798,45 @@ class MainWindow(QMainWindow):
         )
         self.add_info_row(
             form,
+            "Asset filter",
+            self.asset_filter,
+            "Controls which RAG-produced transcript variants appear in the left asset list and can be imported. "
+            "Reviewed speaker transcripts are selected by default. Existing source files are never deleted.",
+        )
+        self.add_info_row(
+            form,
+            "Custom asset pattern",
+            self.asset_pattern,
+            "Used only with Custom filename pattern. The pattern is matched against processed-cache names and "
+            "the source filename recorded by the RAG pipeline.",
+        )
+        selection = self.loader.last_selection
+        self.add_info_row(
+            form,
+            "Assets loaded",
+            QLabel(f"{selection.selected_count} of {selection.discovered_count}"),
+            "The first number is eligible under the selected filter; the second is every processed cache found "
+            "under the selected folder.",
+        )
+        self.add_info_row(
+            form,
+            "Embedding profile",
+            self.representation_profile,
+            "Qwen3 Embedding 4B is the sole production profile. It writes a Qwen3-specific 2,560-dimensional collection and uses the podcast retrieval query instruction.",
+        )
+        self.add_info_row(
+            form,
+            "Representation warning",
+            QLabel("Qwen3 creates an isolated 2,560-dimensional index; PodCast Chat must use the matching query provider."),
+            "Changing the representation changes the vector space. Existing exports are retained and are never mixed with Qwen3 vectors.",
+        )
+        self.add_info_row(
+            form,
             "Embedding model",
             self.embedding_model,
-            "Embedding model used while writing vectors into Chroma. The chat/query side must use "
-            "compatible embeddings. If you change this for an existing database, use Generate to "
-            "rebuild the export rather than Update.",
+            "Pinned model used while writing vectors into Chroma. The chat/query side must use the "
+            "same complete Qwen3 representation identity. Existing non-Qwen exports must be rebuilt "
+            "rather than updated.",
         )
         self.add_info_row(
             form,
@@ -899,6 +1039,37 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_label)
         layout.addWidget(self.progress_bar)
 
+    def begin_progress_operation(self, message: str) -> None:
+        """Show immediate, elapsed operation feedback in every workspace."""
+        self.progress_started_at = time.monotonic()
+        self.progress_message = message
+        self.progress_timer.start()
+        self.refresh_progress_status()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Working...")
+        self.scroll_progress_into_view()
+
+    def set_progress_message(self, message: str) -> None:
+        self.progress_message = message
+        self.refresh_progress_status()
+
+    def refresh_progress_status(self) -> None:
+        if self.progress_started_at is None:
+            self.progress_label.setText(self.progress_message)
+            return
+        elapsed = max(0, int(time.monotonic() - self.progress_started_at))
+        self.progress_label.setText(f"{self.progress_message}  (elapsed {elapsed}s)")
+
+    def finish_progress_operation(self, message: str, *, completed: bool | None = None) -> None:
+        self.progress_timer.stop()
+        self.progress_started_at = None
+        self.progress_message = message
+        self.progress_label.setText(message)
+        if completed is not None:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(1 if completed else 0)
+            self.progress_bar.setFormat("Complete" if completed else "Failed")
+
     def scroll_progress_into_view(self) -> None:
         def _scroll() -> None:
             target = max(0, self.progress_label.y() - 24)
@@ -909,16 +1080,33 @@ class MainWindow(QMainWindow):
     def set_right_panel(self, panel: QWidget, scroll_value: int = 0) -> None:
         old_panel = self.right.takeWidget()
         if old_panel:
+            if (
+                getattr(self, "cuda_install_button", None) is not None
+                and is_descendant_of(self.cuda_install_button, old_panel)
+            ):
+                self.cuda_install_button = None
             preserved_widgets = (
                 self.podcast_name,
                 self.database_id,
                 self.collection_name,
+                self.asset_filter,
+                self.asset_pattern,
+                self.representation_profile,
                 self.embedding_model,
+                self.embedding_model_revision,
                 self.embedding_device,
+                self.contextualization,
                 self.gpu_status,
                 self.progress_label,
                 self.progress_bar,
                 self.log,
+                self.dedup_profile,
+                self.dedup_near_enabled,
+                self.dedup_retrieval_enabled,
+                self.dedup_near_threshold,
+                self.dedup_near_length_ratio,
+                self.dedup_near_max_block,
+                self.mirror_removals,
             )
             if getattr(self, "redundancy_cancel_button", None) is not None:
                 preserved_widgets += (self.redundancy_cancel_button,)
@@ -966,9 +1154,6 @@ class MainWindow(QMainWindow):
         message = QLabel(
             "You can select and copy the full message below. Use Copy to Clipboard for the entire text."
         )
-        self.add_info_row(form, "Context header", self.contextualization, "Experimental embedding-only context header. Minimal is the safe default; full adds topic and hierarchy labels.")
-        self.add_info_row(form, "BGE-M3 shadow", self.experimental_bge_m3, "Build with the experimental dense BGE-M3 profile without replacing an existing baseline export.")
-        self.add_info_row(form, "Mirror removals", self.mirror_removals, "Preview and remove only records previously tagged to the same source cache. Confirmation is required on Update.")
         message.setWordWrap(True)
         layout.addWidget(message)
 
@@ -993,7 +1178,11 @@ class MainWindow(QMainWindow):
             "processed_data_dir": str(self.processed_data_dir or ""),
             "output_root": str(self.output_root or ""),
             "collection_name": self.collection_name.text(),
+            "asset_filter": self.selected_asset_filter(),
+            "asset_pattern": self.asset_pattern.text(),
+            "representation_profile": self.representation_profile.currentData(),
             "embedding_model": self.embedding_model.text(),
+            "embedding_model_revision": self.embedding_model_revision.text(),
             "embedding_device": self.selected_embedding_device(),
             "included_speakers_by_episode": {
                 fingerprint: sorted(speakers)
@@ -1002,10 +1191,21 @@ class MainWindow(QMainWindow):
         }
 
     def apply_state_payload(self, payload: dict[str, Any]) -> None:
+        saved_profile = str(payload.get("representation_profile") or QWEN3_PROFILE)
+        saved_model = str(payload.get("embedding_model") or QWEN3_MODEL)
+        saved_revision = str(payload.get("embedding_model_revision") or QWEN3_MODEL_REVISION)
+        if saved_profile != QWEN3_PROFILE or saved_model != QWEN3_MODEL or saved_revision != QWEN3_MODEL_REVISION:
+            raise ValueError(
+                "Saved UI state uses an unsupported embedding representation; "
+                "only the pinned Qwen3 profile is accepted."
+            )
+        self.select_asset_filter(str(payload.get("asset_filter") or DEFAULT_ASSET_FILTER))
+        self.asset_pattern.setText(str(payload.get("asset_pattern") or ""))
+        self.asset_pattern.setEnabled(self.selected_asset_filter() == "custom")
         processed = Path(str(payload.get("processed_data_dir") or ""))
         if processed.exists():
             self.processed_data_dir = processed
-            self.episodes = self.loader.load_folder(processed)
+            self.reload_processed_assets()
         else:
             self.processed_data_dir = None
             self.episodes = []
@@ -1015,7 +1215,15 @@ class MainWindow(QMainWindow):
         self.podcast_name.setText(str(payload.get("podcast_name") or "Podcast Chat Export"))
         self.database_id.setText(str(payload.get("database_id") or slugify(self.podcast_name.text())))
         self.collection_name.setText(str(payload.get("collection_name") or "whisper_rag_v2"))
-        self.embedding_model.setText(str(payload.get("embedding_model") or "BAAI/bge-large-en-v1.5"))
+        profile_index = self.representation_profile.findData(saved_profile)
+        if profile_index < 0:
+            profile_index = self.representation_profile.findData(QWEN3_PROFILE)
+        self.representation_profile.setCurrentIndex(profile_index)
+        self.handle_representation_profile_changed()
+        self.embedding_model.setText(QWEN3_MODEL)
+        self.embedding_model_revision.setText(QWEN3_MODEL_REVISION)
+        self.embedding_model.setReadOnly(True)
+        self.embedding_model_revision.setReadOnly(True)
         self.populate_embedding_devices(str(payload.get("embedding_device") or "auto"))
         self.included_speakers_by_episode = {
             str(fingerprint): set(speakers)
@@ -1037,9 +1245,12 @@ class MainWindow(QMainWindow):
         self._loading_state = True
         try:
             self.apply_state_payload(payload)
+        except Exception as exc:
+            self.log.appendPlainText(f"Saved UI state was rejected: {exc}")
+        else:
+            self.log.appendPlainText(f"Loaded persistent UI state: {self.ui_state_path}")
         finally:
             self._loading_state = False
-        self.log.appendPlainText(f"Loaded persistent UI state: {self.ui_state_path}")
 
     def save_persistent_state(self) -> None:
         if self._loading_state:
@@ -1492,6 +1703,25 @@ class MainWindow(QMainWindow):
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
+        source_buttons = QHBoxLayout()
+        source_status_button = QPushButton("Refresh Source Status")
+        source_status_button.setToolTip("Read the producer partition status without changing producer files.")
+        source_status_button.clicked.connect(self.refresh_selected_source_status)
+        prepare_button = QPushButton("Prepare and Import Latest")
+        prepare_button.setToolTip("Publish a valid producer release, preview the Chroma import, and ask before activation.")
+        prepare_button.clicked.connect(self.prepare_and_import_selected_context)
+        source_buttons.addWidget(source_status_button)
+        source_buttons.addWidget(prepare_button)
+        source_buttons.addStretch(1)
+        layout.addLayout(source_buttons)
+
+        activity_title = QLabel("Current activity")
+        activity_title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(activity_title)
+        self.add_progress_status(layout)
+        layout.addWidget(QLabel("Activity log"))
+        layout.addWidget(self.log)
+
         self.context_list = QListWidget()
         self.context_list.currentItemChanged.connect(self.context_selection_changed)
         layout.addWidget(self.context_list, 1)
@@ -1567,7 +1797,10 @@ class MainWindow(QMainWindow):
             report = discover(self.context_catalog)
             self.context_selected_partition = ""
             self.refresh_context_list()
-            self.log.appendPlainText(f"Discovered {len(report['releases'])} release(s), {len(report['invalid'])} invalid candidate(s).")
+            self.log.appendPlainText(
+                f"Discovered {len(report['contexts'])} context(s), {len(report['releases'])} release(s), "
+                f"{len(report['invalid'])} invalid candidate(s)."
+            )
             if report["invalid"]:
                 QMessageBox.warning(self, "Discovery warnings", f"{len(report['invalid'])} manifest candidate(s) were rejected. Review the context status or use the CLI for details.")
         except Exception as exc:
@@ -1586,8 +1819,20 @@ class MainWindow(QMainWindow):
             self.context_detail.setText("No context selected.")
             return
         partition_id = str(item.data(Qt.UserRole))
+        if partition_id != self.context_selected_partition:
+            self.context_source_status = None
+            self.context_pending_release_id = None
         self.context_selected_partition = partition_id
         context = self.context_catalog.context(partition_id) or {}
+        if self.context_source_status is None:
+            stored_status = self.context_catalog.get_setting(f"producer_status:{partition_id}")
+            if stored_status:
+                try:
+                    payload = json.loads(stored_status)
+                    if isinstance(payload, dict) and str(payload.get("partition_id")) == partition_id:
+                        self.context_source_status = payload
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self.context_source_status = None
         releases = self.context_catalog.releases(partition_id)
         output_root = Path(self.context_catalog.get_setting("managed_output_root", str(self.project_root / "exports")))
         partition_root = output_root / "partitions" / partition_id
@@ -1620,6 +1865,18 @@ class MainWindow(QMainWindow):
             f"Database root: {partition_root}",
             "Portability: managed export; machine-specific paths are masked in portable metadata",
         ]
+        source_status = self.context_source_status
+        if source_status and str(source_status.get("partition_id")) == partition_id:
+            lines.extend([
+                f"Producer processing: {source_status.get('completed', 0)}/{source_status.get('declared_episodes', 0)} complete; "
+                f"pending={source_status.get('pending', 0)}, failed={source_status.get('failed', 0)}, "
+                f"interrupted={source_status.get('interrupted', 0)}",
+                f"Producer caches: {source_status.get('processed_cache_count', 0)} total; "
+                f"latest handoff={source_status.get('latest_handoff_id') or 'unknown'}",
+                f"Producer release: {source_status.get('latest_release_id') or 'not published'}",
+            ])
+            for warning in source_status.get("warnings") or []:
+                lines.append(f"Source warning: {warning}")
         if releases:
             lines.append(f"Newest release: {releases[0].get('upstream_release_id')} ({releases[0].get('status')})")
         profile = self.context_catalog.profile(partition_id)
@@ -1659,10 +1916,11 @@ class MainWindow(QMainWindow):
             self.context_selected_partition,
             import_profile_payload(
                 ImportConfig(
-                    embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
+                    representation_profile=str(self.representation_profile.currentData() or PRIMARY_PROFILE),
+                    embedding_model=self.embedding_model.text().strip() or QWEN3_MODEL,
+                    embedding_model_revision=self.embedding_model_revision.text().strip() or QWEN3_MODEL_REVISION,
                     embedding_device=self.selected_embedding_device(),
                     contextualization=self.contextualization.currentText(),
-                    experimental_bge_m3=self.experimental_bge_m3.isChecked(),
                     selected_speakers=selected_speakers,
                     dedup_policy=resolve_dedup_policy({
                         "profile": self.dedup_profile.currentText(),
@@ -1714,6 +1972,7 @@ class MainWindow(QMainWindow):
         )
         self.managed_worker.moveToThread(self.thread)
         self.thread.started.connect(self.managed_worker.run)
+        self.managed_worker.progress.connect(self.handle_progress)
         self.managed_worker.finished.connect(self.handle_dedup_preview)
         self.managed_worker.failed.connect(self.handle_failed)
         self.managed_worker.finished.connect(self.thread.quit)
@@ -1722,14 +1981,13 @@ class MainWindow(QMainWindow):
         self.managed_worker.failed.connect(self.managed_worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.finished.connect(self.clear_worker)
-        self.progress_label.setText("Computing deduplication preview...")
-        self.progress_bar.setRange(0, 0)
+        self.begin_progress_operation("Computing deduplication preview...")
         self.thread.start()
 
     def handle_dedup_preview(self, result: dict[str, Any]) -> None:
         counts = result.get("dedup") or {}
         self.log.appendPlainText("Prospective dedup plan: " + json.dumps(counts, ensure_ascii=True, default=str))
-        self.progress_label.setText("Deduplication preview complete")
+        self.finish_progress_operation("Deduplication preview complete", completed=True)
         QMessageBox.information(self, "Deduplication preview", "\n".join([
             f"Eligible: {counts.get('eligible', 0)}",
             f"Stored: {counts.get('stored', 0)}",
@@ -1748,27 +2006,146 @@ class MainWindow(QMainWindow):
         self.context_catalog.set_local_status(self.context_selected_partition, "active" if current in {"archived", "hidden"} else "archived")
         self.refresh_context_list()
 
+    def _current_managed_import_config(self) -> ImportConfig:
+        selected_speakers = sorted(
+            {
+                speaker
+                for episode in self.episodes
+                for speaker in self.included_speakers_by_episode.get(episode.fingerprint, set())
+            }
+        ) or None
+        return ImportConfig(
+            representation_profile=str(self.representation_profile.currentData() or PRIMARY_PROFILE),
+            embedding_model=self.embedding_model.text().strip() or QWEN3_MODEL,
+            embedding_model_revision=self.embedding_model_revision.text().strip() or QWEN3_MODEL_REVISION,
+            embedding_device=self.selected_embedding_device(),
+            contextualization=self.contextualization.currentText(),
+            selected_speakers=selected_speakers,
+            dedup_policy=resolve_dedup_policy({
+                "profile": self.dedup_profile.currentText(),
+                "near_enabled": self.dedup_near_enabled.isChecked(),
+                "near_jaccard_threshold": float(self.dedup_near_threshold.text() or "0.90"),
+                "near_length_ratio": float(self.dedup_near_length_ratio.text() or "0.90"),
+                "near_max_block_records": int(self.dedup_near_max_block.text() or "2000"),
+                "retrieval": {"enabled": self.dedup_retrieval_enabled.isChecked()},
+            }, default_profile="safe"),
+        )
+
+    def _start_context_workflow(self, operation: str) -> None:
+        if not self.context_selected_partition or self.thread is not None:
+            return
+        self.thread = QThread()
+        self.managed_worker = ManagedContextWorkflowWorker(
+            self._current_managed_import_config(),
+            self.project_root,
+            self.context_catalog_path,
+            self.context_selected_partition,
+            self.output_root,
+            operation,
+        )
+        self.managed_worker.moveToThread(self.thread)
+        self.thread.started.connect(self.managed_worker.run)
+        self.managed_worker.progress.connect(self.handle_progress)
+        self.managed_worker.finished.connect(self.handle_context_workflow_finished)
+        self.managed_worker.failed.connect(self.handle_failed)
+        self.managed_worker.finished.connect(self.thread.quit)
+        self.managed_worker.failed.connect(self.thread.quit)
+        self.managed_worker.finished.connect(self.managed_worker.deleteLater)
+        self.managed_worker.failed.connect(self.managed_worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.clear_worker)
+        self.begin_progress_operation("Working with the producer context...")
+        self.thread.start()
+
+    def refresh_selected_source_status(self) -> None:
+        if not self.context_selected_partition:
+            QMessageBox.information(self, "Context required", "Select a context first.")
+            return
+        self._start_context_workflow("inspect")
+
+    def prepare_and_import_selected_context(self) -> None:
+        if not self.context_selected_partition:
+            QMessageBox.information(self, "Context required", "Select a context first.")
+            return
+        self._start_context_workflow("prepare")
+
+    def handle_context_workflow_finished(self, result: dict[str, Any]) -> None:
+        source_status = result.get("source_status") or {}
+        if source_status:
+            self.context_source_status = dict(source_status)
+        status = str(result.get("status") or "unknown")
+        self.render_contexts()
+        if status == "inspected":
+            self.log.appendPlainText("Producer source status refreshed.")
+            self.finish_progress_operation("Producer source status refreshed", completed=True)
+            return
+        if status == "blocked_pending":
+            self.finish_progress_operation("Producer processing still has pending work", completed=False)
+            QMessageBox.warning(
+                self,
+                "Source processing incomplete",
+                "The producer context is not ready to publish.\n\n"
+                f"Pending: {source_status.get('pending', 0)}\n"
+                f"Failed: {source_status.get('failed', 0)}\n"
+                f"Interrupted: {source_status.get('interrupted', 0)}\n"
+                f"Quarantined: {source_status.get('quarantined', 0)}\n\n"
+                "Run the producer pipeline separately, publish its release, then refresh this view.",
+            )
+            return
+        if status != "ready_for_import":
+            self.finish_progress_operation(f"Producer workflow: {status}", completed=False)
+            return
+
+        release = result.get("release") or {}
+        preview = result.get("preview") or {}
+        release_id = str(release.get("release_id") or preview.get("upstream_release_id") or "")
+        self.context_pending_release_id = release_id or None
+        counts = preview.get("dedup") or {}
+        self.log.appendPlainText("Producer release ready: " + json.dumps({
+            "release_id": release_id,
+            "preview": counts,
+        }, ensure_ascii=True, default=str))
+        self.finish_progress_operation("Release ready for import confirmation", completed=True)
+        answer = QMessageBox.question(
+            self,
+            "Import release",
+            "The producer release passed validation and the Chroma import preview is ready.\n\n"
+            f"Release: {release_id}\n"
+            f"Eligible documents: {counts.get('eligible', 0)}\n"
+            f"Stored after exact deduplication: {counts.get('stored', 0)}\n"
+            f"Suppressed exact repetitions: {counts.get('suppressed_exact', 0)}\n\n"
+            "Import and activate this partition database now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self.context_import_after_prepare = True
+            self.queue_confirmed_context_import()
+
+    def queue_confirmed_context_import(self) -> None:
+        """Start the confirmed import whether or not worker cleanup already ran."""
+        if not self.context_import_after_prepare or self.thread is not None:
+            return
+        self.context_import_after_prepare = False
+        self.begin_progress_operation("Starting confirmed managed import...")
+        QTimer.singleShot(0, self.import_selected_context)
+
     def import_selected_context(self) -> None:
         if not self.context_selected_partition:
             QMessageBox.information(self, "Context required", "Select a context first.")
             return
         if self.thread is not None:
             return
-        config = ImportConfig(
-            embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
-            embedding_device=self.selected_embedding_device(),
-            contextualization=self.contextualization.currentText(),
-            experimental_bge_m3=self.experimental_bge_m3.isChecked(),
-            selected_speakers=sorted(
-                {
-                    speaker
-                    for episode in self.episodes
-                    for speaker in self.included_speakers_by_episode.get(episode.fingerprint, set())
-                }
-            ) or None,
-        )
+        config = self._current_managed_import_config()
         self.thread = QThread()
-        self.managed_worker = ManagedImportWorker(config, self.project_root, self.context_catalog_path, self.context_selected_partition, self.output_root)
+        self.managed_worker = ManagedImportWorker(
+            config,
+            self.project_root,
+            self.context_catalog_path,
+            self.context_selected_partition,
+            self.output_root,
+            self.context_pending_release_id,
+        )
         self.managed_worker.moveToThread(self.thread)
         self.thread.started.connect(self.managed_worker.run)
         self.managed_worker.progress.connect(self.handle_progress)
@@ -1780,8 +2157,7 @@ class MainWindow(QMainWindow):
         self.managed_worker.failed.connect(self.managed_worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.finished.connect(self.clear_worker)
-        self.progress_label.setText("Importing managed context...")
-        self.progress_bar.setRange(0, 0)
+        self.begin_progress_operation("Importing managed context...")
         self.thread.start()
 
     def open_selected_context(self) -> None:
@@ -1848,10 +2224,13 @@ class MainWindow(QMainWindow):
             processed_data_dir=self.processed_data_dir,
             output_root=self.output_root,
             collection_name=self.collection_name.text().strip() or "whisper_rag_v2",
-            embedding_model=self.embedding_model.text().strip() or "BAAI/bge-large-en-v1.5",
+            embedding_model=self.embedding_model.text().strip() or QWEN3_MODEL,
             embedding_device=self.selected_embedding_device(),
             contextualization=self.contextualization.currentText(),
-            experimental_bge_m3=self.experimental_bge_m3.isChecked(),
+            asset_filter=self.selected_asset_filter(),
+            asset_pattern=self.asset_pattern.text().strip(),
+            representation_profile=str(self.representation_profile.currentData() or PRIMARY_PROFILE),
+            embedding_model_revision=self.embedding_model_revision.text().strip() or QWEN3_MODEL_REVISION,
             allow_delete_missing=self.mirror_removals.isChecked(),
             reconcile=self.mirror_removals.isChecked(),
             episodes=self.episodes,
@@ -2035,9 +2414,7 @@ class MainWindow(QMainWindow):
         if self.thread is not None:
             return
         self.log.appendPlainText(f"Starting {mode}: {plan.export_dir}")
-        self.progress_label.setText(f"Starting {mode}...")
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setFormat("Working...")
+        self.begin_progress_operation(f"Starting {mode}...")
         self.thread = QThread()
         self.update_action_states()
         self.worker = ChromaExportWorker(plan, mode)
@@ -2058,7 +2435,7 @@ class MainWindow(QMainWindow):
     def handle_progress(self, progress: ImportProgress) -> None:
         prefix = f"[{progress.current}/{progress.total}] " if progress.total else ""
         self.log.appendPlainText(prefix + progress.message)
-        self.progress_label.setText(progress.message)
+        self.set_progress_message(progress.message)
         if progress.total:
             self.progress_bar.setRange(0, progress.total)
             self.progress_bar.setValue(min(progress.current, progress.total))
@@ -2073,12 +2450,10 @@ class MainWindow(QMainWindow):
             f"skipped_episodes={summary.skipped_episodes}, inserted={summary.inserted}, "
             f"skipped_documents={summary.skipped_documents}, elapsed={summary.elapsed_seconds}s"
         )
-        self.progress_label.setText(
-            f"Complete: imported {summary.imported_episodes}, skipped {summary.skipped_episodes}, inserted {summary.inserted}"
+        self.finish_progress_operation(
+            f"Complete: imported {summary.imported_episodes}, skipped {summary.skipped_episodes}, inserted {summary.inserted}",
+            completed=True,
         )
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(1)
-        self.progress_bar.setFormat("Complete")
         QMessageBox.information(
             self,
             "Import Summary",
@@ -2098,10 +2473,12 @@ class MainWindow(QMainWindow):
     def handle_managed_finished(self, result: dict[str, Any]) -> None:
         status = str(result.get("status") or "unknown")
         self.log.appendPlainText("Managed context result: " + json.dumps(result, ensure_ascii=True, default=str))
-        self.progress_label.setText(f"Managed context: {status}")
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(1 if status in {"completed", "reused"} else 0)
+        self.finish_progress_operation(
+            f"Managed context: {status}",
+            completed=status in {"completed", "reused"},
+        )
         if status in {"completed", "reused"}:
+            self.context_pending_release_id = None
             QMessageBox.information(self, "Managed import complete", f"Database exported to:\n{result.get('export')}")
         else:
             QMessageBox.warning(self, "Managed import not completed", json.dumps(result, indent=2, default=str)[:6000])
@@ -2109,14 +2486,16 @@ class MainWindow(QMainWindow):
 
     def handle_failed(self, message: str) -> None:
         self.log.appendPlainText("Failed: " + message)
-        self.progress_label.setText("Failed")
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Failed")
+        self.finish_progress_operation("Operation failed", completed=False)
         self.show_copyable_message("Import failed", message)
 
     def clear_worker(self) -> None:
+        start_confirmed_import = self.context_import_after_prepare
+        self.context_import_after_prepare = False
         self.thread = None
         self.worker = None
         self.managed_worker = None
         self.update_action_states()
+        if start_confirmed_import:
+            self.begin_progress_operation("Starting confirmed managed import...")
+            QTimer.singleShot(0, self.import_selected_context)
