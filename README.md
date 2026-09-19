@@ -65,6 +65,11 @@ compiled local bundle; it does not run Node at runtime. Build/setup once with:
 .\scripts\Run-ChromaDbImportUi.ps1 -InstallDependencies -Ui Modern -NoLaunch
 ```
 
+For the startup sequence and troubleshooting a slow library load, see
+[`docs/gui-startup-performance.md`](docs/gui-startup-performance.md). The
+library list comes from the app-owned catalog; source reconciliation runs
+separately and may continue after the library appears.
+
 The root bootstrap now launches Modern by default. Use `-Ui Legacy` when the
 existing Qt window is needed; both paths keep the same numbered launcher
 actions and use the existing Python importer.
