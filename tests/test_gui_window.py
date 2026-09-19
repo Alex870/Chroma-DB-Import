@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 import tempfile
 import types
 import unittest
@@ -40,6 +41,31 @@ class DesktopWindowTests(unittest.TestCase):
             resolved = desktop_window.resolve_state_dir(project_root=project_root, local_app_data=fallback)
             self.assertEqual(fallback / "Chroma DB Import" / "gui", resolved)
             self.assertTrue((resolved / "gui_catalog.sqlite3").parent.is_dir())
+
+    def test_default_state_falls_back_when_existing_catalog_is_readonly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            project_state = project_root / "state" / "gui"
+            project_state.mkdir(parents=True)
+            catalog = project_state / "gui_catalog.sqlite3"
+            connection = sqlite3.connect(catalog)
+            try:
+                connection.execute("CREATE TABLE marker(value TEXT)")
+            finally:
+                connection.close()
+            fallback = project_root / "local-app-data"
+            original_connect = desktop_window.sqlite3.connect
+
+            def connect(database, *args, **kwargs):
+                if Path(str(database)).resolve() == catalog.resolve():
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+                return original_connect(database, *args, **kwargs)
+
+            with patch.object(desktop_window.sqlite3, "connect", side_effect=connect):
+                resolved = desktop_window.resolve_state_dir(project_root=project_root, local_app_data=fallback)
+
+            self.assertEqual(fallback / "Chroma DB Import" / "gui", resolved)
+            self.assertFalse((resolved / "gui_catalog.sqlite3").exists())
 
     def test_packaged_window_routes_picker_and_blocks_close_during_import(self) -> None:
         created: dict[str, _FakeWindow] = {}

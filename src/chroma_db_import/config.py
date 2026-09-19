@@ -69,6 +69,9 @@ class ImportConfig:
     # Managed release staging already has an immutable per-release root, so it
     # can opt out of adding a second profile directory level.
     storage_path_isolated: bool = False
+    # Partial keeps legacy exports importable; certified rejects records that
+    # cannot support auditable temporal retrieval.
+    temporal_validation_mode: str = "partial"
 
 def resolve_path(base_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()
@@ -81,6 +84,8 @@ def load_config(config_path: Path) -> ImportConfig:
     if not config_path.exists():
         return ImportConfig()
     payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if str(payload.get("temporal_validation_mode") or "partial") not in {"partial", "certified"}:
+        raise ValueError("temporal_validation_mode must be 'partial' or 'certified'")
     if "experimental_bge_m3" in payload or "shadow_export_root" in payload:
         raise ValueError("Legacy embedding compatibility settings have been removed; use the pinned Qwen3 profile")
     configured_profile = str(payload.get("representation_profile") or PRIMARY_PROFILE)

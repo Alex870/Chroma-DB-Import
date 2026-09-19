@@ -1,6 +1,6 @@
 # React UI completion specification
 
-Version 1.0 · 2026-09-12 · Approved visual direction; implementation pending
+Version 1.1 · 2026-09-13 · Contextual managed-partition creation
 
 ## 1. Authority, purpose and scope
 
@@ -8,6 +8,7 @@ Extend the **existing React database manager** to cover the usable legacy Qt
 capabilities identified in the [75-item audit](gui-react-parity-audit-and-design.md).
 This is the normative UI specification. The companion
 [implementation guide](gui-react-ui-implementation.md) specifies how to build it.
+The focused rationale and precedence record is [Contextual managed-partition database creation](gui-react-ui-design-change-contextual-managed-create.md).
 The audit records evidence; it is not the implementation checklist. The older
 `gui-simple-workspace-design.md` is superseded. The original root GUI documents
 describe the first React build and must not be used to restart that completed work.
@@ -55,6 +56,7 @@ a binary menu tree. Frequency is an operator hypothesis, not measured telemetry.
 | Inspect an episode from Content | Episode title |
 | Include all speakers from open speaker selector | All speakers; then save or review the draft |
 | Import an available release from selected context | Review latest release → Apply update |
+| Create a database for an available managed partition | Create database on that partition → Continue → Review → Create database |
 | Prepare ready processed content from selected context | Prepare update → review → Apply update |
 | Preview analysis from a selected analyzable release | Preview coverage |
 | Restore from an archived list | Restore |
@@ -315,6 +317,46 @@ location, not overwrite. Explicit one-run input overrides suggested defaults.
 Review runs validation and shows real source, selection, destination, representation,
 device and effects. **Create database** launches the reviewed job. Add existing stays
 read-only inspection followed by registration, preserving on-disk identity and paths.
+
+### 6.1 Contextual creation from Available partitions
+
+The automatically discovered **Available partitions** list is the primary entry point
+for a new managed database. Every eligible partition row has its own accessible
+**Create database** button. `ready_to_create` uses the primary action; a
+`profile_mismatch` uses **Create separate database**; an existing linked database
+keeps its update/review action. A partition that is not ready shows its blocking
+reason and does not expose a disabled or misleading create action. The generic
+header action remains the unscoped folder-based creation entry point.
+
+A partition action opens the existing three-step Create flow with a contextual
+managed payload. The payload includes source root, connection, partition and
+corpus identity, importer-owned catalog path, latest valid release, display name,
+effective selection and execution settings, read-only representation/profile
+identity, and value provenance. Required fields use safe fallbacks; a ready row
+must never open with an empty name, release, output target, or effective setting
+when a valid value can be resolved.
+
+For contextual managed creation, the output field is the exact partition target,
+not an output parent. Its value is resolved using this precedence:
+
+1. Partition/context `output_root` or `managed_output_root`.
+2. Application `creation_defaults.output_parent`.
+3. `<source root>\exports`.
+
+The proposed target is `<output root>\partitions\<partition id>`. The resolved
+managed output root is carried alongside the exact target in the draft and preview.
+The UI validates the canonical suffix and rejects an invalid target inline rather
+than silently creating a second nested partition path.
+
+Source root and partition ID remain editable. Editing either clears the old
+readiness/release snapshot and requires a fresh managed-source inspection before
+continuing; a source-root edit also clears the old connection/catalog identity,
+while a partition-only edit may reuse that connection/catalog to inspect the new
+partition. A successful inspection refreshes the release and source identity.
+Name, target, selection and execution edits invalidate only the affected draft or
+review state. Review shows source identity, selected release, effective
+profile/device, selection policy, exact target and import effects. Existing targets
+remain non-destructive: choose another location or register the existing database.
 
 ## 7. Source connections
 

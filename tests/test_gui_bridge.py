@@ -16,7 +16,7 @@ class GuiBridgeTests(unittest.TestCase):
             response = bridge.get_database({})
             self.assertFalse(response["ok"])
             self.assertEqual(response["error"]["code"], "VALIDATION_FAILED")
-            self.assertEqual(bridge.handshake()["data"]["api_version"], "gui-api-v1")
+            self.assertEqual(bridge.handshake({})["data"]["api_version"], "gui-api-v1")
             service.shutdown()
 
     def test_production_bridge_does_not_fall_back_to_fixture_data(self) -> None:

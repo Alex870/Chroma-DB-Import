@@ -62,6 +62,7 @@ class ImportPlan:
     # Modern workflow callers may bind an exact final destination. Legacy
     # callers continue to derive it from output_root/podcast_name.
     final_export_dir: Path | None = None
+    temporal_validation_mode: str = "partial"
 
     @property
     def resolved_profile(self) -> str:

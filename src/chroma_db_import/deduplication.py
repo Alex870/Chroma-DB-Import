@@ -715,6 +715,7 @@ def load_managed_dedup_inputs(
     spec: RepresentationSpec | None = None,
     *,
     selected_speakers: Iterable[str] | None = None,
+    selection_policy: Any | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> DedupInventory:
     """Validate raw producer rows across the complete release.
@@ -740,6 +741,17 @@ def load_managed_dedup_inputs(
             raise DeduplicationError(f"cannot read managed cache {path}: {exc}") from exc
         if not isinstance(payload, Mapping) or not isinstance(payload.get("documents"), list):
             raise DeduplicationError(f"managed cache {path.name} must contain a documents array")
+        selected_effective_ids: set[str] | None = None
+        if selection_policy is not None:
+            from chroma_db_import.ui_loader import EpisodeLoader
+            from chroma_db_import.workflow.models import SelectionPolicy
+            from chroma_db_import.workflow.selection import select_documents
+
+            policy = selection_policy if isinstance(selection_policy, SelectionPolicy) else SelectionPolicy.from_mapping(selection_policy)
+            selected_effective_ids = {
+                str(document.metadata.get("stable_document_id") or document.metadata.get("node_id") or "").strip()
+                for document in select_documents(EpisodeLoader().load_file(path), policy)
+            }
         actual_fingerprint = content_fingerprint(path)
         declared = str(payload.get("cache_fingerprint") or payload.get("source_fingerprint") or actual_fingerprint)
         expected_fingerprints = {str(item) for item in upstream.get("processed_cache_fingerprints") or []}
@@ -790,7 +802,9 @@ def load_managed_dedup_inputs(
             node_type = str(copied_metadata.get("node_type") or "").strip()
             source_span_ids, span_reason = normalize_span_ids(copied_metadata)
             include = has_text(text)
-            if chosen_speakers:
+            if selected_effective_ids is not None:
+                include = include and effective_id in selected_effective_ids
+            elif chosen_speakers:
                 speakers = set()
                 speaker = copied_metadata.get("speaker")
                 if isinstance(speaker, str) and speaker.strip() and speaker.lower() not in {"unknown", "multiple", "mixed"}:
@@ -808,7 +822,7 @@ def load_managed_dedup_inputs(
                 else:
                     include = include and bool(speakers & chosen_speakers)
             if not include:
-                reason = "empty_text" if not has_text(text) else "speaker_filtered"
+                reason = "empty_text" if not has_text(text) else ("selection_filtered" if selected_effective_ids is not None else "speaker_filtered")
                 excluded_reasons[reason] += 1
                 continue
             rows.append((path, raw, copied_metadata, verified_fingerprint))

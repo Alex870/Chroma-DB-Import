@@ -288,6 +288,7 @@ class FrozenPreview:
     # must compare the database against this base hash rather than treating
     # the preview policy as a persisted settings change.
     base_settings_hash: str = ""
+    execution_options: dict[str, Any] = field(default_factory=lambda: ExecutionOptions().as_dict())
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -321,6 +322,7 @@ class FrozenPreview:
             status=_text(value.get("status"), "ready") or "ready",
             schema_version=_text(value.get("schema_version"), "gui-preview-v1") or "gui-preview-v1",
             base_settings_hash=_text(value.get("base_settings_hash")),
+            execution_options=dict(value.get("execution_options") or ExecutionOptions().as_dict()),
         )
         if not preview.preview_id or preview.operation not in {"create", "update", "rebuild", "remove_outdated"}:
             raise BridgeError("VALIDATION_FAILED", "Preview is incomplete or has an unsupported operation.")
@@ -341,6 +343,9 @@ class JobRecord:
     can_cancel: bool = False
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
+    # Latest durable progress snapshot.  Older catalogs are migrated with an
+    # empty object so the UI can safely consume this field across restarts.
+    progress: dict[str, Any] | None = None
 
     STATES: ClassVar[set[str]] = {"queued", "running", "succeeded", "succeeded_with_warnings", "failed", "interrupted", "cancelled"}
 

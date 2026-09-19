@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import shutil
 import time
@@ -100,8 +101,25 @@ def preflight_files(
     for path in files:
         payload = load_processed_payload(path)
         docs = load_processed_documents(path)
+        for doc in docs:
+            if payload.get("episode_uid"):
+                doc.metadata.setdefault("episode_uid", str(payload["episode_uid"]))
+            if payload.get("episode_id"):
+                doc.metadata.setdefault("episode_id", str(payload["episode_id"]))
         docs = [doc for doc in docs if should_include_document(doc, config)]
-        report = validate_document_items(docs, str(path))
+        report = validate_document_items(
+            docs,
+            str(path),
+            require_temporal=config.temporal_validation_mode == "certified",
+            episode_uid=str(payload.get("episode_uid") or ""),
+        )
+        declared_temporal = payload.get("temporal_coverage")
+        declared_hash = str(payload.get("temporal_coverage_sha256") or "").removeprefix("sha256:")
+        if isinstance(declared_temporal, dict) and declared_hash:
+            actual_hash = hashlib.sha256(json.dumps(report.temporal_coverage, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+            if actual_hash != declared_hash:
+                report.errors.append(f"{path} temporal coverage does not match its documents")
+                report.valid = False
         payload_representation = payload.get("representation") if isinstance(payload.get("representation"), dict) else {}
         declared_model = str(payload.get("embedding_model") or payload_representation.get("model_id") or "").strip()
         if declared_model and declared_model != QWEN3_MODEL:
@@ -228,7 +246,12 @@ def write_preflight_report(config: ImportConfig, project_dir: Path, report: dict
 def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImporter, files: list[Path], preflight: dict[str, Any], *, dedup_plan: DedupPlan | None = None) -> Path:
     """Write the downstream import manifest consumed by chat and inspection tools."""
     validation_results = [
-        validate_document_items(load_processed_documents(path), str(path))
+        validate_document_items(
+            load_processed_documents(path),
+            str(path),
+            require_temporal=config.temporal_validation_mode == "certified",
+            episode_uid=str(load_processed_payload(path).get("episode_uid") or ""),
+        )
         for path in files
     ]
     source_files = [
@@ -290,6 +313,20 @@ def write_manifest(config: ImportConfig, project_dir: Path, importer: ChromaImpo
         }
     path = importer.persist_dir / config.manifest_path
     write_json(path, manifest)
+    podcast_path = importer.persist_dir / "podcast.json"
+    if podcast_path.is_file():
+        try:
+            podcast_payload = json.loads(podcast_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            podcast_payload = {}
+        if isinstance(podcast_payload, dict):
+            coverage = manifest.get("temporal_coverage") or {}
+            podcast_payload.update({
+                "temporal_capability": manifest.get("temporal_capability", "legacy"),
+                "temporal_coverage": coverage,
+                "temporal_coverage_sha256": hashlib.sha256(json.dumps(coverage, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest(),
+            })
+            write_json(podcast_path, podcast_payload)
     return path
 
 def benchmark_embeddings(config: ImportConfig, project_dir: Path) -> int:

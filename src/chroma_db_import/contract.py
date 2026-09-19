@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,8 @@ class ValidationReport:
     date_max: str | None
     duplicate_node_ids: list[str]
     malformed_position_cards: int
+    temporal_capability: str = "legacy"
+    temporal_coverage: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +63,8 @@ class ValidationReport:
             "date_max": self.date_max,
             "duplicate_node_ids": self.duplicate_node_ids,
             "malformed_position_cards": self.malformed_position_cards,
+            "temporal_capability": self.temporal_capability,
+            "temporal_coverage": self.temporal_coverage or {},
         }
 
     def raise_for_errors(self, label: str) -> None:
@@ -198,6 +202,9 @@ def coerce_speakers(metadata: dict[str, Any]) -> list[str]:
 def sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     clean = {}
     for key, value in metadata.items():
+        if key == "episode_sort_key" and str(value or "").strip().isdigit() and len(str(value).strip()) == 8:
+            clean[key] = int(str(value).strip())
+            continue
         if value is None:
             clean[key] = ""
         elif isinstance(value, (str, int, float, bool)):
@@ -214,7 +221,218 @@ def document_to_item(doc: Any) -> dict[str, Any]:
     }
 
 
-def validate_document_items(items: list[Any], label: str = "processed cache") -> ValidationReport:
+def _strict_episode_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        return ""
+    try:
+        parsed = dt.date.fromisoformat(text)
+    except ValueError:
+        return ""
+    return text if parsed.isoformat() == text else ""
+
+
+def _temporal_speakers(metadata: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    speaker = metadata.get("speaker")
+    if isinstance(speaker, str) and speaker.strip() and speaker.strip().casefold() not in {"unknown", "multiple", "mixed", "unattributed"}:
+        values.append(speaker.strip())
+    raw = metadata.get("speakers")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = [part.strip() for part in raw.split(",")]
+    if isinstance(raw, list):
+        for value in raw:
+            if isinstance(value, str) and value.strip() and value.strip().casefold() not in {"unknown", "multiple", "mixed", "unattributed"} and value.strip() not in values:
+                values.append(value.strip())
+    return values
+
+
+def temporal_record_eligibility(metadata: dict[str, Any], *, episode_uid: str = "", require_direct_speaker: bool = False) -> dict[str, Any]:
+    reasons: list[str] = []
+    episode_date = _strict_episode_date(metadata.get("episode_date"))
+    if not episode_date:
+        reasons.append("missing_or_invalid_episode_date")
+    sort_key = str(metadata.get("episode_sort_key") or "").strip()
+    if not sort_key.isdigit() or len(sort_key) != 8 or (episode_date and sort_key != episode_date.replace("-", "")):
+        reasons.append("missing_or_invalid_episode_sort_key")
+    if str(metadata.get("episode_date_source") or "").casefold() in {"filename", "filename_inferred", "inferred"}:
+        reasons.append("date_is_filename_inferred")
+    identity = str(metadata.get("episode_uid") or metadata.get("episode_id") or episode_uid or "").strip()
+    if not identity:
+        reasons.append("missing_episode_identity")
+    node_type = str(metadata.get("node_type") or "").strip().casefold()
+    if node_type not in {"leaf_chunk", "transcript_segment", "position_card", "episode_thesis", "cluster_summary", "topic_profile"}:
+        reasons.append("missing_or_invalid_node_type")
+    speakers = _temporal_speakers(metadata)
+    scope = str(metadata.get("speaker_scope") or "").strip().casefold()
+    if not speakers or not scope or scope in {"unknown", "unattributed"} or (scope in {"multiple", "mixed"} and not speakers):
+        reasons.append("missing_or_ambiguous_speaker")
+    direct_speaker = bool(speakers) and scope not in {"", "multiple", "mixed", "all", "unknown", "unattributed"}
+    if require_direct_speaker and not direct_speaker:
+        reasons.append("evidence_is_not_direct_speaker_attribution")
+    provenance = metadata.get("source_span_id") or metadata.get("source_span_ids") or metadata.get("source_segment_id") or metadata.get("source_segment_ids") or metadata.get("source_spans") or metadata.get("primary_evidence_id") or metadata.get("primary_evidence_ids") or metadata.get("primary_evidence_path") or metadata.get("child_ids")
+    if not provenance:
+        reasons.append("missing_source_provenance")
+    return {
+        "eligible": not reasons, "reasons": reasons, "date": episode_date,
+        "sort_key": sort_key, "episode_uid": identity, "episode_id": str(metadata.get("episode_id") or ""),
+        "speakers": speakers, "direct_speaker": direct_speaker, "node_type": node_type,
+    }
+
+
+def temporal_coverage_stats(items: list[Any], *, episode_uid: str = "") -> dict[str, Any]:
+    rows = []
+    for item in items:
+        if isinstance(item, dict) and "metadata" in item:
+            rows.append(dict(item.get("metadata") or {}))
+        elif isinstance(item, dict):
+            rows.append(dict(item))
+        else:
+            rows.append(dict(getattr(item, "metadata", {}) or {}))
+    reason_counts: Counter[str] = Counter()
+    dates: list[str] = []
+    speakers: Counter[str] = Counter()
+    speaker_details: dict[str, dict[str, Any]] = {}
+    periods: dict[str, dict[str, Any]] = {}
+    episodes: dict[str, dict[str, Any]] = {}
+    primary = derived = eligible = missing_speakers = dated = sort_keyed = 0
+    missing_dates = invalid_dates = 0
+    for metadata in rows:
+        check = temporal_record_eligibility(metadata, episode_uid=episode_uid)
+        if check["date"]:
+            dates.append(check["date"])
+            dated += 1
+        raw_date = str(metadata.get("episode_date") or "").strip()
+        if not raw_date:
+            missing_dates += 1
+        elif not check["date"]:
+            invalid_dates += 1
+        if check["sort_key"] and "missing_or_invalid_episode_sort_key" not in check["reasons"]:
+            sort_keyed += 1
+        if not check["eligible"]:
+            reason_counts.update(check["reasons"])
+        else:
+            eligible += 1
+            if check["node_type"] in {"leaf_chunk", "transcript_segment"}:
+                primary += 1
+            else:
+                derived += 1
+        if not check["speakers"]:
+            missing_speakers += 1
+        identity = check["episode_uid"]
+        if identity:
+            row = episodes.setdefault(identity, {"episode_uid": identity, "episode_id": check["episode_id"], "episode_date": check["date"], "episode_sort_key": check["sort_key"], "document_count": 0, "eligible_document_count": 0, "speakers": set(), "primary_evidence_count": 0, "derived_evidence_count": 0, "status": "ineligible"})
+            row["document_count"] += 1
+            row["speakers"].update(check["speakers"])
+            if check["eligible"]:
+                row["eligible_document_count"] += 1
+                row["primary_evidence_count"] += int(check["node_type"] in {"leaf_chunk", "transcript_segment"})
+                row["derived_evidence_count"] += int(check["node_type"] not in {"leaf_chunk", "transcript_segment"})
+            row["status"] = "eligible" if row["eligible_document_count"] == row["document_count"] else "ineligible"
+        speakers.update(check["speakers"])
+        for speaker in check["speakers"]:
+            detail = speaker_details.setdefault(
+                speaker,
+                {
+                    "document_count": 0,
+                    "eligible_document_count": 0,
+                    "episode_ids": set(),
+                    "eligible_episode_ids": set(),
+                    "date_min": "",
+                    "date_max": "",
+                    "primary_evidence_count": 0,
+                    "derived_evidence_count": 0,
+                },
+            )
+            detail["document_count"] += 1
+            if check["eligible"]:
+                detail["eligible_document_count"] += 1
+                if identity:
+                    detail["eligible_episode_ids"].add(identity)
+                if check["node_type"] in {"leaf_chunk", "transcript_segment"}:
+                    detail["primary_evidence_count"] += 1
+                else:
+                    detail["derived_evidence_count"] += 1
+            if identity:
+                detail["episode_ids"].add(identity)
+            if check["date"]:
+                detail["date_min"] = min(detail["date_min"] or check["date"], check["date"])
+                detail["date_max"] = max(detail["date_max"] or check["date"], check["date"])
+        if check["date"]:
+            period = periods.setdefault(
+                check["date"][:7],
+                {
+                    "document_count": 0,
+                    "eligible_document_count": 0,
+                    "episode_ids": set(),
+                    "eligible_episode_ids": set(),
+                    "primary_evidence_count": 0,
+                    "derived_evidence_count": 0,
+                },
+            )
+            period["document_count"] += 1
+            if check["eligible"]:
+                period["eligible_document_count"] += 1
+                if check["node_type"] in {"leaf_chunk", "transcript_segment"}:
+                    period["primary_evidence_count"] += 1
+                else:
+                    period["derived_evidence_count"] += 1
+            if identity:
+                period["episode_ids"].add(identity)
+    episode_rows = []
+    for key in sorted(episodes, key=lambda value: (episodes[value]["episode_date"], value)):
+        row = dict(episodes[key]); row["speakers"] = sorted(row["speakers"]); episode_rows.append(row)
+    by_speaker = {
+        name: {
+            **detail,
+            "episode_ids": sorted(detail["episode_ids"]),
+            "eligible_episode_ids": sorted(detail["eligible_episode_ids"]),
+            "episode_count": len(detail["episode_ids"]),
+            "eligible_episode_count": len(detail["eligible_episode_ids"]),
+        }
+        for name, detail in sorted(speaker_details.items())
+    }
+    by_period = {
+        name: {
+            **detail,
+            "episode_ids": sorted(detail["episode_ids"]),
+            "eligible_episode_ids": sorted(detail["eligible_episode_ids"]),
+            "episode_count": len(detail["episode_ids"]),
+            "eligible_episode_count": len(detail["eligible_episode_ids"]),
+        }
+        for name, detail in sorted(periods.items())
+    }
+    total = len(rows)
+    capability = "certified" if total and eligible == total else "partial" if rows else "legacy"
+    return {
+        "date_min": min(dates) if dates else "", "date_max": max(dates) if dates else "",
+        "eligible_episode_count": sum(row["status"] == "eligible" for row in episode_rows),
+        "eligible_document_count": eligible, "missing_date_count": missing_dates,
+        "invalid_date_count": invalid_dates, "dated_record_count": dated,
+        "sort_key_record_count": sort_keyed, "missing_sort_key_count": total - sort_keyed,
+        "missing_speaker_count": missing_speakers, "primary_evidence_count": primary, "derived_evidence_count": derived,
+        "record_count": total, "ineligible_temporal_record_count": total - eligible,
+        "ineligible_reasons": dict(sorted(reason_counts.items())),
+        "by_speaker": by_speaker,
+        "speaker_coverage": by_speaker,
+        "by_period": by_period,
+        "episodes": episode_rows,
+        "temporally_eligible_record_count": eligible,
+        "temporal_capability": capability,
+    }
+
+
+def validate_document_items(
+    items: list[Any],
+    label: str = "processed cache",
+    *,
+    require_temporal: bool = False,
+    episode_uid: str = "",
+    legacy_contract: bool = False,
+) -> ValidationReport:
     """Validate processed-document payloads against the shared import contract."""
     errors: list[str] = []
     warnings: list[str] = []
@@ -281,6 +499,15 @@ def validate_document_items(items: list[Any], label: str = "processed cache") ->
         if child_id not in known_ids:
             errors.append(f"{parent_id} references missing child_id {child_id}")
 
+    temporal = temporal_coverage_stats(normalized, episode_uid=episode_uid)
+    if legacy_contract:
+        temporal = dict(temporal)
+        temporal["temporal_capability"] = "legacy"
+        warnings.append("temporal metadata is from a legacy contract")
+    if temporal["temporal_capability"] != "certified":
+        warnings.append("temporal metadata is partial or legacy")
+    if require_temporal and temporal["temporal_capability"] != "certified":
+        errors.append(f"{label} is not temporally certified")
     return ValidationReport(
         valid=not errors,
         errors=errors,
@@ -293,6 +520,8 @@ def validate_document_items(items: list[Any], label: str = "processed cache") ->
         date_max=max(dates) if dates else None,
         duplicate_node_ids=duplicate_node_ids,
         malformed_position_cards=malformed_position_cards,
+        temporal_capability=temporal["temporal_capability"],
+        temporal_coverage=temporal,
     )
 
 
@@ -317,6 +546,90 @@ def summarize_reports(reports: list[ValidationReport]) -> dict[str, Any]:
         warnings += len(report.warnings)
         malformed_positions += report.malformed_position_cards
         documents += report.document_count
+    temporal_reports = [report.temporal_coverage or {} for report in reports]
+    temporal_capability = "certified" if temporal_reports and all(item.get("temporal_capability") == "certified" for item in temporal_reports) else "partial" if any(item.get("temporal_capability") == "partial" for item in temporal_reports) else "legacy"
+    temporal_episodes: dict[str, dict[str, Any]] = {}
+    for coverage in temporal_reports:
+        for episode in coverage.get("episodes") or []:
+            key = str(episode.get("episode_uid") or episode.get("episode_id") or "")
+            if not key:
+                continue
+            current = temporal_episodes.setdefault(key, {"episode_uid": key, "episode_id": episode.get("episode_id", ""), "episode_date": episode.get("episode_date", ""), "episode_sort_key": episode.get("episode_sort_key", ""), "document_count": 0, "eligible_document_count": 0, "primary_evidence_count": 0, "derived_evidence_count": 0, "speakers": set(), "status": "ineligible"})
+            for field in ("document_count", "eligible_document_count", "primary_evidence_count", "derived_evidence_count"):
+                current[field] += int(episode.get(field) or 0)
+            current["speakers"].update(episode.get("speakers") or [])
+            current["status"] = "eligible" if current["eligible_document_count"] == current["document_count"] else "ineligible"
+    temporal = {
+        "date_min": min((item.get("date_min") for item in temporal_reports if item.get("date_min")), default=""),
+        "date_max": max((item.get("date_max") for item in temporal_reports if item.get("date_max")), default=""),
+        "eligible_episode_count": sum(item.get("status") == "eligible" for item in temporal_episodes.values()),
+        "eligible_document_count": sum(int(item.get("eligible_document_count") or 0) for item in temporal_reports),
+        "missing_date_count": sum(int(item.get("missing_date_count") or 0) for item in temporal_reports),
+        "invalid_date_count": sum(int(item.get("invalid_date_count") or 0) for item in temporal_reports),
+        "missing_sort_key_count": sum(int(item.get("missing_sort_key_count") or 0) for item in temporal_reports),
+        "dated_record_count": sum(int(item.get("dated_record_count") or 0) for item in temporal_reports),
+        "sort_key_record_count": sum(int(item.get("sort_key_record_count") or 0) for item in temporal_reports),
+        "missing_speaker_count": sum(int(item.get("missing_speaker_count") or 0) for item in temporal_reports),
+        "primary_evidence_count": sum(int(item.get("primary_evidence_count") or 0) for item in temporal_reports),
+        "derived_evidence_count": sum(int(item.get("derived_evidence_count") or 0) for item in temporal_reports),
+        "record_count": sum(int(item.get("record_count") or 0) for item in temporal_reports),
+        "ineligible_temporal_record_count": sum(int(item.get("ineligible_temporal_record_count") or 0) for item in temporal_reports),
+        "ineligible_reasons": dict(sorted((reason, sum(int(item.get("ineligible_reasons", {}).get(reason) or 0) for item in temporal_reports)) for reason in {reason for item in temporal_reports for reason in item.get("ineligible_reasons", {})})),
+        "by_speaker": {}, "by_period": {},
+        "episodes": [{**item, "speakers": sorted(item["speakers"])} for item in sorted(temporal_episodes.values(), key=lambda row: (row["episode_date"], row["episode_uid"]))],
+        "temporal_capability": temporal_capability,
+    }
+    speaker_rows: dict[str, dict[str, Any]] = {}
+    period_rows: dict[str, dict[str, Any]] = {}
+    for coverage in temporal_reports:
+        for name, row in (coverage.get("by_speaker") or {}).items():
+            target = speaker_rows.setdefault(name, {
+                "document_count": 0,
+                "eligible_document_count": 0,
+                "episode_ids": set(),
+                "eligible_episode_ids": set(),
+                "date_min": "",
+                "date_max": "",
+                "primary_evidence_count": 0,
+                "derived_evidence_count": 0,
+            })
+            for field_name in ("document_count", "eligible_document_count", "primary_evidence_count", "derived_evidence_count"):
+                target[field_name] += int(row.get(field_name) or 0)
+            target["episode_ids"].update(str(value) for value in row.get("episode_ids") or [])
+            target["eligible_episode_ids"].update(str(value) for value in row.get("eligible_episode_ids") or [])
+            for field_name in ("date_min", "date_max"):
+                value = str(row.get(field_name) or "")
+                if value:
+                    target[field_name] = min(target[field_name] or value, value) if field_name == "date_min" else max(target[field_name] or value, value)
+        for period, row in (coverage.get("by_period") or {}).items():
+            target = period_rows.setdefault(period, {
+                "document_count": 0,
+                "eligible_document_count": 0,
+                "episode_ids": set(),
+                "primary_evidence_count": 0,
+                "derived_evidence_count": 0,
+            })
+            for field_name in ("document_count", "eligible_document_count", "primary_evidence_count", "derived_evidence_count"):
+                target[field_name] += int(row.get(field_name) or 0)
+            target["episode_ids"].update(str(value) for value in row.get("episode_ids") or [])
+    temporal["by_speaker"] = {
+        name: {
+            **row,
+            "episode_ids": sorted(row["episode_ids"]),
+            "eligible_episode_ids": sorted(row["eligible_episode_ids"]),
+            "episode_count": len(row["episode_ids"]),
+            "eligible_episode_count": len(row["eligible_episode_ids"]),
+        }
+        for name, row in sorted(speaker_rows.items())
+    }
+    temporal["by_period"] = {
+        period: {
+            **row,
+            "episode_ids": sorted(row["episode_ids"]),
+            "episode_count": len(row["episode_ids"]),
+        }
+        for period, row in sorted(period_rows.items())
+    }
     return {
         "document_count": documents,
         "counts_by_node_type": dict(node_types),
@@ -327,6 +640,8 @@ def summarize_reports(reports: list[ValidationReport]) -> dict[str, Any]:
         "error_count": errors,
         "warning_count": warnings,
         "malformed_position_cards": malformed_positions,
+        "temporal_capability": temporal_capability,
+        "temporal_coverage": temporal,
     }
 
 
@@ -347,6 +662,8 @@ def build_import_manifest(
     embedding_cache: dict[str, Any] | None = None,
     partition_identity: dict[str, Any] | None = None,
     dedup: dict[str, Any] | None = None,
+    temporal_capability: str | None = None,
+    temporal_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if embedding_model != QWEN3_MODEL:
         raise ValueError(
@@ -379,6 +696,9 @@ def build_import_manifest(
     if not representation_payload.get("representation_id"):
         raise ValueError("Qwen3-only exports require representation.representation_id")
     summary = summarize_reports(validation_results)
+    coverage = dict(temporal_coverage or summary.get("temporal_coverage") or {})
+    capability = str(temporal_capability or summary.get("temporal_capability") or "legacy")
+    coverage["temporal_capability"] = capability
     manifest = {
         "manifest_version": IMPORT_MANIFEST_VERSION,
         "importer_version": IMPORTER_VERSION,
@@ -401,6 +721,9 @@ def build_import_manifest(
         "staging": staging or {},
         "reconciliation": reconciliation or {},
         "embedding_cache": embedding_cache or {},
+        "temporal_capability": capability,
+        "temporal_coverage": coverage,
+        "temporal_coverage_sha256": hashlib.sha256(json.dumps(coverage, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest(),
     }
     if dedup is not None:
         manifest["dedup"] = dict(dedup)
@@ -481,6 +804,23 @@ def validate_podcast_metadata(payload: dict[str, Any]) -> ValidationReport:
             name = speaker.get("name") if isinstance(speaker, dict) else None
             if name and name not in speaker_names:
                 warnings.append(f"episode {idx} speaker {name} missing from top-level speakers")
+    temporal_capability = str(payload.get("temporal_capability") or "legacy")
+    temporal_coverage = payload.get("temporal_coverage") if isinstance(payload.get("temporal_coverage"), dict) else {}
+    if temporal_capability not in {"certified", "partial", "legacy"}:
+        errors.append("podcast.json temporal_capability is invalid")
+    if temporal_capability == "certified":
+        for idx, episode in enumerate(episodes):
+            episode_date = _strict_episode_date(episode.get("episode_date")) if isinstance(episode, dict) else ""
+            episode_sort_key = str(episode.get("episode_sort_key") or "") if isinstance(episode, dict) else ""
+            if not episode_date or episode_sort_key != episode_date.replace("-", ""):
+                errors.append(f"episode {idx} lacks a certified date/sort-key pair")
+            if not str((episode or {}).get("episode_uid") or "").strip():
+                errors.append(f"episode {idx} lacks episode_uid for certified temporal coverage")
+    declared_temporal_hash = str(payload.get("temporal_coverage_sha256") or "")
+    if temporal_coverage and declared_temporal_hash:
+        actual_temporal_hash = hashlib.sha256(json.dumps(temporal_coverage, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+        if declared_temporal_hash.removeprefix("sha256:") != actual_temporal_hash:
+            errors.append("podcast.json temporal coverage checksum does not match")
     return ValidationReport(
         valid=not errors,
         errors=errors,
@@ -493,4 +833,6 @@ def validate_podcast_metadata(payload: dict[str, Any]) -> ValidationReport:
         date_max=max(dates) if dates else None,
         duplicate_node_ids=[],
         malformed_position_cards=0,
+        temporal_capability=temporal_capability,
+        temporal_coverage=temporal_coverage,
     )

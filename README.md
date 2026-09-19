@@ -299,12 +299,12 @@ Contexts and local preferences are stored in the private
 
 The managed workspace keeps producer processing pending separate from Chroma
 import pending. Producer pending work blocks release publication until the
-user chooses **Resume Source Processing** and the source reports that all
-declared episodes have valid caches. Once processing is ready, **Prepare and
-Import Latest** publishes or reuses the matching upstream release, discovers
-it, runs the importer dry-run and deduplication preview, and then offers
-**Import and Activate**. A failed preparation or import leaves the previous
-active database untouched.
+producer's PowerShell menu completes **Process / resume all pending work** and
+the source reports that all declared episodes have valid caches. Once a release
+is active, **Prepare and Import Latest** reuses that validated upstream release,
+discovers it, runs the importer dry-run and deduplication preview, and then
+offers **Import and Activate**. A failed preparation or import leaves the
+previous active database untouched.
 
 The discovery screen also registers a validated producer `partition.json` as
 a release-less context candidate. This is what enables the first release to

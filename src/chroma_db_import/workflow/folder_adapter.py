@@ -50,7 +50,7 @@ class FolderAdapter:
             output_root=Path(str(record.target["path"])).parent,
             collection_name=str(record.target.get("collection_name") or "whisper_rag_v2"),
             embedding_model=str(representation.get("model_id") or ""),
-            embedding_device=str(record.target.get("embedding_device") or "auto"),
+            embedding_device=str(preview.execution_options.get("embedding_device") or record.execution_options.get("embedding_device") or record.target.get("embedding_device") or "auto"),
             representation_profile=str(representation.get("profile") or record.target.get("representation_profile") or "qwen3-embedding-4b-shadow"),
             embedding_model_revision=str(representation.get("model_revision") or ""),
             final_export_dir=Path(str(record.target["path"])),
@@ -331,4 +331,3 @@ class FolderAdapter:
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(json.dumps({"preview_id": preview.preview_id, "deleted_ids": ids}, indent=2), encoding="utf-8")
         return len(ids)
-

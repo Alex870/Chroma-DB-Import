@@ -13,12 +13,12 @@ those operations are not represented by non-functional GUI buttons.
 | Rebuild an existing folder export | Database → Maintenance → Review rebuild | Implemented for folder sources through staged replacement; managed rebuild is blocked until a producer release exists. |
 | Speaker and episode selection | Database → Content | Implemented with global rules, episode exclusions/overrides, search, and shared-context explanation. |
 | Collection and representation details | Database → Overview / History / Settings | Implemented as read-only identity and active-version details. |
-| Source discovery and readiness | Advanced tools → Source connections | Implemented with inspect, resume, and prepare actions; preparation returns to database review when a database is selected. |
-| GPU/CUDA diagnosis | Settings & help → Environment | Implemented as an explicit diagnosis action plus a copyable supported-launcher repair command; no install occurs on page load. |
+| Source discovery and readiness | Advanced tools → Source connections | Implemented with owned source connections, context/release inventory, inspect and prepare actions; preparation remains review-first. |
+| GPU/CUDA diagnosis | Settings & help → Environment | Implemented as explicit diagnosis plus a backend-reviewed supported-launcher repair job and copyable fallback; no install occurs on page load. |
 | Legacy-state migration proposal | Settings & help → Legacy-state migration | Implemented as read-only, field-scoped proposals; acceptance/repair remains the documented CLI path. |
-| Semantic redundancy analysis | Advanced tools → Redundancy analysis | CLI-only with a visible disposition and command family: `chroma-db-import redundancy`. It remains advisory and version-bound. |
+| Semantic redundancy analysis | Advanced tools → Redundancy analysis · semantic judge | Implemented as scoped coverage/report actions over validated exports, with visible per-context judge configuration, loopback endpoint probing, bounded policy controls, frozen pilot review, confirmed execution, and live durable progress feedback. |
 | Release promotion, rollback, and prune | History / release administration | CLI-only where the existing adapter lacks a verifiable exact-plan contract; no GUI action claims unsupported completion. |
-| Settings import/export | Settings & help | CLI-only pending a field-level apply contract; inspection never mutates operational configuration. |
+| Settings import/export | Settings & help | Implemented for scoped application-default transfers with field-level review/apply; runtime configuration and secrets remain excluded. |
 | Standalone validation and specialist reports | Advanced CLI | Existing validated commands remain available; Activity can export durable job reports through the bridge. |
 
 The root bootstrap launches Modern by default, while the explicit `-Ui Legacy`

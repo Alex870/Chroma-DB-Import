@@ -7,6 +7,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from chroma_db_import.contract import temporal_coverage_stats
+
 
 @dataclass
 class StagingValidation:
@@ -19,6 +21,8 @@ class StagingValidation:
     date_count: int = 0
     smoke_query: str = "podcast import pinned retrieval smoke query"
     smoke_query_ids: list[str] = field(default_factory=list)
+    temporal_capability: str = "legacy"
+    temporal_coverage: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -31,6 +35,8 @@ class StagingValidation:
             "date_count": self.date_count,
             "smoke_query": self.smoke_query,
             "smoke_query_ids": self.smoke_query_ids,
+            "temporal_capability": self.temporal_capability,
+            "temporal_coverage": self.temporal_coverage,
         }
 
 
@@ -62,6 +68,8 @@ def validate_staged_records(
     *,
     expected_dimension: int | None,
     retrieval_ids: list[str] | None = None,
+    require_temporal: bool = False,
+    legacy_contract: bool = False,
 ) -> StagingValidation:
     errors: list[str] = []
     warnings: list[str] = []
@@ -104,6 +112,12 @@ def validate_staged_records(
     smoke_ids = list(retrieval_ids or ids[:1])
     if ids and not smoke_ids:
         errors.append("pinned retrieval smoke query returned no IDs")
+    temporal = temporal_coverage_stats(metadatas)
+    if legacy_contract:
+        temporal = dict(temporal)
+        temporal["temporal_capability"] = "legacy"
+    if require_temporal and temporal["temporal_capability"] != "certified":
+        errors.append("staging records are not temporally certified")
     return StagingValidation(
         valid=not errors,
         errors=errors,
@@ -113,4 +127,6 @@ def validate_staged_records(
         speaker_count=speaker_count,
         date_count=date_count,
         smoke_query_ids=smoke_ids,
+        temporal_capability=temporal["temporal_capability"],
+        temporal_coverage=temporal,
     )

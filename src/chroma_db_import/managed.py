@@ -17,7 +17,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from chroma_db_import.config import ImportConfig, load_config
 from chroma_db_import.contract import (
@@ -26,6 +26,7 @@ from chroma_db_import.contract import (
     partition_identity,
     partition_identities,
     sanitize_metadata,
+    temporal_coverage_stats,
     validate_podcast_metadata,
 )
 from chroma_db_import.importer import cache_fingerprint, load_processed_payload, representation_spec
@@ -37,13 +38,15 @@ from chroma_db_import.deduplication import (
 )
 from chroma_db_import.dedup_artifacts import validate_dedup_artifacts, write_dedup_artifacts
 from chroma_db_import.managed_lock import ManagedPartitionBusy, ManagedPartitionLock
+from chroma_db_import.lock_repair import repair_partition_lock
 from chroma_db_import.redundancy_chroma import close_chroma_client
 from chroma_db_import.redundancy_policy import policy_fingerprint, resolve_redundancy_policy
 from chroma_db_import.representation import QWEN3_MODEL, QWEN3_MODEL_REVISION, QWEN3_PROFILE, resolved_collection_name
 
 
 HANDOFF_CONTRACT = "podcast-rag-transcription-handoff-v1"
-UPSTREAM_RELEASE_CONTRACT = "podcast-rag-corpus-release-v1"
+UPSTREAM_RELEASE_CONTRACT = "podcast-rag-corpus-release-v2"
+LEGACY_UPSTREAM_RELEASE_CONTRACT = "podcast-rag-corpus-release-v1"
 DOWNSTREAM_RELEASE_CONTRACT = "chroma-export-release-v1"
 DOWNSTREAM_DEDUP_RELEASE_CONTRACT = "chroma-export-release-v2"
 CATALOG_SCHEMA_VERSION = 3
@@ -64,8 +67,26 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def producer_active_release_id(source_root: Path, partition_id: str) -> str:
+    """Return the producer-selected release without scanning or changing its files."""
+    pointer = source_root.expanduser().resolve() / "partitions" / partition_id / "active-release.json"
+    try:
+        payload = json.loads(pointer.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict) or payload.get("pointer_contract_version") != "podcast-rag-active-release-v1":
+        return ""
+    if str(payload.get("partition_id") or "") != str(partition_id):
+        return ""
+    return str(payload.get("release_id") or "").strip()
+
+
 def _fingerprint(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
+def _temporal_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
 def _safe_id(value: Any, label: str) -> str:
@@ -242,32 +263,112 @@ def validate_handoff_manifest(payload: Any, package_root: Path | None = None) ->
 def validate_upstream_release(payload: Any) -> ContextIdentity:
     if not isinstance(payload, dict) or payload.get("release_contract_version") != UPSTREAM_RELEASE_CONTRACT:
         raise ManagedContextError("unsupported or invalid Podcast-RAG release contract")
-    for field in ("release_id", "partition_id", "corpus_id", "handoff_ids", "episode_uids"):
+    for field in (
+        "release_id",
+        "created_at",
+        "partition_id",
+        "corpus_id",
+        "handoff_ids",
+        "episode_ids",
+        "episode_uids",
+        "cache_schema_version",
+        "representation_profile",
+        "embedding_model",
+        "processed_cache_fingerprints",
+        "processed_cache_artifacts",
+        "validation_evidence",
+        "release_identity_fingerprint",
+    ):
         if field not in payload:
             raise ManagedContextError(f"release is missing {field}")
     identity = ContextIdentity.from_mapping(payload, strict=True)
     if not isinstance(payload.get("handoff_ids"), list) or not isinstance(payload.get("episode_uids"), list):
         raise ManagedContextError("release handoff_ids and episode_uids must be arrays")
+    episode_ids = payload.get("episode_ids")
+    if not isinstance(episode_ids, list) or len(episode_ids) != len(set(str(item) for item in episode_ids)):
+        raise ManagedContextError("release episode_ids must be a unique array")
     episode_uids = [str(item) for item in payload["episode_uids"]]
     if len(episode_uids) != len(set(episode_uids)):
         raise ManagedContextError("release contains duplicate episode_uids")
+    if len(episode_ids) != len(episode_uids):
+        raise ManagedContextError("release episode_ids and episode_uids must have equal cardinality")
     prefix = identity.partition_id + ":"
     if any(not item.startswith(prefix) for item in episode_uids):
         raise ManagedContextError("release contains an episode_uid from another partition")
+    fingerprints = payload.get("processed_cache_fingerprints")
+    artifacts = payload.get("processed_cache_artifacts")
+    if not isinstance(fingerprints, list) or not fingerprints or len(fingerprints) != len(set(str(item) for item in fingerprints)):
+        raise ManagedContextError("release processed_cache_fingerprints must be a non-empty unique array")
+    if not isinstance(artifacts, list) or len(artifacts) != len(episode_uids):
+        raise ManagedContextError("release processed_cache_artifacts must bind every declared episode")
+    artifact_uids: set[str] = set()
+    artifact_episode_ids: set[str] = set()
+    artifact_fingerprints: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise ManagedContextError("release cache artifacts must be objects")
+        for field in ("episode_id", "episode_uid", "handoff_id", "relative_path", "cache_fingerprint", "content_sha256", "validation"):
+            if field not in artifact:
+                raise ManagedContextError(f"release cache artifact is missing {field}")
+        artifact_uid = str(artifact["episode_uid"])
+        artifact_episode_ids.add(str(artifact["episode_id"]))
+        if artifact_uid in artifact_uids:
+            raise ManagedContextError("release cache artifacts contain duplicate episode_uids")
+        artifact_uids.add(artifact_uid)
+        artifact_fingerprints.add(str(artifact["cache_fingerprint"]))
+        _normalize_hash(artifact["content_sha256"], "release cache artifact content_sha256")
+        relative_path = str(artifact["relative_path"])
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ManagedContextError("release cache artifact relative_path must remain inside the partition")
+        validation = artifact["validation"]
+        if not isinstance(validation, dict) or validation.get("status") not in {"passed", "passed_with_warnings"} or validation.get("errors"):
+            raise ManagedContextError("release cache artifact validation evidence is not passing")
+    if artifact_uids != set(episode_uids) or artifact_episode_ids != {str(item) for item in episode_ids} or artifact_fingerprints != {str(item) for item in fingerprints}:
+        raise ManagedContextError("release cache artifacts do not bind to the declared episodes and fingerprints")
+    evidence = payload.get("validation_evidence")
+    if not isinstance(evidence, dict) or evidence.get("evidence_closure") is not True:
+        raise ManagedContextError("release validation evidence is not closed")
+    if evidence.get("status") not in {"passed", "passed_with_warnings"} or evidence.get("errors"):
+        raise ManagedContextError("release validation evidence is not passing")
+    if evidence.get("cache_count") != len(artifacts) or evidence.get("episode_count") != len(episode_uids):
+        raise ManagedContextError("release validation evidence counts do not match the release artifacts")
+    _normalize_hash(payload.get("release_identity_fingerprint"), "release_identity_fingerprint")
+    capability = str(payload.get("temporal_capability") or "legacy")
+    if capability not in {"certified", "partial", "legacy"}:
+        raise ManagedContextError("release temporal_capability is invalid")
+    coverage = payload.get("temporal_coverage")
+    coverage_hash = str(payload.get("temporal_coverage_sha256") or "")
+    if capability != "legacy" or coverage is not None or coverage_hash:
+        if not isinstance(coverage, dict):
+            raise ManagedContextError("release temporal_coverage must be an object when declared")
+        expected_hash = "sha256:" + _temporal_hash(coverage)
+        normalized_hash = coverage_hash if coverage_hash.startswith("sha256:") else "sha256:" + coverage_hash
+        if normalized_hash != expected_hash:
+            raise ManagedContextError("release temporal coverage checksum mismatch")
+        if str(coverage.get("temporal_capability") or capability) != capability:
+            raise ManagedContextError("release temporal capability does not match coverage")
     return identity
 
 
 class ManagedCatalog:
     """SQLite-backed local catalog; portable identity remains in producer JSON."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = path.expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(self.path), timeout=30)
+        self.read_only = bool(read_only)
+        if self.read_only:
+            if not self.path.is_file():
+                raise ManagedContextError(f"catalog does not exist: {self.path}")
+            self.connection = sqlite3.connect(f"file:{self.path.as_posix()}?mode=ro", uri=True, timeout=30)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.connection = sqlite3.connect(str(self.path), timeout=30)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 30000")
-        self._initialize()
+        if not self.read_only:
+            self._initialize()
 
     def _initialize(self) -> None:
         self.connection.executescript(
@@ -316,6 +417,12 @@ class ManagedCatalog:
                 partition_id TEXT PRIMARY KEY REFERENCES contexts(partition_id),
                 profile_json TEXT NOT NULL,
                 profile_fingerprint TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS context_settings (
+                partition_id TEXT PRIMARY KEY REFERENCES contexts(partition_id),
+                settings_json TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS runs (
@@ -790,6 +897,59 @@ class ManagedCatalog:
             return None
         return {"profile": json.loads(row["profile_json"]), "profile_fingerprint": row["profile_fingerprint"]}
 
+    def context_settings(self, partition_id: str) -> dict[str, Any]:
+        if not self.context(partition_id):
+            raise ManagedContextError(f"unknown partition: {partition_id}")
+        try:
+            row = self.connection.execute("SELECT settings_json, revision, updated_at FROM context_settings WHERE partition_id=?", (partition_id,)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            row = None
+        if not row:
+            return {"partition_id": partition_id, "revision": 0, "settings": {"execution_options": {"embedding_device": "auto"}}, "updated_at": None}
+        return {"partition_id": partition_id, "revision": int(row[1]), "settings": json.loads(row[0]), "updated_at": row[2]}
+
+    def save_context_settings_bundle(self, partition_id: str, *, profile: dict[str, Any] | None = None, settings: dict[str, Any] | None = None, redundancy_policy: dict[str, Any] | None = None, base_revision: int | None = None, base_profile_fingerprint: str | None = None) -> dict[str, Any]:
+        if not self.context(partition_id):
+            raise ManagedContextError(f"unknown partition: {partition_id}")
+        current_settings = self.context_settings(partition_id)
+        current_profile = self.profile(partition_id)
+        if base_revision is not None and int(base_revision) != int(current_settings["revision"]):
+            raise ManagedContextError("context settings changed in another window")
+        if base_profile_fingerprint and str((current_profile or {}).get("profile_fingerprint") or "") != str(base_profile_fingerprint):
+            raise ManagedContextError("context import profile changed in another window")
+        profile_fingerprint = str((current_profile or {}).get("profile_fingerprint") or "")
+        normalized_profile = None
+        if profile is not None:
+            normalized_profile = dict(profile)
+            normalized_profile["dedup_policy"] = resolve_dedup_policy(normalized_profile.get("dedup_policy"), default_profile="safe")
+            profile_fingerprint = _fingerprint(normalized_profile)
+        resolved_redundancy = None
+        redundancy_fingerprint = ""
+        if redundancy_policy is not None:
+            resolved_redundancy = resolve_redundancy_policy(redundancy_policy)
+            redundancy_fingerprint = policy_fingerprint(resolved_redundancy)
+        next_revision = int(current_settings["revision"]) + (1 if settings is not None else 0)
+        now = _now()
+        self.connection.execute("BEGIN")
+        try:
+            if normalized_profile is not None:
+                payload = _json(normalized_profile)
+                self.connection.execute("INSERT OR REPLACE INTO import_profiles(partition_id, profile_json, profile_fingerprint, updated_at) VALUES(?,?,?,?)", (partition_id, payload, profile_fingerprint, now))
+                self.connection.execute("INSERT OR IGNORE INTO import_profile_revisions(partition_id, profile_fingerprint, profile_json, created_at) VALUES(?,?,?,?)", (partition_id, profile_fingerprint, payload, now))
+            if settings is not None:
+                self.connection.execute("INSERT OR REPLACE INTO context_settings(partition_id, settings_json, revision, updated_at) VALUES(?,?,?,?)", (partition_id, _json(settings), next_revision, now))
+            if resolved_redundancy is not None:
+                payload = _json(resolved_redundancy)
+                self.connection.execute("INSERT OR IGNORE INTO redundancy_profile_revisions(partition_id, policy_fingerprint, policy_json, created_at) VALUES(?,?,?,?)", (partition_id, redundancy_fingerprint, payload, now))
+                self.connection.execute("INSERT OR REPLACE INTO redundancy_profiles(partition_id, policy_json, policy_fingerprint, updated_at) VALUES(?,?,?,?)", (partition_id, payload, redundancy_fingerprint, now))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return {"partition_id": partition_id, "revision": next_revision, "settings": dict(settings or current_settings["settings"]), "profile_fingerprint": profile_fingerprint, "policy_fingerprint": redundancy_fingerprint, "updated_at": now}
+
     def record_run(self, run_id: str, partition_id: str, upstream_release_id: str, downstream_release_id: str, status: str, detail: dict[str, Any], *, completed: bool = False) -> None:
         self.connection.execute(
             "INSERT OR REPLACE INTO runs(run_id, partition_id, upstream_release_id, downstream_release_id, status, detail_json, started_at, completed_at) VALUES(?,?,?,?,?,?,COALESCE((SELECT started_at FROM runs WHERE run_id=?),?),?)",
@@ -929,6 +1089,54 @@ def resolve_release_cache_files(release: dict[str, Any], source_roots: Iterable[
     release_path = Path(str(release.get("source_path") or ""))
     if not release_path.is_file():
         raise ManagedContextError("release manifest path is unavailable")
+    if payload.get("release_contract_version") != UPSTREAM_RELEASE_CONTRACT:
+        raise ManagedContextError("unsupported or invalid Podcast-RAG release contract")
+    validate_upstream_release(payload)
+    if payload.get("release_contract_version") == UPSTREAM_RELEASE_CONTRACT:
+        partition_root = release_path.parent.parent.resolve()
+        resolved_paths: list[Path] = []
+        resolved_episode_uids: set[str] = set()
+        resolved_fingerprints: set[str] = set()
+        for artifact in payload.get("processed_cache_artifacts") or []:
+            relative_path = Path(str(artifact.get("relative_path") or ""))
+            try:
+                cache_path = (partition_root / relative_path).resolve()
+                cache_path.relative_to(partition_root)
+            except (OSError, ValueError) as exc:
+                raise ManagedContextError("release cache artifact path escapes the partition root") from exc
+            if not cache_path.is_file():
+                raise ManagedContextError(f"release cache artifact is unavailable: {relative_path.as_posix()}")
+            expected_content_hash = _normalize_hash(artifact.get("content_sha256"), "release cache artifact content_sha256")
+            if _sha256(cache_path) != expected_content_hash:
+                raise ManagedContextError(f"release cache artifact content hash mismatch: {cache_path.name}")
+            cache_payload = load_processed_payload(cache_path)
+            identity_values = partition_identities(cache_payload)
+            if len({(item.get("partition_id"), item.get("corpus_id")) for item in identity_values}) != 1:
+                raise ManagedContextError(f"managed release references a cache with mixed partition/corpus identity: {cache_path.name}")
+            cache_identity = identity_values[0] if identity_values else {}
+            if (
+                cache_identity.get("partition_id") != payload.get("partition_id")
+                or cache_identity.get("corpus_id") != payload.get("corpus_id")
+            ):
+                raise ManagedContextError(f"cache partition/corpus mismatch: {cache_path.name}")
+            cache_episode_uids = _cache_episode_uids(cache_payload)
+            expected_episode_uid = str(artifact.get("episode_uid") or "")
+            if cache_episode_uids != {expected_episode_uid}:
+                raise ManagedContextError(f"cache episode_uid binding disagrees with release: {cache_path.name}")
+            if str(cache_payload.get("episode_id") or "") != str(artifact.get("episode_id") or ""):
+                raise ManagedContextError(f"cache episode_id binding disagrees with release: {cache_path.name}")
+            actual_fingerprint = str(cache_payload.get("source_fingerprint") or cache_payload.get("cache_fingerprint") or "").strip().removeprefix("sha256:")
+            expected_fingerprint = str(artifact.get("cache_fingerprint") or "").strip().removeprefix("sha256:")
+            if not actual_fingerprint or actual_fingerprint != expected_fingerprint:
+                raise ManagedContextError(f"cache fingerprint mismatch: {cache_path.name}")
+            resolved_paths.append(cache_path)
+            resolved_episode_uids.add(expected_episode_uid)
+            resolved_fingerprints.add(expected_fingerprint)
+        expected_episode_uids = {str(item).strip() for item in payload.get("episode_uids") or [] if str(item).strip()}
+        expected_fingerprints = {str(item).strip().removeprefix("sha256:") for item in payload.get("processed_cache_fingerprints") or [] if str(item).strip()}
+        if resolved_episode_uids != expected_episode_uids or resolved_fingerprints != expected_fingerprints:
+            raise ManagedContextError("release cache artifacts do not completely bind to the release declarations")
+        return sorted(set(resolved_paths))
     expected = {str(item) for item in (payload.get("processed_cache_fingerprints") or []) if str(item)}
     if not expected:
         raise ManagedContextError("release does not declare processed_cache_fingerprints")
@@ -980,75 +1188,239 @@ def resolve_release_cache_files(release: dict[str, Any], source_roots: Iterable[
     return paths
 
 
+def _known_discovery_dirs(root: Path) -> list[Path]:
+    """Return the shallow producer layout locations that can contain metadata.
+
+    Source roots also contain processed caches, transcripts, audio, and other
+    large working trees.  Discovery metadata has a small, producer-defined
+    layout, so walking only these directories avoids inspecting unrelated files.
+    """
+    directories: set[Path] = {root.resolve()}
+    try:
+        directories.update(path.resolve() for path in root.iterdir() if path.is_dir())
+    except OSError:
+        return sorted(directories)
+    partitions_root = root / "partitions"
+    try:
+        if partitions_root.is_dir():
+            directories.update(path.resolve() for path in partitions_root.iterdir() if path.is_dir())
+    except OSError:
+        pass
+    return sorted(directories)
+
+
+def _discovery_manifest_candidates(root: Path) -> list[Path]:
+    """Find metadata in the supported shallow producer layout only."""
+    directories = _known_discovery_dirs(root)
+    candidates: set[Path] = set()
+    for directory in directories:
+        for filename in ("partition.json", "manifest.json", "release.json"):
+            path = directory / filename
+            if path.is_file():
+                candidates.add(path.resolve())
+        try:
+            candidates.update(path.resolve() for path in directory.glob("*.release.json") if path.is_file())
+        except OSError:
+            pass
+        releases_dir = directory / "releases"
+        try:
+            candidates.update(path.resolve() for path in releases_dir.glob("*.release.json") if path.is_file())
+        except OSError:
+            pass
+        for inbox_name in ("handoff_inbox", "handoff"):
+            inbox = directory / inbox_name
+            try:
+                packages = [path for path in inbox.iterdir() if path.is_dir()] if inbox.is_dir() else []
+                for package in packages:
+                    for filename in ("manifest.json", "release.json"):
+                        path = package / filename
+                        if path.is_file():
+                            candidates.add(path.resolve())
+                    candidates.update(path.resolve() for path in package.glob("*.release.json") if path.is_file())
+            except OSError:
+                continue
+    return sorted(candidates)
+
+
+def _discovery_pointer_candidates(root: Path) -> list[Path]:
+    pointers: list[Path] = []
+    for directory in _known_discovery_dirs(root):
+        path = directory / "active-release.json"
+        if path.is_file():
+            pointers.append(path.resolve())
+    return sorted(set(pointers))
+
+
+def _discovery_signature(path: Path) -> dict[str, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def _handoff_dependency_signatures(payload: Mapping[str, Any], package_root: Path) -> dict[str, dict[str, int] | None]:
+    dependencies: dict[str, dict[str, int] | None] = {}
+    for episode in payload.get("episodes") or []:
+        if not isinstance(episode, Mapping):
+            continue
+        selected = episode.get("selected_transcript")
+        if not isinstance(selected, Mapping):
+            continue
+        relative = str(selected.get("path") or "").strip()
+        if not relative:
+            continue
+        path = (package_root / relative).resolve()
+        dependencies[str(path)] = _discovery_signature(path)
+    return dependencies
+
+
+def _discovery_dependencies_unchanged(entry: Mapping[str, Any]) -> bool:
+    dependencies = entry.get("dependencies")
+    if not isinstance(dependencies, Mapping):
+        return True
+    return all(_discovery_signature(Path(str(path))) == signature for path, signature in dependencies.items())
+
+
+def _discovery_cache_key(root: Path) -> str:
+    return "discovery_cache:" + hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()
+
+
+def _load_discovery_cache(catalog: ManagedCatalog, root: Path) -> dict[str, dict[str, Any]]:
+    raw = catalog.get_setting(_discovery_cache_key(root), "{}")
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _append_discovered_context(report: dict[str, Any], context: Mapping[str, Any] | None) -> None:
+    if not context:
+        return
+    partition_id = str(context.get("partition_id") or "")
+    if not any(str(item.get("partition_id") or "") == partition_id for item in report["contexts"]):
+        report["contexts"].append(dict(context))
+
+
+def _append_discovered_release(report: dict[str, Any], partition_id: str, release_id: str, path: Path) -> None:
+    if not any(item.get("partition_id") == partition_id and item.get("release_id") == release_id for item in report["releases"]):
+        report["releases"].append({"partition_id": partition_id, "release_id": release_id, "path": str(path)})
+
+
 def discover(catalog: ManagedCatalog, roots: Iterable[Path] | None = None) -> dict[str, Any]:
     if roots:
         for root in roots:
             catalog.add_source_root(root)
     source_roots = catalog.source_roots()
     report: dict[str, Any] = {"roots": [str(path) for path in source_roots], "contexts": [], "releases": [], "invalid": []}
-    seen: set[Path] = set()
     for root in source_roots:
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or path in seen:
+        root = root.resolve()
+        cache = _load_discovery_cache(catalog, root)
+        next_cache: dict[str, dict[str, Any]] = {}
+
+        for path in _discovery_manifest_candidates(root):
+            key = str(path)
+            signature = _discovery_signature(path)
+            if signature is None:
                 continue
-            if path.name != "manifest.json" and path.name != "release.json" and not path.name.endswith(".release.json"):
-                continue
-            seen.add(path)
+            cached = cache.get(key)
+            if cached and cached.get("signature") == signature and _discovery_dependencies_unchanged(cached):
+                kind = str(cached.get("kind") or "")
+                partition_id = str(cached.get("partition_id") or "")
+                release_id = str(cached.get("release_id") or "")
+                context = catalog.context(partition_id) if partition_id else None
+                release = catalog.release(partition_id, release_id) if partition_id and release_id else None
+                if kind == "release" and context and release and Path(str(release.get("source_path") or "")).resolve() == path:
+                    _append_discovered_context(report, context)
+                    _append_discovered_release(report, partition_id, release_id, path)
+                    next_cache[key] = cached
+                    continue
+                if kind in {"handoff", "partition"} and context:
+                    _append_discovered_context(report, context)
+                    next_cache[key] = cached
+                    continue
+                if kind == "ignored":
+                    next_cache[key] = cached
+                    continue
+                if kind == "invalid":
+                    report["invalid"].append({"path": key, "error": str(cached.get("error") or "Cached metadata validation failed.")})
+                    next_cache[key] = cached
+                    continue
+
+            entry: dict[str, Any] = {"signature": signature}
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ManagedContextError("metadata must be a JSON object")
                 if payload.get("release_contract_version") == UPSTREAM_RELEASE_CONTRACT:
                     identity = validate_upstream_release(payload)
                     _require_registry_mapping(identity, root)
                     partition_payload = payload.get("partition") if isinstance(payload.get("partition"), dict) else payload
-                    producer_status = str(partition_payload.get("status") or "active")
-                    context = catalog.upsert_context(identity, source_root=root, source_manifest=path, producer_status=producer_status)
+                    context = catalog.upsert_context(identity, source_root=root, source_manifest=path, producer_status=str(partition_payload.get("status") or "active"))
                     release = catalog.record_release(identity, payload, path)
-                    report["contexts"].append(context)
-                    report["releases"].append({"partition_id": identity.partition_id, "release_id": release["upstream_release_id"], "path": str(path)})
+                    entry.update({"kind": "release", "partition_id": identity.partition_id, "release_id": str(release["upstream_release_id"])})
+                    _append_discovered_context(report, context)
+                    _append_discovered_release(report, identity.partition_id, str(release["upstream_release_id"]), path)
                 elif payload.get("contract_version") == HANDOFF_CONTRACT:
+                    entry["dependencies"] = _handoff_dependency_signatures(payload, path.parent)
                     identity = validate_handoff_manifest(payload, path.parent)
                     _require_registry_mapping(identity, root)
                     partition_payload = payload.get("partition") if isinstance(payload.get("partition"), dict) else payload
-                    producer_status = str(partition_payload.get("status") or "active")
-                    context = catalog.upsert_context(identity, source_root=root, source_manifest=path, producer_status=producer_status)
-                    report["contexts"].append(context)
+                    context = catalog.upsert_context(identity, source_root=root, source_manifest=path, producer_status=str(partition_payload.get("status") or "active"))
+                    entry.update({"kind": "handoff", "partition_id": identity.partition_id})
+                    _append_discovered_context(report, context)
+                elif str(payload.get("release_contract_version") or "") == LEGACY_UPSTREAM_RELEASE_CONTRACT:
+                    raise ManagedContextError("legacy Podcast-RAG release manifests are historical and not importable")
+                elif path.name == "partition.json" and str(payload.get("contract_version") or "").startswith("podcast-rag-partition-"):
+                    identity = ContextIdentity.from_mapping(payload, strict=True)
+                    _require_registry_mapping(identity, root)
+                    partition_payload = payload.get("partition") if isinstance(payload.get("partition"), dict) else payload
+                    context = catalog.upsert_context(identity, source_root=root, source_manifest=path, producer_status=str(partition_payload.get("status") or "active"))
+                    entry.update({"kind": "partition", "partition_id": identity.partition_id})
+                    _append_discovered_context(report, context)
+                else:
+                    entry["kind"] = "ignored"
             except (OSError, json.JSONDecodeError, ManagedContextError) as exc:
-                report["invalid"].append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
-        # A producer partition can legitimately exist before its first release
-        # is published.  Register that validated identity as a release-less
-        # context candidate so the desktop workflow can inspect source status
-        # and publish the first release without requiring manual JSON work.
-        partition_manifests: list[Path] = []
-        direct_partition_manifest = root / "partition.json"
-        if direct_partition_manifest.is_file():
-            partition_manifests.append(direct_partition_manifest)
-        partitions_root = root / "partitions"
-        if partitions_root.is_dir():
-            partition_manifests.extend(sorted(partitions_root.glob("*/partition.json")))
-        for path in partition_manifests:
-            if path in seen:
-                continue
-            seen.add(path)
+                entry.update({"kind": "invalid", "error": f"{type(exc).__name__}: {exc}"})
+                report["invalid"].append({"path": key, "error": str(entry["error"])})
+            next_cache[key] = entry
+
+        for pointer_path in _discovery_pointer_candidates(root):
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                if not str(payload.get("contract_version") or "").startswith("podcast-rag-partition-"):
-                    continue
-                identity = ContextIdentity.from_mapping(payload, strict=True)
-                if catalog.context(identity.partition_id):
-                    continue
+                pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                if pointer.get("pointer_contract_version") != "podcast-rag-active-release-v1":
+                    raise ManagedContextError("unsupported active release pointer contract")
+                relative_release_path = Path(str(pointer.get("release_path") or ""))
+                partition_root = pointer_path.parent.resolve()
+                release_path = (partition_root / relative_release_path).resolve()
+                release_path.relative_to(partition_root)
+                if not release_path.is_file():
+                    raise ManagedContextError("active release pointer references a missing manifest")
+                release_payload = json.loads(release_path.read_text(encoding="utf-8"))
+                identity = validate_upstream_release(release_payload)
+                if str(pointer.get("partition_id") or "") != identity.partition_id or str(pointer.get("corpus_id") or "") != identity.corpus_id:
+                    raise ManagedContextError("active release pointer identity does not match its manifest")
+                if str(pointer.get("release_id") or "") != str(release_payload.get("release_id") or ""):
+                    raise ManagedContextError("active release pointer release_id does not match its manifest")
+                expected_hash = _normalize_hash(pointer.get("release_sha256"), "active release pointer release_sha256")
+                if _sha256(release_path) != expected_hash:
+                    raise ManagedContextError("active release pointer manifest hash does not match")
                 _require_registry_mapping(identity, root)
-                partition_payload = payload.get("partition") if isinstance(payload.get("partition"), dict) else payload
-                producer_status = str(partition_payload.get("status") or "active")
-                report["contexts"].append(
-                    catalog.upsert_context(
-                        identity,
-                        source_root=root,
-                        source_manifest=path,
-                        producer_status=producer_status,
-                    )
+                partition_payload = release_payload.get("partition") if isinstance(release_payload.get("partition"), dict) else release_payload
+                context = catalog.upsert_context(identity, source_root=root, source_manifest=release_path, producer_status=str(partition_payload.get("status") or "active"))
+                _append_discovered_context(report, context)
+                report.setdefault("active_releases", []).append(
+                    {
+                        "partition_id": identity.partition_id,
+                        "release_id": str(release_payload.get("release_id") or ""),
+                        "pointer": str(pointer_path),
+                        "path": str(release_path),
+                    }
                 )
-            except (OSError, json.JSONDecodeError, ManagedContextError) as exc:
-                report["invalid"].append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+            except (OSError, json.JSONDecodeError, ManagedContextError, ValueError) as exc:
+                report["invalid"].append({"path": str(pointer_path), "error": f"{type(exc).__name__}: {exc}"})
+        catalog.set_setting(_discovery_cache_key(root), json.dumps(next_cache, ensure_ascii=False, sort_keys=True))
     return report
 
 
@@ -1104,10 +1476,15 @@ def _portable_config(config: dict[str, Any]) -> dict[str, Any]:
 def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstream: dict[str, Any], profile_fingerprint: str, cache_paths: list[Path], manifest: dict[str, Any], *, upstream_release_id: str, downstream_release_id: str, dedup_plan: Any | None = None) -> None:
     episodes: dict[str, dict[str, Any]] = {}
     speakers: set[str] = set()
+    temporal_metadata: list[dict[str, Any]] = []
     for path in cache_paths:
         payload = load_processed_payload(path)
         docs = payload.get("documents") if isinstance(payload.get("documents"), list) else []
         metadata = [dict(item.get("metadata") or {}) for item in docs if isinstance(item, dict)]
+        if payload.get("episode_uid"):
+            for item in metadata:
+                item.setdefault("episode_uid", str(payload["episode_uid"]))
+        temporal_metadata.extend(metadata)
         first = next((item for item in metadata if item), {})
         declared_uid = str(payload.get("episode_uid") or "")
         declared_episode_id = declared_uid.split(":", 1)[1] if ":" in declared_uid else ""
@@ -1136,12 +1513,18 @@ def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstre
                 "episode_id": episode_id,
                 "episode_title": str(first.get("episode_title") or payload.get("episode_title") or episode_id),
                 "episode_date": first.get("episode_date") or payload.get("episode_date"),
+                "episode_sort_key": first.get("episode_sort_key") or payload.get("episode_sort_key"),
                 "document_count": stored_count,
                 "raw_document_count": len(docs),
                 "speakers": [{"id": re.sub(r"[^a-z0-9]+", "-", speaker.lower()).strip("-") or "speaker", "name": speaker} for speaker in episode_speakers],
                 "imported_at": _now(),
                 **identity.as_dict(),
             }
+    temporal_coverage = temporal_coverage_stats(temporal_metadata)
+    upstream_temporal_capability = str(upstream.get("temporal_capability") or "legacy")
+    temporal_capability = "legacy" if upstream_temporal_capability == "legacy" else temporal_coverage.get("temporal_capability", "legacy")
+    temporal_coverage = dict(temporal_coverage)
+    temporal_coverage["temporal_capability"] = temporal_capability
     representation = manifest.get("representation") or {}
     managed_collection_name = resolved_collection_name(
         str(manifest.get("collection_name") or COLLECTION_NAME),
@@ -1182,6 +1565,9 @@ def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstre
         **identity.as_dict(),
         "upstream_release_id": upstream_release_id,
         "import_profile_fingerprint": profile_fingerprint,
+        "temporal_capability": temporal_capability,
+        "temporal_coverage": temporal_coverage,
+        "temporal_coverage_sha256": _temporal_hash(temporal_coverage),
     }
     podcast_report = validate_podcast_metadata(podcast)
     if not podcast_report.valid:
@@ -1198,6 +1584,9 @@ def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstre
     manifest["handoff_ids"] = list(upstream.get("handoff_ids") or [])
     manifest["import_profile_fingerprint"] = profile_fingerprint
     manifest["portable"] = True
+    manifest["temporal_capability"] = temporal_capability
+    manifest["temporal_coverage"] = temporal_coverage
+    manifest["temporal_coverage_sha256"] = _temporal_hash(temporal_coverage)
     if dedup_plan is not None:
         manifest["dedup_counts"] = dedup_plan.as_counts()
     downstream = {
@@ -1230,6 +1619,9 @@ def _write_managed_metadata(export_root: Path, identity: ContextIdentity, upstre
         "representation": dict(representation),
         "import_profile_fingerprint": profile_fingerprint,
         "created_at": _now(),
+        "temporal_capability": temporal_capability,
+        "temporal_coverage": temporal_coverage,
+        "temporal_coverage_sha256": _temporal_hash(temporal_coverage),
     }
     _atomic_json(export_root / "podcast.json", podcast)
     _atomic_json(export_root / "import_manifest.json", manifest)
@@ -1257,6 +1649,11 @@ def _stamp_collection_identity(export_root: Path, identity: ContextIdentity, ups
         client = chromadb.PersistentClient(path=str(export_root))
         collection = client.get_collection(resolved_collection_name(COLLECTION_NAME, QWEN3_PROFILE))
         metadata = dict(getattr(collection, "metadata", None) or {})
+        temporal_payload = {}
+        try:
+            temporal_payload = json.loads((export_root / "podcast.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            temporal_payload = {}
         metadata.update(
             {
                 "partition_id": identity.partition_id,
@@ -1274,6 +1671,8 @@ def _stamp_collection_identity(export_root: Path, identity: ContextIdentity, ups
                 "embedding_dimension": 2560,
                 "distance_metric": "cosine",
                 "normalize_embeddings": True,
+                "temporal_capability": temporal_payload.get("temporal_capability", "legacy"),
+                "temporal_coverage_sha256": temporal_payload.get("temporal_coverage_sha256", ""),
             }
         )
         if dedup_plan is not None:
@@ -1342,6 +1741,7 @@ def run_managed_import(
     output_root: Path | None = None,
     dry_run: bool = False,
     validation_only: bool = False,
+    selection_policy: Mapping[str, Any] | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     context = catalog.context(partition_id)
@@ -1352,7 +1752,10 @@ def run_managed_import(
     releases = catalog.releases(partition_id)
     if not releases:
         raise ManagedContextError(f"partition has no discovered Podcast-RAG release: {partition_id}")
-    release = next((item for item in releases if item["upstream_release_id"] == upstream_release_id), releases[0]) if upstream_release_id else releases[0]
+    preferred_release_id = upstream_release_id or producer_active_release_id(Path(str(context.get("source_root") or project_dir)), partition_id)
+    release = next((item for item in releases if item["upstream_release_id"] == preferred_release_id), releases[0]) if releases else None
+    if release is None:
+        raise ManagedContextError(f"partition has no discovered Podcast-RAG release: {partition_id}")
     if upstream_release_id and release["upstream_release_id"] != upstream_release_id:
         raise ManagedContextError(f"unknown upstream release {upstream_release_id} for {partition_id}")
     upstream = release["payload"]
@@ -1370,6 +1773,8 @@ def run_managed_import(
     # The catalog profile is authoritative.  A caller-supplied base config is
     # only used for local paths and for contexts that have not been cataloged.
     effective_config = resolve_managed_config(config, catalog.profile(partition_id))
+    if str(upstream.get("temporal_capability") or "legacy") == "certified":
+        effective_config.temporal_validation_mode = "certified"
 
     if progress_callback is not None:
         progress_callback(f"Validating {len(cache_paths)} producer cache(s)...", 0, len(cache_paths))
@@ -1384,11 +1789,24 @@ def run_managed_import(
     if saved_profile is None:
         profile = import_profile_payload(effective_config)
         profile_fingerprint = _fingerprint(profile)
-        if not (dry_run or validation_only):
+        # A one-run modern selection changes only this release derivation; it
+        # must not create or overwrite the saved context profile.
+        if not (dry_run or validation_only or selection_policy is not None):
             profile_fingerprint = catalog.save_profile(partition_id, profile)
     else:
         profile = saved_profile["profile"]
         profile_fingerprint = str(saved_profile["profile_fingerprint"])
+    modern_selection_policy = selection_policy
+    if modern_selection_policy is None and isinstance(profile.get("selection_policy"), Mapping):
+        modern_selection_policy = dict(profile["selection_policy"])
+    if modern_selection_policy is not None:
+        from chroma_db_import.workflow.models import SelectionPolicy
+
+        modern_selection_policy = SelectionPolicy.from_mapping(modern_selection_policy).as_dict()
+        if selection_policy is not None:
+            profile_for_run = dict(profile)
+            profile_for_run["selection_policy"] = modern_selection_policy
+            profile_fingerprint = _fingerprint(profile_for_run)
     effective_config = resolve_managed_config(effective_config, {"profile": profile, "profile_fingerprint": profile_fingerprint})
     dedup_policy = resolve_dedup_policy(effective_config.dedup_policy, default_profile="off")
     if progress_callback is not None:
@@ -1399,6 +1817,7 @@ def run_managed_import(
         upstream,
         representation_spec(effective_config),
         selected_speakers=effective_config.selected_speakers,
+        selection_policy=modern_selection_policy,
         progress_callback=progress_callback,
     )
     if progress_callback is not None:
@@ -1431,15 +1850,15 @@ def run_managed_import(
             "plan_fingerprint": dedup_plan.plan_fingerprint,
         }
     output_root = output_root or Path(catalog.get_setting("managed_output_root", str(project_dir / "exports")))
+    run_id = f"managed_{uuid.uuid4().hex}"
     try:
-        lock = ManagedPartitionLock(paths["partition_root"]).acquire()
+        lock = ManagedPartitionLock(paths["partition_root"], run_id=run_id).acquire()
     except ManagedPartitionBusy as exc:
         catalog.record_downstream_export(partition_id, downstream_release_id, release["upstream_release_id"], profile_fingerprint, "busy", {"error": str(exc)})
         raise ManagedContextError(str(exc)) from exc
     try:
         if paths["export_root"].exists():
             if _managed_release_is_reusable(paths["export_root"], identity, upstream, release["upstream_release_id"], downstream_release_id, profile_fingerprint, dedup_plan):
-                run_id = f"managed_{uuid.uuid4().hex}"
                 catalog.update_release(partition_id, release["upstream_release_id"], status="imported", downstream_release_id=downstream_release_id, imported_at=_now())
                 catalog.set_active_release(output_root, partition_id, downstream_release_id, corpus_id=identity.corpus_id)
                 catalog.record_run(run_id, partition_id, release["upstream_release_id"], downstream_release_id, "reused", {"export": str(paths["export_root"]), "embedding_work": 0}, completed=True)
@@ -1463,7 +1882,6 @@ def run_managed_import(
         managed_config.import_state_dir = str(stage / "import_batches")
         managed_config.embedding_cache_dir = str(paths["partition_root"] / "embedding_cache")
         managed_config.manifest_path = "import_manifest.json"
-        run_id = f"managed_{uuid.uuid4().hex}"
         catalog.record_run(run_id, partition_id, release["upstream_release_id"], downstream_release_id, "processing", {"cache_files": [str(path) for path in cache_paths]})
         dedup_integration_supported = True
         try:
@@ -1490,6 +1908,7 @@ def run_managed_import(
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             _stamp_collection_identity(stage_export, identity, release["upstream_release_id"], downstream_release_id, profile_fingerprint, dedup_plan)
             _write_managed_metadata(stage_export, identity, upstream, profile_fingerprint, cache_paths, manifest, upstream_release_id=release["upstream_release_id"], downstream_release_id=downstream_release_id, dedup_plan=dedup_plan if dedup_integration_supported else None)
+            _stamp_collection_identity(stage_export, identity, release["upstream_release_id"], downstream_release_id, profile_fingerprint, dedup_plan)
             dedup_reference = write_dedup_artifacts(
                 stage_export,
                 dedup_plan,
@@ -1607,6 +2026,12 @@ def managed_main(argv: list[str]) -> int:
     review_dedup.add_argument("--output-root")
     add_catalog(review_dedup)
 
+    repair_lock = context_commands.add_parser("repair-lock", help="Recover a stuck partition lock without importing")
+    repair_lock.add_argument("--partition", required=True)
+    repair_lock.add_argument("--output-root", required=True)
+    repair_lock.add_argument("--confirm", action="store_true", help="Permit stopping the verified stale importer owner")
+    repair_lock.add_argument("--grace-timeout", type=float, default=10.0)
+
     import_command = subparsers.add_parser("import", help="Import the newest valid release for one context")
     import_command.add_argument("--partition", required=True)
     import_command.add_argument("--release")
@@ -1621,6 +2046,12 @@ def managed_main(argv: list[str]) -> int:
     status.add_argument("--catalog")
 
     args = parser.parse_args(argv)
+    if args.command == "contexts" and args.context_command == "repair-lock":
+        partition_id = _safe_id(args.partition, "partition")
+        partition_root = Path(args.output_root).expanduser().resolve() / "partitions" / partition_id
+        result = repair_partition_lock(partition_root, confirm=args.confirm, grace_timeout=args.grace_timeout)
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0 if result.get("status") in {"already_available", "released", "owner_terminated"} else 1
     project_dir, config = _project_dir_from_config(getattr(args, "config", None))
     catalog_path = _catalog_path(getattr(args, "catalog", None), project_dir)
     with ManagedCatalog(catalog_path) as catalog:

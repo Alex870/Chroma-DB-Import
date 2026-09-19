@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import html
 import os
+import sqlite3
+import uuid
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,35 @@ def asset_root() -> Path:
     return Path(__file__).resolve().parent / "assets"
 
 
+def _state_dir_is_usable(path: Path) -> bool:
+    """Check the write needed by AppCatalog without changing persistent state."""
+    catalog_path = path / "gui_catalog.sqlite3"
+    probe_path = path / f".gui-state-write-probe-{uuid.uuid4().hex}"
+    try:
+        if catalog_path.is_file():
+            # BEGIN IMMEDIATE verifies that an existing catalog is writable and
+            # lockable, while the rollback guarantees that no catalog data is
+            # changed by the probe.
+            connection = sqlite3.connect(str(catalog_path), timeout=0.25)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.rollback()
+            finally:
+                connection.close()
+        else:
+            probe_path.write_text("probe", encoding="ascii")
+        return True
+    except (OSError, sqlite3.Error):
+        return False
+    finally:
+        try:
+            probe_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
 def resolve_state_dir(
     state_dir: Path | None = None,
     *,
@@ -36,12 +67,16 @@ def resolve_state_dir(
     project_state = (project_root or Path.cwd()).expanduser().resolve() / "state" / "gui"
     try:
         project_state.mkdir(parents=True, exist_ok=True)
+        if not _state_dir_is_usable(project_state):
+            raise OSError(f"GUI state is not writable at {project_state}")
         return project_state
     except OSError as project_error:
         fallback_root = local_app_data or Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
         fallback = fallback_root.expanduser().resolve() / "Chroma DB Import" / "gui"
         try:
             fallback.mkdir(parents=True, exist_ok=True)
+            if not _state_dir_is_usable(fallback):
+                raise OSError(f"GUI state is not writable at {fallback}")
             return fallback
         except OSError as fallback_error:
             raise RuntimeError(
@@ -66,7 +101,29 @@ def create_window(*, state_dir: Path | None = None, workspace: str = "default") 
         result = window.create_file_dialog(webview.FOLDER_DIALOG)
         return str(result[0]) if result else None
 
-    bridge = ApplicationBridge(service, folder_picker=pick_folder)
+    def _dialog_result(result: Any) -> str | None:
+        if isinstance(result, (list, tuple)):
+            return str(result[0]) if result else None
+        return str(result) if result else None
+
+    def pick_file(purpose: str) -> str | None:
+        window = window_ref.get("window")
+        if window is None:
+            return None
+        if purpose == "redundancy_bundle":
+            return _dialog_result(window.create_file_dialog(webview.FOLDER_DIALOG))
+        file_types = ("JSON files (*.json)", "All files (*.*)")
+        return _dialog_result(window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=False, file_types=file_types))
+
+    def pick_save_file(purpose: str) -> str | None:
+        window = window_ref.get("window")
+        if window is None:
+            return None
+        defaults = {"report": "report.json", "settings_export": "settings.json", "labels": "labels.json", "evaluation": "evaluation.json"}
+        file_types = ("JSON files (*.json)", "All files (*.*)")
+        return _dialog_result(window.create_file_dialog(webview.SAVE_DIALOG, save_filename=defaults.get(purpose, "output.json"), file_types=file_types))
+
+    bridge = ApplicationBridge(service, folder_picker=pick_folder, file_picker=pick_file, save_file_picker=pick_save_file)
     index = asset_root() / "index.html"
     if index.is_file():
         # Pass a plain local path so pywebview can serve the bundle through its

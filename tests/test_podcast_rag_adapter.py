@@ -1,7 +1,9 @@
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from chroma_db_import.podcast_rag_adapter import PodcastRagSourceAdapter, UPSTREAM_RELEASE_CONTRACT
 from chroma_db_import.representation import QWEN3_MODEL
 
@@ -47,6 +49,9 @@ def write_source(root: Path, *, statuses: list[str] | None = None, cache_count: 
                         "source_fingerprint": f"fingerprint-{index}",
                         "partition_id": PARTITION_ID,
                         "corpus_id": PARTITION_ID,
+                        "partition_display_name": "Podcast One",
+                        "context_type": "podcast",
+                        "workflow_profile": "podcast",
                         "episode_uid": f"{PARTITION_ID}:{episode_id}",
                         "embedding_model": QWEN3_MODEL,
                         "documents": [],
@@ -67,6 +72,15 @@ def write_source(root: Path, *, statuses: list[str] | None = None, cache_count: 
 
 
 class PodcastRagAdapterTests(unittest.TestCase):
+    def test_inspect_prefers_the_producer_active_release_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_source(root)
+            adapter = PodcastRagSourceAdapter(root, PARTITION_ID)
+            with patch.object(adapter, "_active_release", return_value={"release_id": "release-active"}):
+                status = adapter.inspect()
+            self.assertEqual("release-active", status.latest_release_id)
+
     def test_inspect_reports_current_handoff_and_pending_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -83,7 +97,7 @@ class PodcastRagAdapterTests(unittest.TestCase):
             root = Path(directory)
             write_source(root)
             adapter = PodcastRagSourceAdapter(root, PARTITION_ID)
-            with self.assertRaisesRegex(Exception, "must publish a release separately"):
+            with self.assertRaisesRegex(Exception, "Process / resume all pending work"):
                 adapter.publish_release()
 
     def test_existing_matching_release_is_reused_without_process(self):
@@ -97,11 +111,44 @@ class PodcastRagAdapterTests(unittest.TestCase):
                     {
                         "release_contract_version": UPSTREAM_RELEASE_CONTRACT,
                         "release_id": "release-existing",
+                        "created_at": "2026-09-14T00:00:00+00:00",
                         "partition_id": PARTITION_ID,
                         "corpus_id": PARTITION_ID,
+                        "partition_display_name": "Podcast One",
+                        "context_type": "podcast",
+                        "workflow_profile": "podcast",
+                        "handoff_ids": ["handoff-one"],
                         "embedding_model": QWEN3_MODEL,
+                        "cache_schema_version": "2.1",
+                        "representation_profile": "baseline-v1",
+                        "episode_ids": ["episode-01", "episode-02"],
                         "episode_uids": [f"{PARTITION_ID}:episode-01", f"{PARTITION_ID}:episode-02"],
                         "processed_cache_fingerprints": ["fingerprint-1", "fingerprint-2"],
+                        "processed_cache_artifacts": [
+                            {
+                                "episode_id": f"episode-{index:02d}",
+                                "episode_uid": f"{PARTITION_ID}:episode-{index:02d}",
+                                "handoff_id": "handoff-one",
+                                "relative_path": f"processed_data/cache-{index:02d}.processed_documents.json",
+                                "cache_fingerprint": f"fingerprint-{index}",
+                                "content_sha256": hashlib.sha256((partition_root / "processed_data" / f"cache-{index:02d}.processed_documents.json").read_bytes()).hexdigest(),
+                                "validation": {"status": "passed", "counts": {}, "warnings": [], "errors": []},
+                            }
+                            for index in (1, 2)
+                        ],
+                        "validation_evidence": {
+                            "status": "passed",
+                            "validator": "test",
+                            "validator_version": "test",
+                            "evidence_closure": True,
+                            "cache_count": 2,
+                            "episode_count": 2,
+                            "document_count": 0,
+                            "counts": {},
+                            "warnings": [],
+                            "errors": [],
+                        },
+                        "release_identity_fingerprint": "sha256:" + "3" * 64,
                     }
                 ),
                 encoding="utf-8",

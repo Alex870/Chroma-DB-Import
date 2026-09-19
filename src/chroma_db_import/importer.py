@@ -11,7 +11,7 @@ from typing import Any
 
 import chroma_db_import.runtime as runtime
 from chroma_db_import.config import ImportConfig, resolve_path
-from chroma_db_import.contract import content_fingerprint, file_fingerprint, has_text, sanitize_metadata, validate_document_items
+from chroma_db_import.contract import content_fingerprint, file_fingerprint, has_text, sanitize_metadata, temporal_coverage_stats, validate_document_items
 from chroma_db_import.state import write_json
 from chroma_db_import.representation import (
     RepresentationSpec,
@@ -69,8 +69,10 @@ def load_processed_documents(cache_path: Path) -> list[Document]:
         )
     return docs
 
-def validate_documents(docs: list[Document], label: str) -> None:
-    validate_document_items(docs, label).raise_for_errors(label)
+def validate_documents(docs: list[Document], label: str, *, require_temporal: bool = False, episode_uid: str = "", legacy_contract: bool = False):
+    report = validate_document_items(docs, label, require_temporal=require_temporal, episode_uid=episode_uid, legacy_contract=legacy_contract)
+    report.raise_for_errors(label)
+    return report
 
 def document_id(doc: Document) -> str:
     metadata = doc.metadata or {}
@@ -378,7 +380,27 @@ class ChromaImporter:
                 raise DeduplicationError("dedup plan representation does not match effective import configuration")
         docs = load_processed_documents(cache_path)
         payload = load_processed_payload(cache_path)
-        validate_documents(docs, str(cache_path))
+        for doc in docs:
+            if payload.get("episode_uid"):
+                doc.metadata.setdefault("episode_uid", str(payload["episode_uid"]))
+            if payload.get("episode_id"):
+                doc.metadata.setdefault("episode_id", str(payload["episode_id"]))
+        document_validation = validate_documents(
+            docs,
+            str(cache_path),
+            require_temporal=self.config.temporal_validation_mode == "certified",
+            episode_uid=str(payload.get("episode_uid") or ""),
+            legacy_contract=str(payload.get("schema_version") or "2.0") != "2.1" and not any(
+                payload.get(field_name) not in (None, "")
+                for field_name in ("temporal_capability", "temporal_coverage", "temporal_coverage_sha256")
+            ),
+        )
+        declared_temporal = payload.get("temporal_coverage")
+        declared_hash = str(payload.get("temporal_coverage_sha256") or "").removeprefix("sha256:")
+        if isinstance(declared_temporal, dict) and declared_hash:
+            actual_hash = hashlib.sha256(json.dumps(document_validation.temporal_coverage, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+            if actual_hash != declared_hash:
+                raise ValueError(f"{cache_path} temporal coverage does not match its documents")
         docs = [doc for doc in docs if has_text(doc.page_content) and should_include_document(doc, self.config)]
         source_cache = cache_path.name if self.config.portable_artifacts else str(cache_path.resolve())
         episode_id = str((docs[0].metadata if docs else {}).get("episode_id") or payload.get("episode_id") or cache_path.stem)
@@ -518,6 +540,7 @@ class ChromaImporter:
             staged_embeddings,
             expected_dimension=self.embedding_dimension,
             retrieval_ids=staged_ids[:1],
+            require_temporal=self.config.temporal_validation_mode == "certified",
         )
         report = {
             "operation_id": operation,

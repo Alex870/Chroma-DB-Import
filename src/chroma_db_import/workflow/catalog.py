@@ -15,7 +15,7 @@ class CatalogError(RuntimeError):
     pass
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 
 
 def _json(value: Any) -> str:
@@ -77,7 +77,7 @@ class AppCatalog:
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL, stage TEXT NOT NULL,
                     database_id TEXT, preview_id TEXT, payload_json TEXT NOT NULL,
-                    result_json TEXT, error_json TEXT, can_cancel INTEGER NOT NULL DEFAULT 0,
+                    result_json TEXT, error_json TEXT, progress_json TEXT NOT NULL DEFAULT '{}', can_cancel INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS jobs_preview_unique
@@ -99,11 +99,44 @@ class AppCatalog:
                     id TEXT PRIMARY KEY, root TEXT NOT NULL UNIQUE, catalog_path TEXT NOT NULL,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS source_observations (
+                    connection_id TEXT NOT NULL, partition_id TEXT NOT NULL, upstream_release_id TEXT NOT NULL,
+                    source_root TEXT NOT NULL, corpus_id TEXT NOT NULL, status TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0, snapshot_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL, PRIMARY KEY(connection_id, partition_id, upstream_release_id)
+                );
+                CREATE INDEX IF NOT EXISTS source_observations_context_idx
+                    ON source_observations(connection_id, partition_id, observed_at DESC);
+                CREATE TABLE IF NOT EXISTS database_links (
+                    database_id TEXT PRIMARY KEY, connection_id TEXT NOT NULL, partition_id TEXT NOT NULL,
+                    corpus_id TEXT NOT NULL, source_root TEXT NOT NULL, target_key TEXT NOT NULL,
+                    profile_fingerprint TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL,
+                    state TEXT NOT NULL, last_source_release_id TEXT,
+                    last_downstream_release_id TEXT, selected INTEGER NOT NULL DEFAULT 0,
+                    detail_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS database_links_context_idx
+                    ON database_links(connection_id, partition_id, state);
+                CREATE TABLE IF NOT EXISTS database_release_history (
+                    id TEXT PRIMARY KEY, database_id TEXT NOT NULL, connection_id TEXT NOT NULL,
+                    partition_id TEXT NOT NULL, upstream_release_id TEXT,
+                    downstream_release_id TEXT, operation TEXT NOT NULL, status TEXT NOT NULL,
+                    detail_json TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS database_release_history_db_idx
+                    ON database_release_history(database_id, created_at DESC);
                 """
             )
             columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(databases)").fetchall()}
             if "execution_options_json" not in columns:
                 connection.execute("ALTER TABLE databases ADD COLUMN execution_options_json TEXT NOT NULL DEFAULT '{\"embedding_device\":\"auto\"}'")
+            job_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "progress_json" not in job_columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
+            database_link_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(database_links)").fetchall()}
+            if "selected" not in database_link_columns:
+                connection.execute("ALTER TABLE database_links ADD COLUMN selected INTEGER NOT NULL DEFAULT 0")
             row = connection.execute("SELECT value FROM catalog_meta WHERE key='schema_version'").fetchone()
             current = int(row[0]) if row and str(row[0]).isdigit() else 0
             if current > SCHEMA_VERSION:
@@ -134,6 +167,17 @@ class AppCatalog:
         if not row:
             raise BridgeError("IDENTITY_UNRESOLVED", f"Database {database_id} is not registered.")
         return self._record(row).as_dict()
+
+    def get_database_by_target(self, target: str, *, include_archived: bool = True) -> dict[str, Any] | None:
+        """Return the library entry that owns a normalized destination, if any."""
+        target_key = normalize_target(target)
+        with self._connection() as connection:
+            query = "SELECT * FROM databases WHERE target_key=?"
+            values: tuple[Any, ...] = (target_key,)
+            if not include_archived:
+                query += " AND archived=0"
+            row = connection.execute(query, values).fetchone()
+        return self._record(row).as_dict() if row else None
 
     def create_database(self, value: Mapping[str, Any]) -> dict[str, Any]:
         record = DatabaseRecord.from_mapping(value)
@@ -231,6 +275,224 @@ class AppCatalog:
             connection.commit()
         return next(item for item in self.list_source_connections(include_archived=True) if item["id"] == connection_id)
 
+    def save_source_observation(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist the latest read-only observation of one upstream release."""
+        connection_id = str(value.get("connection_id") or "").strip()
+        partition_id = str(value.get("partition_id") or "").strip()
+        release_id = str(value.get("upstream_release_id") or "").strip()
+        if not connection_id or not partition_id or not release_id:
+            raise BridgeError("VALIDATION_FAILED", "Source observation identity is incomplete.")
+        observed_at = str(value.get("observed_at") or utc_now())
+        snapshot = dict(value.get("snapshot") or {})
+        if value.get("error") and "error" not in snapshot:
+            snapshot["error"] = str(value.get("error"))
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """INSERT INTO source_observations(
+                    connection_id, partition_id, upstream_release_id, source_root, corpus_id,
+                    status, active, snapshot_json, observed_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(connection_id, partition_id, upstream_release_id) DO UPDATE SET
+                    source_root=excluded.source_root, corpus_id=excluded.corpus_id,
+                    status=excluded.status, active=excluded.active,
+                    snapshot_json=excluded.snapshot_json, observed_at=excluded.observed_at""",
+                (
+                    connection_id, partition_id, release_id,
+                    str(value.get("source_root") or ""), str(value.get("corpus_id") or ""),
+                    str(value.get("status") or "unknown"), int(bool(value.get("active"))),
+                    _json(snapshot), observed_at,
+                ),
+            )
+            connection.commit()
+        return {
+            "connection_id": connection_id,
+            "partition_id": partition_id,
+            "upstream_release_id": release_id,
+            "source_root": str(value.get("source_root") or ""),
+            "corpus_id": str(value.get("corpus_id") or ""),
+            "status": str(value.get("status") or "unknown"),
+            "active": bool(value.get("active")),
+            "source_fingerprint": snapshot.get("source_fingerprint"),
+            "readiness": snapshot.get("context_status") or {},
+            "error": snapshot.get("error"),
+            "snapshot": snapshot,
+            "observed_at": observed_at,
+        }
+
+    def list_source_observations(self, *, connection_id: str | None = None, partition_id: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if connection_id:
+            clauses.append("connection_id=?")
+            values.append(str(connection_id))
+        if partition_id:
+            clauses.append("partition_id=?")
+            values.append(str(partition_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM source_observations{where} ORDER BY observed_at DESC, upstream_release_id DESC",
+                values,
+            ).fetchall()
+        return [
+            {
+                "connection_id": row["connection_id"], "partition_id": row["partition_id"],
+                "upstream_release_id": row["upstream_release_id"], "source_root": row["source_root"],
+                "corpus_id": row["corpus_id"], "status": row["status"], "active": bool(row["active"]),
+                "source_fingerprint": json.loads(row["snapshot_json"]).get("source_fingerprint"),
+                "readiness": json.loads(row["snapshot_json"]).get("context_status") or {},
+                "error": json.loads(row["snapshot_json"]).get("error"),
+                "snapshot": json.loads(row["snapshot_json"]), "observed_at": row["observed_at"],
+            }
+            for row in rows
+        ]
+
+    def save_database_link(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        database_id = str(value.get("database_id") or "").strip()
+        connection_id = str(value.get("connection_id") or "").strip()
+        partition_id = str(value.get("partition_id") or "").strip()
+        if not database_id or not connection_id or not partition_id:
+            raise BridgeError("VALIDATION_FAILED", "Database link identity is incomplete.")
+        existing = self.get_database_link(database_id)
+        created_at = str(existing.get("created_at") if existing else value.get("created_at") or utc_now())
+        updated_at = str(value.get("updated_at") or utc_now())
+        detail = dict(value.get("detail") or {})
+        selected = bool(value.get("selected", existing.get("selected", False) if existing else False))
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """INSERT INTO database_links(
+                    database_id, connection_id, partition_id, corpus_id, source_root, target_key,
+                    profile_fingerprint, origin, state, last_source_release_id,
+                    last_downstream_release_id, selected, detail_json, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(database_id) DO UPDATE SET
+                    connection_id=excluded.connection_id, partition_id=excluded.partition_id,
+                    corpus_id=excluded.corpus_id, source_root=excluded.source_root,
+                    target_key=excluded.target_key, profile_fingerprint=excluded.profile_fingerprint,
+                    origin=excluded.origin, state=excluded.state,
+                    last_source_release_id=excluded.last_source_release_id,
+                    last_downstream_release_id=excluded.last_downstream_release_id,
+                    selected=excluded.selected, detail_json=excluded.detail_json, updated_at=excluded.updated_at""",
+                (
+                    database_id, connection_id, partition_id, str(value.get("corpus_id") or ""),
+                    str(value.get("source_root") or ""), str(value.get("target_key") or ""),
+                    str(value.get("profile_fingerprint") or ""), str(value.get("origin") or "existing"),
+                    str(value.get("state") or "linked"),
+                    str(value.get("last_source_release_id") or "") or None,
+                    str(value.get("last_downstream_release_id") or "") or None,
+                    int(selected), _json(detail), created_at, updated_at,
+                ),
+            )
+            connection.commit()
+        return self.get_database_link(database_id) or {}
+
+    def select_database_link(self, *, database_id: str, connection_id: str, partition_id: str) -> dict[str, Any]:
+        """Select exactly one linked database as the update destination.
+
+        A partition may retain more than one explicit link for discovery and
+        history, but supplementing must have one persisted destination. The
+        selection is catalog state; it never changes the database files.
+        """
+        database_id = str(database_id or "").strip()
+        connection_id = str(connection_id or "").strip()
+        partition_id = str(partition_id or "").strip()
+        if not database_id or not connection_id or not partition_id:
+            raise BridgeError("VALIDATION_FAILED", "database_id, connection_id, and partition_id are required.")
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT connection_id, partition_id FROM database_links WHERE database_id=?",
+                (database_id,),
+            ).fetchone()
+            if not row:
+                raise BridgeError("IDENTITY_UNRESOLVED", "The selected database is not explicitly linked to this partition.")
+            if str(row["connection_id"]) != connection_id or str(row["partition_id"]) != partition_id:
+                raise BridgeError("IDENTITY_UNRESOLVED", "The selected database is linked to a different source partition.")
+            connection.execute(
+                "UPDATE database_links SET selected=0, updated_at=? WHERE connection_id=? AND partition_id=?",
+                (now, connection_id, partition_id),
+            )
+            connection.execute(
+                "UPDATE database_links SET selected=1, updated_at=? WHERE database_id=?",
+                (now, database_id),
+            )
+            connection.commit()
+        return self.get_database_link(database_id) or {}
+
+    def get_database_link(self, database_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM database_links WHERE database_id=?", (str(database_id),)).fetchone()
+        if not row:
+            return None
+        return self._database_link_from_row(row)
+
+    @staticmethod
+    def _database_link_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "database_id": row["database_id"], "connection_id": row["connection_id"],
+            "partition_id": row["partition_id"], "corpus_id": row["corpus_id"],
+            "source_root": row["source_root"], "target_key": row["target_key"],
+            "profile_fingerprint": row["profile_fingerprint"], "origin": row["origin"],
+            "state": row["state"], "last_source_release_id": row["last_source_release_id"],
+            "last_downstream_release_id": row["last_downstream_release_id"],
+            "selected": bool(row["selected"]),
+            "detail": json.loads(row["detail_json"]), "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_database_links(self, *, connection_id: str | None = None, partition_id: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if connection_id:
+            clauses.append("connection_id=?")
+            values.append(str(connection_id))
+        if partition_id:
+            clauses.append("partition_id=?")
+            values.append(str(partition_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connection() as connection:
+            rows = connection.execute(f"SELECT * FROM database_links{where} ORDER BY updated_at DESC, database_id", values).fetchall()
+        return [self._database_link_from_row(row) for row in rows]
+
+    def save_database_release_event(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        event = {
+            "id": str(value.get("id") or new_id("release_event")),
+            "database_id": str(value.get("database_id") or ""),
+            "connection_id": str(value.get("connection_id") or ""),
+            "partition_id": str(value.get("partition_id") or ""),
+            "upstream_release_id": str(value.get("upstream_release_id") or "") or None,
+            "downstream_release_id": str(value.get("downstream_release_id") or "") or None,
+            "operation": str(value.get("operation") or "unknown"),
+            "status": str(value.get("status") or "unknown"),
+            "detail": dict(value.get("detail") or {}),
+            "created_at": str(value.get("created_at") or utc_now()),
+        }
+        if not event["database_id"] or not event["connection_id"] or not event["partition_id"]:
+            raise BridgeError("VALIDATION_FAILED", "Database release history identity is incomplete.")
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO database_release_history(id,database_id,connection_id,partition_id,upstream_release_id,downstream_release_id,operation,status,detail_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (event["id"], event["database_id"], event["connection_id"], event["partition_id"], event["upstream_release_id"], event["downstream_release_id"], event["operation"], event["status"], _json(event["detail"]), event["created_at"]),
+            )
+            connection.commit()
+        return event
+
+    def list_database_release_history(self, database_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM database_release_history WHERE database_id=? ORDER BY created_at DESC LIMIT ?",
+                (str(database_id), max(1, min(int(limit), 500))),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"], "database_id": row["database_id"], "connection_id": row["connection_id"],
+                "partition_id": row["partition_id"], "upstream_release_id": row["upstream_release_id"],
+                "downstream_release_id": row["downstream_release_id"], "operation": row["operation"],
+                "status": row["status"], "detail": json.loads(row["detail_json"]), "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
     def save_draft(self, payload: Mapping[str, Any], *, draft_id: str | None = None, database_id: str | None = None) -> dict[str, Any]:
         identifier = draft_id or new_id("draft")
         with self._lock, self._connection() as connection:
@@ -269,22 +531,39 @@ class AppCatalog:
             raise BridgeError("IDENTITY_UNRESOLVED", f"Preview {preview_id} is not available.")
         return json.loads(row[0])
 
-    def create_or_get_job(self, *, kind: str, database_id: str | None, preview_id: str | None, payload: Mapping[str, Any], can_cancel: bool = False) -> dict[str, Any]:
+    def create_or_get_job(self, *, kind: str, database_id: str | None, preview_id: str | None, payload: Mapping[str, Any], can_cancel: bool = False, retry_failed: bool = False) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
             if preview_id:
                 existing = connection.execute("SELECT * FROM jobs WHERE preview_id=? AND kind='import'", (preview_id,)).fetchone()
                 if existing:
+                    if retry_failed and str(existing["state"]) == "failed":
+                        now = utc_now()
+                        connection.execute(
+                            "UPDATE jobs SET state='queued',stage='checking',result_json=NULL,error_json=NULL,progress_json=?,started_at=NULL,completed_at=NULL WHERE id=?",
+                            (_json({"stage": "checking", "message": "Queued for retry", "percent": 0}), existing["id"]),
+                        )
+                        connection.execute(
+                            "INSERT INTO job_events VALUES(?,?,?,?,?,?)",
+                            (existing["id"], self._next_event_sequence(connection, str(existing["id"])), "checking", "Queued for retry", "{}", now),
+                        )
+                        connection.commit()
+                        existing = connection.execute("SELECT * FROM jobs WHERE id=?", (existing["id"],)).fetchone()
                     return self._job_from_row(existing)
             identifier = new_id("job")
             now = utc_now()
             connection.execute(
-                "INSERT INTO jobs(id,kind,state,stage,database_id,preview_id,payload_json,result_json,error_json,can_cancel,created_at,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (identifier, kind, "queued", "checking", database_id, preview_id, _json(dict(payload)), None, None, int(can_cancel), now, None, None),
+                "INSERT INTO jobs(id,kind,state,stage,database_id,preview_id,payload_json,result_json,error_json,progress_json,can_cancel,created_at,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (identifier, kind, "queued", "checking", database_id, preview_id, _json(dict(payload)), None, None, _json({"stage": "checking", "message": "Queued", "percent": 0}), int(can_cancel), now, None, None),
             )
             connection.execute("INSERT INTO job_events VALUES(?,?,?,?,?,?)", (identifier, 1, "checking", "Queued", "{}", now))
             connection.commit()
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (identifier,)).fetchone()
             return self._job_from_row(row)
+
+    @staticmethod
+    def _next_event_sequence(connection: sqlite3.Connection, job_id: str) -> int:
+        row = connection.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM job_events WHERE job_id=?", (job_id,)).fetchone()
+        return int(row[0] or 1)
 
     def get_job_for_preview(self, preview_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
@@ -293,7 +572,7 @@ class AppCatalog:
 
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> dict[str, Any]:
-        return JobRecord(id=row["id"], kind=row["kind"], state=row["state"], stage=row["stage"], database_id=row["database_id"], preview_id=row["preview_id"], created_at=row["created_at"], started_at=row["started_at"], completed_at=row["completed_at"], can_cancel=bool(row["can_cancel"]), result=json.loads(row["result_json"]) if row["result_json"] else None, error=json.loads(row["error_json"]) if row["error_json"] else None).as_dict()
+        return JobRecord(id=row["id"], kind=row["kind"], state=row["state"], stage=row["stage"], database_id=row["database_id"], preview_id=row["preview_id"], created_at=row["created_at"], started_at=row["started_at"], completed_at=row["completed_at"], can_cancel=bool(row["can_cancel"]), result=json.loads(row["result_json"]) if row["result_json"] else None, error=json.loads(row["error_json"]) if row["error_json"] else None, progress=json.loads(row["progress_json"]) if row["progress_json"] else None).as_dict()
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self._connection() as connection:
@@ -317,7 +596,7 @@ class AppCatalog:
             rows = connection.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
         return [self._job_from_row(row) for row in rows]
 
-    def update_job(self, job_id: str, *, state: str | None = None, stage: str | None = None, result: Mapping[str, Any] | None = None, error: Mapping[str, Any] | None = None, can_cancel: bool | None = None) -> dict[str, Any]:
+    def update_job(self, job_id: str, *, state: str | None = None, stage: str | None = None, result: Mapping[str, Any] | None = None, error: Mapping[str, Any] | None = None, can_cancel: bool | None = None, progress: Mapping[str, Any] | None = None) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
@@ -326,7 +605,7 @@ class AppCatalog:
             next_stage = stage or row["stage"]
             started = row["started_at"] or (utc_now() if next_state == "running" else None)
             completed = row["completed_at"] or (utc_now() if next_state in JobRecord.STATES - {"queued", "running"} else None)
-            connection.execute("UPDATE jobs SET state=?,stage=?,started_at=?,completed_at=?,result_json=?,error_json=?,can_cancel=? WHERE id=?", (next_state, next_stage, started, completed, _json(result) if result is not None else row["result_json"], _json(error) if error is not None else row["error_json"], int(can_cancel if can_cancel is not None else bool(row["can_cancel"])), job_id))
+            connection.execute("UPDATE jobs SET state=?,stage=?,started_at=?,completed_at=?,result_json=?,error_json=?,progress_json=?,can_cancel=? WHERE id=?", (next_state, next_stage, started, completed, _json(result) if result is not None else row["result_json"], _json(error) if error is not None else row["error_json"], _json(progress) if progress is not None else row["progress_json"], int(can_cancel if can_cancel is not None else bool(row["can_cancel"])), job_id))
             connection.commit()
             return self.get_job(job_id)
 
@@ -346,7 +625,17 @@ class AppCatalog:
             row = connection.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM job_events WHERE job_id=?", (job_id,)).fetchone()
             sequence = int(row[0])
             connection.execute("INSERT INTO job_events VALUES(?,?,?,?,?,?)", (job_id, sequence, stage, message, _json(dict(data or {})), utc_now()))
-            connection.execute("UPDATE jobs SET stage=? WHERE id=?", (stage, job_id))
+            detail = dict(data or {})
+            current = detail.get("current")
+            total = detail.get("total")
+            percent: float | None = None
+            try:
+                if total is not None and float(total) > 0 and current is not None:
+                    percent = round(max(0.0, min(100.0, float(current) / float(total) * 100.0)), 1)
+            except (TypeError, ValueError):
+                percent = None
+            progress = {"stage": stage, "message": message, "current": current, "total": total, "percent": percent, "updated_at": utc_now()}
+            connection.execute("UPDATE jobs SET stage=?,progress_json=? WHERE id=?", (stage, _json(progress), job_id))
             connection.commit()
         return {"job_id": job_id, "sequence": sequence, "stage": stage, "message": message, "data": dict(data or {})}
 

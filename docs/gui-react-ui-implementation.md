@@ -481,8 +481,10 @@ Create/Update entry callbacks.
 2. Implement action priority in design §7.2 using returned capabilities and current jobs.
 3. Refresh never publishes. Prepare calls publish explicitly, then discovers using
    the same authoritative catalog and returns the exact release ID.
-4. Create/review payload uses `source_ref.upstream_release_id` from that result.
-   No database invokes prefilled Create; existing database invokes current Update review.
+4. A partition row invokes the existing Create route with an additive
+   `creation_defaults` context payload; `source_ref.upstream_release_id` comes from
+   the selected latest valid release. Existing databases continue to invoke the
+   current Update review.
 5. Preserve prepared release on preview failure. Retry review never republishes.
 6. Pending producer work shows recovery guidance; do not add a fake Resume.
 7. Keep newer ready release import available when later producer processing is pending.
@@ -490,6 +492,45 @@ Create/Update entry callbacks.
 **Verify:** inspect has no producer mutation; prepare cannot auto-apply; release changes
 between prepare and review do not substitute latest; existing retained-record blocker
 is preserved; no-context/no-release/preview-failure states have recovery.
+
+### Contextual managed-partition creation (design change 2026-09-13)
+
+Implement this as an additive extension of the P10/P11 contract; do not add a
+second import execution path.
+
+1. Add typed `creation_defaults` to reconciled context data. It must carry the
+   managed source identity, latest valid release, nonblank display name, effective
+   `selection_policy`, `execution_options`, read-only representation/profile
+   identity, target `{path, managed_output_root}`, and per-value provenance.
+2. Resolve the managed output root by partition/context
+   `output_root`/`managed_output_root`, then application
+   `creation_defaults.output_parent`, then `<source_root>/exports`. Propose the
+   exact `<output_root>/partitions/<partition_id>` target and preserve both root
+   and full target in draft and preview payloads.
+3. Render one accessible create action per eligible Available-partition row;
+   keep the header action for unscoped folder creation, preserve linked update/
+   review actions, and render blocking reasons for unready rows.
+4. Reuse `onCreateFromContext`, the existing three-step wizard, draft persistence,
+   preview job and apply pipeline. Source root and partition ID edits clear the
+   readiness/release snapshot and require managed inspection; name, target,
+   selection and execution edits invalidate only dependent review/draft state.
+5. Treat managed `target.path` as the exact partition target. Validate its
+   canonical `partitions/<partition-id>` suffix and the matching
+   `managed_output_root` pair inline and in the adapter. Never silently nest an
+   already-partitioned target a second time. Keep legacy records without the new
+   root field readable.
+6. Review must show source identity, selected release, effective profile/device,
+   selection policy, exact target and import effects. Existing-target handling is
+   choose another location or register existing; it never overwrites.
+
+**Verify:** two or more discovered partitions expose distinct accessible create
+actions; each opens a fully populated scoped wizard; partition/application/fallback
+output precedence is correct; edited identity requires a fresh inspection; editable
+valid values reach the preview; preview includes the selected release, effective
+settings, exact target and managed root; long names/paths wrap at 960px; keyboard
+focus and button names are accessible; folder-based creation and non-destructive
+collision/stale-preview behavior remain unchanged. Add focused React/Playwright and
+reconciliation/adapter tests before marking the change complete.
 
 ### P11 — Managed defaults and real modern selection semantics
 

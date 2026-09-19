@@ -22,6 +22,7 @@ from .deduplication import (
     resolve_dedup_policy,
     sha256_digest,
 )
+from .contract import temporal_coverage_stats, temporal_record_eligibility
 
 
 class DedupArtifactError(DeduplicationError):
@@ -135,6 +136,7 @@ def write_dedup_artifacts(
     if policy["profile"] == "off":
         return {"enabled": False, "artifacts": []}
     rows = [portable_occurrence(plan.decisions[item_id], plan.inputs[item_id]) for item_id in sorted(plan.inputs)]
+    temporal_coverage = temporal_coverage_stats([row.get("producer_metadata") or {} for row in rows])
     ledger_bytes = b"".join(_json_bytes(row) for row in rows)
     ledger_path = export_root / "dedup_occurrences.jsonl"
     _write_atomic(ledger_path, ledger_bytes)
@@ -163,6 +165,8 @@ def write_dedup_artifacts(
         "occurrence_ledger": {"path": "dedup_occurrences.jsonl", "sha256": ledger_hash, "row_count": len(rows)},
         "runtime": _portable(dict(runtime_counts or {})),
         "required_capabilities": [DEDUP_CAPABILITY],
+        "temporal_capability": temporal_coverage.get("temporal_capability", "legacy"),
+        "temporal_coverage": temporal_coverage,
     }
     manifest_bytes = _json_bytes(manifest, indent=2)
     manifest_path = export_root / "dedup_manifest.json"
@@ -360,6 +364,8 @@ def validate_dedup_artifacts(
         if not isinstance(row["page_content"], str) or not isinstance(row["producer_metadata"], Mapping):
             raise DedupArtifactError("dedup occurrence content or producer metadata has an invalid type")
         _validate_portable_value(row["producer_metadata"])
+        if str(release.get("temporal_capability") or "legacy") == "certified" and not temporal_record_eligibility(dict(row["producer_metadata"]), episode_uid=str(row.get("episode_uid") or ""))["eligible"]:
+            raise DedupArtifactError("certified temporal release contains an ineligible occurrence")
     row_ids = {row["document_id"] for row in rows}
     if any(not item for item in row_ids) or len(rows) != manifest.get("occurrence_ledger", {}).get("row_count"):
         raise DedupArtifactError("dedup ledger row inventory mismatch")

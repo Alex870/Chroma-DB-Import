@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .redundancy_judge import validate_judgment
 from .redundancy_models import AnalysisUnit, CandidatePair, Judgment
@@ -215,6 +215,7 @@ def run_bounded_judgments(
     cancel_check: Any | None = None,
     cache: JudgmentCache | None = None,
     cache_keys: list[str] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     if len(requests) != len(candidate_ids):
         raise LocalJudgeError("judge request and candidate counts differ")
@@ -229,6 +230,8 @@ def run_bounded_judgments(
     if max_calls == 0:
         return {"status": "zero_budget", "judgments": judgments, "calls": calls, "elapsed_seconds": 0.0, "token_usage": None, "call_records": call_records}
     status = "completed"
+    if progress_callback:
+        progress_callback(0, len(requests), "Starting bounded judge calls.")
     for index, request in enumerate(requests):
         if calls >= max_calls:
             status = "completed_partial"
@@ -260,6 +263,8 @@ def run_bounded_judgments(
                 judgments.append(checked.as_dict())
                 cached_usage = cached.get("usage")
                 call_records.append({"candidate_id": candidate_ids[index], "elapsed_seconds": 0.0, "token_usage": cached_usage if isinstance(cached_usage, Mapping) else None, "cache_hit": True, "status": "cached", "request_bytes": request.get("_request_bytes"), "removed_neighbors": request.get("_removed_neighbors", 0)})
+                if progress_callback:
+                    progress_callback(index + 1, len(requests), f"Reused judge result {index + 1} of {len(requests)}.")
                 continue
         call_started = time.monotonic()
         judgment = client.request_judgment(request, candidate_id=candidate_ids[index], supplied_units=supplied_units, pair=(pairs[index] if pairs and index < len(pairs) else None), allowed_matched_ids=allowed_matched_ids)
@@ -268,6 +273,8 @@ def run_bounded_judgments(
         usage = dict(client.last_usage) if isinstance(client.last_usage, Mapping) else None
         judgments.append(judgment.as_dict())
         call_records.append({"candidate_id": candidate_ids[index], "elapsed_seconds": round(elapsed, 6), "token_usage": usage, "cache_hit": False, "status": judgment.relation, "request_bytes": request.get("_request_bytes"), "removed_neighbors": request.get("_removed_neighbors", 0)})
+        if progress_callback:
+            progress_callback(index + 1, len(requests), f"Completed judge call {index + 1} of {len(requests)}.")
         if cache and key:
             cache.put(key, judgment, usage=usage)
         if time.monotonic() - call_started >= client.timeout:

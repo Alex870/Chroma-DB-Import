@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 import chroma_db_import.runtime as runtime
 from chroma_db_import.config import ImportConfig
-from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, has_text, partition_identities, sanitize_metadata, summarize_reports, validate_document_items, validate_podcast_metadata
+from chroma_db_import.contract import IMPORTER_VERSION, build_import_manifest, content_fingerprint, has_text, partition_identities, sanitize_metadata, summarize_reports, temporal_coverage_stats, validate_document_items, validate_podcast_metadata
 from chroma_db_import.importer import cache_fingerprint, validate_documents, document_fingerprints, representation_spec, detect_embedding_dimension
 from chroma_db_import.providers import create_embedding_provider, preflight_embedding_memory
 from chroma_db_import.reconciliation import ReconciliationPlan, plan_reconciliation, require_delete_confirmation, source_identity
@@ -40,6 +40,7 @@ def _plan_config(plan: ImportPlan, *, device: str | None = None) -> ImportConfig
         contextualization=plan.contextualization,
         asset_filter=plan.asset_filter,
         asset_pattern=plan.asset_pattern,
+        temporal_validation_mode=plan.temporal_validation_mode,
     )
 
 
@@ -384,7 +385,7 @@ def _export_chroma_locked(
             continue
 
         selected = select_documents_for_episode(episode, plan.included_speakers_by_episode)
-        validate_documents([Document(page_content=doc.page_content, metadata=doc.metadata) for doc in selected], str(episode.path))
+        validate_documents([Document(page_content=doc.page_content, metadata=doc.metadata) for doc in selected], str(episode.path), require_temporal=plan.temporal_validation_mode == "certified", episode_uid=str(getattr(episode, "episode_uid", "") or episode.episode_id), legacy_contract=str(episode.schema_version or "1.0") != "2.1")
         documents = []
         source_cache = str((episode.source_file_path or episode.path).resolve())
         for doc in selected:
@@ -476,6 +477,8 @@ def _export_chroma_locked(
         staged_embeddings,
         expected_dimension=embedding_dimension,
         retrieval_ids=staged_ids[:1],
+        require_temporal=plan.temporal_validation_mode == "certified",
+        legacy_contract=any(str(episode.schema_version or "1.0") != "2.1" for episode in plan.episodes),
     )
     if staged_ids:
         smoke = vectorstore._collection.query(query_embeddings=[staged_embeddings[0]], n_results=1, include=[])
@@ -500,6 +503,13 @@ def _export_chroma_locked(
         )
     total_documents = sum(int(item.get("document_count") or 0) for item in all_episode_entries)
     total_collection_documents = total_documents + topic_profile_count
+    try:
+        collection_payload = vectorstore._collection.get(include=["metadatas"])
+        temporal_coverage = temporal_coverage_stats(collection_payload.get("metadatas") or [])
+    except Exception:
+        temporal_coverage = staging_validation.temporal_coverage
+    if plan.temporal_validation_mode == "certified" and temporal_coverage.get("temporal_capability") != "certified":
+        raise ValueError("Certified export contains records without complete temporal metadata")
     emit_progress(ImportProgress("Writing podcast metadata...", processed_documents, total_documents_to_import))
     write_podcast_metadata(
         plan,
@@ -514,6 +524,8 @@ def _export_chroma_locked(
         topic_profile_count=topic_profile_count,
         representation_id=spec.representation_id,
         representation=spec.as_dict(),
+        temporal_capability=temporal_coverage.get("temporal_capability", "legacy"),
+        temporal_coverage=temporal_coverage,
     )
     metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata_report = validate_podcast_metadata(metadata_payload)
@@ -555,6 +567,8 @@ def _export_chroma_locked(
         selected_speakers=sorted({speaker for speakers in plan.included_speakers_by_episode.values() for speaker in speakers}),
         compatibility_warnings=metadata_report.warnings,
         partition_identity=(preflight.get("partition_isolation") or {}).get("partition") or None,
+        temporal_capability=temporal_coverage.get("temporal_capability", "legacy"),
+        temporal_coverage=temporal_coverage,
     )
     manifest["representation"] = spec.as_dict()
     manifest["representation_id"] = spec.representation_id
@@ -668,7 +682,7 @@ def build_ui_validation_report(plan: ImportPlan) -> dict[str, Any]:
     for episode in plan.episodes:
         selected = select_documents_for_episode(episode, plan.included_speakers_by_episode)
         docs = [DocumentLike(doc.page_content, doc.metadata) for doc in selected]
-        report = validate_document_items(docs, str(episode.path))
+        report = validate_document_items(docs, str(episode.path), require_temporal=plan.temporal_validation_mode == "certified", episode_uid=str(getattr(episode, "episode_uid", "") or episode.episode_id), legacy_contract=str(episode.schema_version or "1.0") != "2.1")
         raw_reports.append({"path": str(episode.path), "report": report})
         files.append({"path": str(episode.path), **report.as_dict()})
         warnings.extend(report.warnings)
@@ -879,6 +893,7 @@ def episode_metadata_entry(
 ) -> dict[str, Any]:
     speakers = sorted({speaker for doc in selected for speaker in document_speakers(doc.metadata)})
     source_content = episode.source_content_fingerprint or episode.fingerprint
+    episode_scope = str((episode.partition_identity or {}).get("partition_id") or (episode.partition_identity or {}).get("corpus_id") or "")
     entry = {
         "source_file": str(episode.source_file_path or episode.path),
         "source_fingerprint": episode.fingerprint,
@@ -892,8 +907,10 @@ def episode_metadata_entry(
             content_hash=source_content,
         ),
         "episode_id": episode.episode_id,
+        "episode_uid": f"{episode_scope}:{episode.episode_id}" if episode_scope else episode.episode_id,
         "episode_title": episode.title,
         "episode_date": episode.episode_date,
+        "episode_sort_key": str(episode.episode_date or "").replace("-", ""),
         "document_count": len(selected) if document_count is None else document_count,
         "speakers": [{"id": slugify(speaker), "name": speaker} for speaker in speakers],
         "imported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1093,6 +1110,11 @@ def write_topic_profile_documents(
                         "topic_kind": str(topic.get("topic_kind") or "subject"),
                         "topic_aliases": topic.get("aliases") or [],
                         "query_hints": topic.get("query_hints") or [],
+                        "primary_evidence_ids": [
+                            str(item.get("stable_document_id") or item.get("node_id") or "")
+                            for item in topic.get("evidence") or []
+                            if str(item.get("stable_document_id") or item.get("node_id") or "")
+                        ],
                     }
                 ),
             )
@@ -1123,6 +1145,8 @@ def write_podcast_metadata(
     topic_profile_count: int = 0,
     representation_id: str = "",
     representation: dict[str, Any] | None = None,
+    temporal_capability: str = "legacy",
+    temporal_coverage: dict[str, Any] | None = None,
 ) -> None:
     all_speakers = sorted(
         {
@@ -1148,6 +1172,10 @@ def write_podcast_metadata(
     partition = partition_candidates[0] if partition_candidates else {}
     spec = representation_spec(_plan_config(plan))
     representation_payload = dict(representation or spec.as_dict())
+    coverage_payload = dict(temporal_coverage or {})
+    coverage_hash = hashlib.sha256(
+        json.dumps(coverage_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
     payload = {
         "podcast_name": plan.podcast_name,
         "database_id": plan.database_id,
@@ -1187,6 +1215,9 @@ def write_podcast_metadata(
         "episodes": imported_episodes,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "generated_by": "Chroma DB Import UI",
+        "temporal_capability": temporal_capability,
+        "temporal_coverage": coverage_payload,
+        "temporal_coverage_sha256": coverage_hash,
     }
     if partition:
         payload["partition"] = dict(partition)

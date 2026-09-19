@@ -13,7 +13,7 @@ from chroma_db_import.ui_helpers import safe_folder_name
 from chroma_db_import.ui_loader import EpisodeLoader
 from chroma_db_import.ui_models import Episode, ProcessedDocument
 
-from .models import BridgeError, DatabaseRecord, FrozenPreview, PreviewEffects, SelectionPolicy, new_id, stable_hash, utc_now
+from .models import BridgeError, DatabaseRecord, ExecutionOptions, FrozenPreview, PreviewEffects, SelectionPolicy, new_id, stable_hash, utc_now
 from .selection import select_documents, speakers_for_episode
 
 
@@ -320,6 +320,7 @@ def create_folder_preview(record: DatabaseRecord | None, draft: Mapping[str, Any
     if operation == "remove_outdated":
         effects.delete_ids = requested_delete_ids
     required = ["REMOVE_OUTDATED_RECORDS"] if operation == "remove_outdated" and effects.delete_ids else []
+    execution_options = ExecutionOptions.from_mapping(draft.get("execution_options") or (record.execution_options if record else None)).as_dict()
     return FrozenPreview(
         preview_id=new_id("preview"), operation=operation, database_id=database_id, draft_id=str(draft.get("draft_id") or "") or None,
         created_at=utc_now(), settings_revision=settings_revision,
@@ -328,10 +329,11 @@ def create_folder_preview(record: DatabaseRecord | None, draft: Mapping[str, Any
             "source_path": str((draft.get("source_ref") or {}).get("path") or folder),
             "target_path": str(target),
             "selection_policy": policy.as_dict(),
+            "execution_options": execution_options,
         }),
         source_snapshot=snapshot, target_identity={**target_identity, "path": str(target), "source_hash": snapshot["hash"], "content_hash": stable_hash(existing)},
         selection_policy=policy.as_dict(), representation=representation, validation_findings=findings, effects=effects,
-        required_acknowledgments=required,
+        required_acknowledgments=required, execution_options=execution_options,
     )
 
 

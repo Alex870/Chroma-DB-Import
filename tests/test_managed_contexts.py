@@ -21,26 +21,58 @@ from chroma_db_import.managed import (
 
 
 def write_release(root: Path, partition_id: str, corpus_id: str, release_id: str, cache_fingerprint: str) -> Path:
+    partition_root = root / "partitions" / partition_id
     release_dir = root / "partitions" / partition_id / "releases"
     release_dir.mkdir(parents=True, exist_ok=True)
     path = release_dir / f"{release_id}.release.json"
+    cache_paths = sorted((partition_root / "processed_data").glob("*.processed_documents.json"))
+    cache_path = cache_paths[0] if cache_paths else partition_root / "processed_data" / "cache.processed_documents.json"
+    relative_cache_path = cache_path.relative_to(partition_root).as_posix()
+    content_sha256 = hashlib.sha256(cache_path.read_bytes()).hexdigest() if cache_path.is_file() else "0" * 64
     path.write_text(
         json.dumps(
             {
-                "release_contract_version": "podcast-rag-corpus-release-v1",
+                "release_contract_version": "podcast-rag-corpus-release-v2",
                 "release_id": release_id,
+                "created_at": "2026-09-14T00:00:00+00:00",
                 "partition_id": partition_id,
                 "corpus_id": corpus_id,
                 "partition_display_name": partition_id.title(),
                 "context_type": "podcast",
                 "workflow_profile": "podcast",
                 "handoff_ids": [f"handoff-{partition_id}"],
+                "episode_ids": ["episode-01"],
                 "episode_uids": [f"{partition_id}:episode-01"],
                 "cache_schema_version": "2.1",
+                "representation_profile": "baseline-v1",
                 "embedding_model": QWEN3_MODEL,
                 "embedding_model_revision": QWEN3_MODEL_REVISION,
                 "embedding_dimension": 2560,
                 "processed_cache_fingerprints": [cache_fingerprint],
+                "processed_cache_artifacts": [
+                    {
+                        "episode_id": "episode-01",
+                        "episode_uid": f"{partition_id}:episode-01",
+                        "handoff_id": f"handoff-{partition_id}",
+                        "relative_path": relative_cache_path,
+                        "cache_fingerprint": cache_fingerprint,
+                        "content_sha256": content_sha256,
+                        "validation": {"status": "passed", "counts": {}, "warnings": [], "errors": []},
+                    }
+                ],
+                "validation_evidence": {
+                    "status": "passed",
+                    "validator": "test",
+                    "validator_version": "test",
+                    "evidence_closure": True,
+                    "cache_count": 1,
+                    "episode_count": 1,
+                    "document_count": 0,
+                    "counts": {},
+                    "warnings": [],
+                    "errors": [],
+                },
+                "release_identity_fingerprint": "sha256:" + "3" * 64,
             }
         ),
         encoding="utf-8",
@@ -136,6 +168,24 @@ class ManagedContextTests(unittest.TestCase):
                 self.assertEqual("podcast-one", catalog.context("podcast-one")["partition_id"])
             self.assertEqual("manifest.json", manifest.name)
 
+    def test_discovery_reuses_unchanged_release_metadata_from_catalog_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_release(root, "podcast-one", "podcast-one", "release-01", "cache-one")
+            catalog_path = root / "catalog.sqlite3"
+            with ManagedCatalog(catalog_path) as catalog:
+                first = discover(catalog, [root])
+                self.assertFalse(first["invalid"])
+
+            with ManagedCatalog(catalog_path) as catalog, patch(
+                "chroma_db_import.managed.validate_upstream_release",
+                side_effect=AssertionError("unchanged release should use the discovery cache"),
+            ):
+                second = discover(catalog, [root])
+
+            self.assertFalse(second["invalid"])
+            self.assertEqual("release-01", second["releases"][0]["release_id"])
+
     def test_invalid_handoff_and_non_default_mapping_are_quarantined(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -167,6 +217,7 @@ class ManagedContextTests(unittest.TestCase):
                         "source_fingerprint": "cache-one",
                         "partition_id": "podcast-one",
                         "corpus_id": "corpus-one",
+                        "episode_id": "episode-01",
                         "episode_uid": "podcast-one:episode-01",
                         "partition_display_name": "Podcast One",
                         "context_type": "podcast",
@@ -181,6 +232,20 @@ class ManagedContextTests(unittest.TestCase):
             backup_dir.mkdir(parents=True)
             shutil.copy2(cache_dir / "same-name.processed_documents.json", backup_dir / "same-name.processed_documents.json")
             release_path = write_release(root, "podcast-one", "corpus-one", "release-01", "cache-one")
+            (release_path.parent.parent / "active-release.json").write_text(
+                json.dumps(
+                    {
+                        "pointer_contract_version": "podcast-rag-active-release-v1",
+                        "partition_id": "podcast-one",
+                        "corpus_id": "corpus-one",
+                        "release_id": "release-01",
+                        "release_path": f"releases/{release_path.name}",
+                        "release_sha256": "sha256:" + hashlib.sha256(release_path.read_bytes()).hexdigest(),
+                        "updated_at": "2026-09-14T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
             registry_dir = root / "partitions"
             (registry_dir / "registry.json").write_text(
                 json.dumps({"partitions": [{"partition_id": "podcast-one", "corpus_id": "corpus-one"}]}),
@@ -195,6 +260,7 @@ class ManagedContextTests(unittest.TestCase):
                 context = catalog.context("podcast-one")
                 self.assertEqual("corpus-one", context["corpus_id"])
                 self.assertEqual("release-01", catalog.releases("podcast-one")[0]["upstream_release_id"])
+                self.assertEqual("release-01", report["active_releases"][0]["release_id"])
                 caches = resolve_release_cache_files(catalog.releases("podcast-one")[0], catalog.source_roots())
                 self.assertEqual("same-name.processed_documents.json", caches[0].name)
                 self.assertIsNone(catalog.context("podcast-two"))
@@ -203,8 +269,9 @@ class ManagedContextTests(unittest.TestCase):
     def test_mixed_cache_identity_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            cache_dir = root / "processed_data"
-            cache_dir.mkdir()
+            partition_root = root / "partitions" / "one"
+            cache_dir = partition_root / "processed_data"
+            cache_dir.mkdir(parents=True)
             for name, partition in (("one", "one"), ("two", "two")):
                 (cache_dir / f"{name}.processed_documents.json").write_text(
                     json.dumps(
@@ -212,6 +279,7 @@ class ManagedContextTests(unittest.TestCase):
                             "source_fingerprint": f"cache-{name}",
                             "partition_id": partition,
                             "corpus_id": partition,
+                            "episode_id": "episode",
                             "episode_uid": f"{partition}:episode",
                             "partition_display_name": partition,
                             "context_type": "custom",
@@ -222,23 +290,55 @@ class ManagedContextTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
+            release_path = partition_root / "releases" / "release.json"
             release = {
-                "source_path": str(root / "release.json"),
+                "source_path": str(release_path),
                 "payload": {
-                    "release_contract_version": "podcast-rag-corpus-release-v1",
+                    "release_contract_version": "podcast-rag-corpus-release-v2",
                     "release_id": "release-01",
+                    "created_at": "2026-09-14T00:00:00+00:00",
                     "partition_id": "one",
                     "corpus_id": "one",
                     "partition_display_name": "One",
                     "context_type": "custom",
                     "workflow_profile": "custom",
                     "handoff_ids": ["h"],
+                    "episode_ids": ["episode", "episode-two"],
                     "episode_uids": ["one:episode", "two:episode"],
+                    "cache_schema_version": "2.1",
+                    "representation_profile": "baseline-v1",
+                    "embedding_model": QWEN3_MODEL,
                     "processed_cache_fingerprints": ["cache-one", "cache-two"],
+                    "processed_cache_artifacts": [
+                        {
+                            "episode_id": "episode" if name == "one" else "episode-two",
+                            "episode_uid": f"{partition}:episode",
+                            "handoff_id": "h",
+                            "relative_path": f"processed_data/{name}.processed_documents.json",
+                            "cache_fingerprint": f"cache-{name}",
+                            "content_sha256": hashlib.sha256((cache_dir / f"{name}.processed_documents.json").read_bytes()).hexdigest(),
+                            "validation": {"status": "passed", "counts": {}, "warnings": [], "errors": []},
+                        }
+                        for name, partition in (("one", "one"), ("two", "two"))
+                    ],
+                    "validation_evidence": {
+                        "status": "passed",
+                        "validator": "test",
+                        "validator_version": "test",
+                        "evidence_closure": True,
+                        "cache_count": 2,
+                        "episode_count": 2,
+                        "document_count": 0,
+                        "counts": {},
+                        "warnings": [],
+                        "errors": [],
+                    },
+                    "release_identity_fingerprint": "sha256:" + "3" * 64,
                 },
             }
-            (root / "release.json").write_text("{}", encoding="utf-8")
-            with self.assertRaisesRegex(ManagedContextError, "partition/corpus"):
+            release_path.parent.mkdir(parents=True, exist_ok=True)
+            release_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ManagedContextError, "episode_uid"):
                 resolve_release_cache_files(release, [root])
 
     def test_destination_and_release_ids_are_stable_and_partition_specific(self):
@@ -253,8 +353,8 @@ class ManagedContextTests(unittest.TestCase):
     def test_managed_import_promotes_portable_identity_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            cache_dir = root / "processed_data"
-            cache_dir.mkdir()
+            cache_dir = root / "partitions" / "podcast-one" / "processed_data"
+            cache_dir.mkdir(parents=True)
             cache = cache_dir / "episode.processed_documents.json"
             cache.write_text(
                 json.dumps(

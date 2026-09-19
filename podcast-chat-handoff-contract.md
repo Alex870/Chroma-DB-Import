@@ -13,6 +13,16 @@ release identity. Chroma DB Import owns the derived vector export. PodCast Chat
 reads the validated export and uses it for retrieval and provenance; it does not
 reconstruct identity from folder names or raw cache files.
 
+## Temporal release additions
+
+Chroma exports preserve `episode_date`, `episode_sort_key`, episode identity,
+speaker scope, and provenance unchanged in dense metadata, lexical sidecars,
+and occurrence ledgers. Releases expose `temporal_capability` (`certified`,
+`partial`, or `legacy`) plus a checksummed `temporal_coverage` object. A
+certified release is promoted only when its declared coverage agrees with the
+actual collection. Legacy exports remain readable but cannot claim complete
+temporal coverage.
+
 The contract is filesystem-based in v1. An API, object-store, or packaged
 transport may be added later without changing the JSON meanings or the
 identity rules.
@@ -54,7 +64,7 @@ identity rules.
 | `corpus_id` | Immutable downstream corpus/database identity. It normally equals `partition_id`; a different value is valid only when the producer registry explicitly maps it. |
 | `episode_id` | Stable episode or meeting-recording identifier within a partition. |
 | `episode_uid` | Globally safe episode identity: `partition_id:episode_id`. |
-| Upstream release | A Podcast-RAG release with contract `podcast-rag-corpus-release-v1`. |
+| Upstream release | A Podcast-RAG release with contract `podcast-rag-corpus-release-v2`. |
 | Downstream release | A Chroma export with contract `chroma-export-release-v1`. It represents one upstream release imported with one effective importer profile. |
 | Import profile | Importer choices such as embedding model, model revision, normalization, distance metric, speaker selection, and contextualization. |
 | Representation | The complete vector/index space, including model, revision, dimension, pooling, contextualization, metric, and implementation version. |
@@ -186,7 +196,7 @@ Its v1 contract is:
 {
   "release_contract_version": "chroma-export-release-v1",
   "release_id": "chroma_release_01_baseline",
-  "upstream_release_contract_version": "podcast-rag-corpus-release-v1",
+  "upstream_release_contract_version": "podcast-rag-corpus-release-v2",
   "upstream_release_id": "release_partition_podcast_20260905_01",
   "partition": {
     "partition_id": "partition_podcast",
@@ -226,7 +236,7 @@ Its v1 contract is:
 |---|---|---|
 | `release_contract_version` | string | Must equal `chroma-export-release-v1`. |
 | `release_id` | string | Immutable downstream export identity. |
-| `upstream_release_contract_version` | string | Must equal `podcast-rag-corpus-release-v1`. |
+| `upstream_release_contract_version` | string | Must equal `podcast-rag-corpus-release-v2`. |
 | `upstream_release_id` | string | Stable source release identity. |
 | `partition` | object | Complete partition identity. |
 | `partition_id` | string | Must agree with `partition.partition_id`. |
@@ -716,7 +726,7 @@ themselves proof that a user is authorized.
 This v1 contract uses exact contract IDs:
 
 - upstream handoff: `podcast-rag-transcription-handoff-v1`;
-- upstream release: `podcast-rag-corpus-release-v1`;
+- upstream release: `podcast-rag-corpus-release-v2`;
 - downstream Chroma export: `chroma-export-release-v1`;
 - PodCast Chat consumer handoff: `podcast-chat-database-handoff-v1`.
 

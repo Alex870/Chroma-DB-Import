@@ -2,8 +2,8 @@
 
 The Chroma importer may inspect producer manifests, state, and published
 release files, but it does not execute or control the producer pipeline.
-Producer processing and release publication are separate operations owned by
-the producer repository.
+The producer repository owns both processing and release publication; its
+complete-partition menu action performs them as one operator workflow.
 """
 
 from __future__ import annotations
@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from chroma_db_import.managed import ContextIdentity, ManagedContextError
+from chroma_db_import.managed import ContextIdentity, ManagedContextError, validate_upstream_release
 
 
-UPSTREAM_RELEASE_CONTRACT = "podcast-rag-corpus-release-v1"
+UPSTREAM_RELEASE_CONTRACT = "podcast-rag-corpus-release-v2"
 SAFE_RELEASE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 
 
@@ -239,8 +239,24 @@ class PodcastRagSourceAdapter:
         processed_cache_count = len(list((self.partition_root / "processed_data").glob("*.processed_documents.json"))) if (self.partition_root / "processed_data").is_dir() else 0
         release_paths = sorted((self.partition_root / "releases").glob("*.release.json")) if (self.partition_root / "releases").is_dir() else []
         latest_release_id = ""
-        if release_paths:
-            latest_release_id = release_paths[-1].name.removesuffix(".release.json")
+        try:
+            active_release = self._active_release()
+        except PodcastRagAdapterError as exc:
+            warnings.append(str(exc))
+            active_release = None
+        if active_release:
+            latest_release_id = _text(active_release.get("release_id"))
+        elif release_paths:
+            release_candidates: list[tuple[str, str, int]] = []
+            for path in release_paths:
+                payload = _read_json(path)
+                created_at = _text(payload.get("created_at")) if isinstance(payload, dict) else ""
+                try:
+                    modified_ns = path.stat().st_mtime_ns
+                except OSError:
+                    modified_ns = 0
+                release_candidates.append((created_at, path.name, modified_ns))
+            latest_release_id = max(release_candidates, key=lambda item: (item[0], item[2], item[1]))[1].removesuffix(".release.json")
         if processed_cache_count > cache_count:
             warnings.append(
                 f"partition contains {processed_cache_count} processed caches; {cache_count} belong to the latest declared handoff"
@@ -303,7 +319,10 @@ class PodcastRagSourceAdapter:
         for path in paths:
             try:
                 payload = _read_json(path)
+                validate_upstream_release(payload)
             except PodcastRagAdapterError:
+                continue
+            except ManagedContextError:
                 continue
             release_fingerprints = {
                 _text(value).removeprefix("sha256:")
@@ -315,6 +334,32 @@ class PodcastRagSourceAdapter:
                 return {"release_id": _text(payload.get("release_id")), "release_path": str(path), "payload": payload, "reused": True}
         return None
 
+    def _active_release(self) -> dict[str, Any] | None:
+        pointer_path = self.partition_root / "active-release.json"
+        if not pointer_path.is_file():
+            return None
+        pointer = _read_json(pointer_path)
+        if pointer.get("pointer_contract_version") != "podcast-rag-active-release-v1":
+            raise PodcastRagAdapterError("producer active-release pointer uses an unsupported contract")
+        release_path = (self.partition_root / _text(pointer.get("release_path"))).resolve()
+        try:
+            release_path.relative_to(self.partition_root.resolve())
+        except ValueError as exc:
+            raise PodcastRagAdapterError("producer active-release pointer escapes the partition root") from exc
+        if not release_path.is_file():
+            raise PodcastRagAdapterError("producer active-release pointer references a missing release manifest")
+        payload = _read_json(release_path)
+        identity = validate_upstream_release(payload)
+        if _text(pointer.get("release_id")) != _text(payload.get("release_id")):
+            raise PodcastRagAdapterError("producer active-release pointer does not match its release manifest")
+        if _text(pointer.get("partition_id")) != identity.partition_id or _text(pointer.get("corpus_id")) != identity.corpus_id or identity.partition_id != self.partition_id:
+            raise PodcastRagAdapterError("producer active-release pointer identity is invalid")
+        expected_hash = _text(pointer.get("release_sha256")).removeprefix("sha256:")
+        actual_hash = hashlib.sha256(release_path.read_bytes()).hexdigest()
+        if not expected_hash or expected_hash != actual_hash:
+            raise PodcastRagAdapterError("producer active-release pointer manifest hash does not match")
+        return {"release_id": _text(payload.get("release_id")), "release_path": str(release_path), "payload": payload, "reused": True, "active": True}
+
     def publish_release(self, callback: ProgressCallback | None = None, *, release_id: str | None = None) -> dict[str, Any]:
         status = self.inspect()
         if not status.ready_to_publish:
@@ -323,6 +368,23 @@ class PodcastRagSourceAdapter:
                 f"pending={status.pending}, failed={status.failed}, interrupted={status.interrupted}, "
                 f"quarantined={status.quarantined}"
             )
+        active = self._active_release()
+        if active:
+            current_fingerprints, current_episode_uids = self._current_cache_fingerprints()
+            release_fingerprints = {
+                _text(value).removeprefix("sha256:")
+                for value in active["payload"].get("processed_cache_fingerprints") or []
+                if _text(value)
+            }
+            release_episode_uids = {
+                _text(value)
+                for value in active["payload"].get("episode_uids") or []
+                if _text(value)
+            }
+            if release_fingerprints == current_fingerprints and release_episode_uids == current_episode_uids:
+                if callback:
+                    callback(f"Using active producer release {active['release_id']}.")
+                return active
         existing = self._existing_release_for_current_caches()
         if existing:
             if callback:
@@ -330,7 +392,7 @@ class PodcastRagSourceAdapter:
             return existing
         raise PodcastRagAdapterError(
             "no matching published producer release was found; "
-            "the producer must publish a release separately before Chroma can import it"
+            "use the producer's Process / resume all pending work menu action before Chroma import"
         )
 
 

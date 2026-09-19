@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
-async function installTestBridge(page: Page) {
-  await page.addInitScript(() => {
+async function installTestBridge(page: Page, managedContext = false) {
+  await page.addInitScript(({ managedContext }) => {
     const jobs: Array<Record<string, unknown>> = []
     const now = '2026-09-07T00:00:00Z'
     const envelope = (data: unknown) => ({ ok: true, data })
@@ -23,8 +23,12 @@ async function installTestBridge(page: Page) {
         delete_ids: { total: 0, items: [] }, episode_changes: [],
       },
     }
+    const contexts = managedContext ? [{
+      ref: { connection_id: 'connection-browser', partition_id: 'partition-browser' }, display_name: 'Browser Show', context_type: 'podcast', corpus_id: 'corpus-browser', workflow_profile: 'podcast', local_status: 'active', producer_status: 'active', source_root: 'C:/Podcast RAG', catalog_path: 'C:/state/context_catalog.sqlite3', source_status: { ready_to_publish: true, completed: 12, pending: 0, failed: 0, interrupted: 0, quarantined: 0, active_release_id: 'release-browser' }, active_database: { status: 'not_linked' }, release_inventory: [{ upstream_release_id: 'release-browser' }], matching_database_ids: [], capabilities: { import: true, analyze: false, archive: true }, suggested_next_action: { action: 'create_database', reason: 'Ready' }, tracking: { state: 'ready_to_create', recommended_action: 'create_database', reason: 'Ready to create.', checked_at: now, active_release_id: 'release-browser', latest_release: { upstream_release_id: 'release-browser' }, last_applied_release_id: null, matching_databases: [], legacy_candidates: [], suggested_target: '', profile_fingerprint: null, history: [], change_counts: { episodes_total: 12, records_changed: null, requires_review: true } },
+    }] : []
     const api: Record<string, (payload?: any) => Promise<unknown>> = {
       handshake: async () => envelope({ api_version: 'gui-api-v1', backend_version: 'browser-test' }),
+      reconcile_sources: async () => envelope({ checked_at: now, connections: [], contexts, source_observations: [] }),
       list_databases: async () => envelope([]),
       list_jobs: async () => envelope(jobs),
       get_job: async (payload) => envelope(jobs.find((item) => item.id === payload.job_id) ?? null),
@@ -69,7 +73,7 @@ async function installTestBridge(page: Page) {
       export_report: async () => envelope({ report_id: 'report-1', path: 'C:/reports/report-1.json' }),
     }
     ;(window as Window & { pywebview?: { api: typeof api } }).pywebview = { api }
-  })
+  }, { managedContext })
 }
 
 test('runs the three-step creation journey through a browser bridge', async ({ page }) => {
@@ -87,7 +91,7 @@ test('runs the three-step creation journey through a browser bridge', async ({ p
   await page.getByRole('button', { name: 'Review' }).click()
   await expect(page.getByText('Ready to create', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Create database' }).click()
-  await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Activity', exact: true })).toBeVisible()
   await expect(page.getByText('Database import', { exact: true })).toBeVisible()
 })
 
@@ -96,6 +100,21 @@ test('opens Source connections for the managed workspace', async ({ page }) => {
   await page.goto('/?workspace=contexts')
   await expect(page.getByRole('heading', { name: 'Source connections' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Inspect source' })).toBeVisible()
+})
+
+test('opens a populated wizard from the selected Available partition', async ({ page }) => {
+  await installTestBridge(page, true)
+  await page.goto('/')
+  await expect(page.getByText('Available partitions', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Create database for Browser Show' }).click()
+  await expect(page.getByRole('heading', { name: 'Choose content' })).toBeVisible()
+  await expect(page.getByLabel('Podcast-RAG source root')).toHaveValue('C:/Podcast RAG')
+  await expect(page.getByLabel('Verified partition ID')).toHaveValue('partition-browser')
+  await expect(page.getByText('release-browser', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Continue' }).click()
+  await expect(page.getByLabel('Database name')).toHaveValue('Browser Show')
+  await expect(page.getByLabel('Storage location')).toHaveValue('C:/Podcast RAG/exports/partitions/partition-browser')
+  await expect(page.getByLabel('Embedding device')).toHaveValue('auto')
 })
 
 test('shows a connection error when the privileged bridge is absent', async ({ page }) => {

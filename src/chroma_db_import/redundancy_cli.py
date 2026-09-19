@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 from .local_judge_client import DEFAULT_BASE_URL, JudgmentCache, LMStudioClient, LocalJudgeError, judgment_cache_key, run_bounded_judgments
 from .managed import ManagedCatalog, ManagedContextError
@@ -142,7 +143,12 @@ def _bundle_predictions(pairs: list[dict[str, object]], judgments: list[dict[str
     return {"A": exact, "B": lexical, "C": None, "D": judge if judgments else None}, measurements
 
 
-def _run_assessment(catalog: ManagedCatalog, partition: str, release_arg: str, *, channels: list[str] | None, judge_requested: bool | None, resume_job_id: str | None, cancel_file: str | Path | None = None) -> tuple[int, dict[str, object]]:
+def _run_assessment(catalog: ManagedCatalog, partition: str, release_arg: str, *, channels: list[str] | None, judge_requested: bool | None, resume_job_id: str | None, cancel_file: str | Path | None = None, progress_callback: Callable[[int, int, str], None] | None = None) -> tuple[int, dict[str, object]]:
+    def report(current: int, total: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(current, total, message)
+
+    report(1, 6, "Loading the validated analysis release.")
     root = _release_path(catalog, partition, release_arg)
     policy_record = catalog.get_redundancy_policy(partition)
     policy = dict(policy_record["policy"])
@@ -170,6 +176,7 @@ def _run_assessment(catalog: ManagedCatalog, partition: str, release_arg: str, *
     # shared_input must materialize representative vectors. Preview remains
     # the only intentionally model/vector-free path.
     inventory = load_inventory(root, inspect_vectors=("dense" in inspect_channels or policy["vector_storage"] in {"full", "shared_input"}))
+    report(2, 6, f"Loaded {len(inventory.units)} analysis units.")
     if resume_job is not None:
         selected_channels = frozen_channels or []
         frozen_judge_requested = bool(frozen_spec.get("judge_requested"))
@@ -209,6 +216,7 @@ def _run_assessment(catalog: ManagedCatalog, partition: str, release_arg: str, *
         if cancelled():
             return finish_cancelled("cancelled before candidate generation")
         snapshot = generate_candidate_snapshot(inventory.units, policy, workspace / "candidate_pairs.jsonl", vectors=inventory.vectors if "dense" in selected_channels else None, require_chroma="dense" in selected_channels)
+        report(3, 6, f"Generated {len(snapshot.get('candidates') or [])} candidate pairs.")
         if cancelled():
             return finish_cancelled("cancelled after candidate generation")
         selected_channel_set = set(selected_channels)
@@ -229,6 +237,7 @@ def _run_assessment(catalog: ManagedCatalog, partition: str, release_arg: str, *
                 judge_status = "zero_budget"
                 judge_metrics = {"calls": 0, "elapsed_seconds": 0.0, "token_usage": None, "call_records": []}
             else:
+                report(4, 6, f"Preparing {len(selected)} bounded judge calls.")
                 requests = [build_judge_request(item["candidate"], item["neighbors"], policy, candidate_id=item["candidate"].document_id) for item in selected]
                 candidate_ids = [item["candidate"].document_id for item in selected]
                 pair_lookup = {pair.candidate_id: pair for pair in pair_objects}
@@ -237,8 +246,8 @@ def _run_assessment(catalog: ManagedCatalog, partition: str, release_arg: str, *
                 model_identity = str(judge_config.get("model_fingerprint") or "") or None
                 session_nonce = str((job.get("spec") or {}).get("session_nonce") or "") or None
                 cache_keys = [judgment_cache_key(base_fingerprint=base_fingerprint, scope=inventory.scope.as_dict(), candidate=item["candidate"], comparisons=list(item["neighbors"]), model_artifact_id=model_identity, session_nonce=session_nonce, prompt_version="redundancy_judge_v1", schema_version=JOB_SCHEMA_VERSION, generation={"temperature": 0, "max_tokens": policy["judge_max_output_tokens"]}) for item in selected]
-                client = LMStudioClient(str(judge_config.get("base_url") or DEFAULT_BASE_URL), model=str(judge_config["model"]), timeout=float(policy["judge_timeout_seconds"]))
-                judge_result = run_bounded_judgments(client, requests, candidate_ids=candidate_ids, supplied_units=unit_map, pairs=judge_pairs, max_calls=int(policy["judge_max_calls"]), job_seconds=float(policy["judge_job_seconds"]), cancel_check=cancelled, cache=cache, cache_keys=cache_keys)
+                client = LMStudioClient(str(judge_config.get("base_url") or DEFAULT_BASE_URL), model=str(judge_config["model"]), timeout=float(judge_config.get("timeout_seconds") or policy["judge_timeout_seconds"]))
+                judge_result = run_bounded_judgments(client, requests, candidate_ids=candidate_ids, supplied_units=unit_map, pairs=judge_pairs, max_calls=int(policy["judge_max_calls"]), job_seconds=float(policy["judge_job_seconds"]), cancel_check=cancelled, cache=cache, cache_keys=cache_keys, progress_callback=lambda current, total, message: report(4 + (current / max(1, total)), 6, message))
                 judgments = list(judge_result["judgments"])
                 judge_metrics = {key: judge_result.get(key) for key in ("calls", "elapsed_seconds", "token_usage", "call_records")}
                 if judge_result.get("status") == "cancelled":
@@ -264,12 +273,17 @@ def _run_assessment(catalog: ManagedCatalog, partition: str, release_arg: str, *
         bundle_status = "completed_partial" if partial else "completed"
         embedding_inputs = {str(row["document_id"]): str(row["embedding_input"]) for row in inventory.occurrences if isinstance(row.get("embedding_input"), str)}
         private_bundle = workspace / "bundle"
+        report(5, 6, "Writing the validated redundancy bundle.")
         coverage = {**dict(snapshot["coverage"]), "candidate_count": len(pair_objects), "candidate_snapshot_hash": snapshot["snapshot_hash"], "candidate_backend": snapshot["backend"], "candidate_configuration": dict(snapshot.get("configuration") or {}), "judge_status": judge_status, "judge_metrics": judge_metrics, "partial_reasons": partial_reasons}
         manifest = write_bundle(private_bundle, inventory=inventory, candidate_pairs=pair_objects, judgments=judgments, policy=policy, coverage=coverage, input_spec=dict(job.get("spec") or {}), storage_mode=policy["vector_storage"], embedding_inputs=embedding_inputs, status=bundle_status, judgment_status={"model": judge_config.get("model") if judge_requested else None, "model_artifact_id": str(judge_config.get("model_fingerprint") or "") or None, "prompt_version": "redundancy_judge_v1", "schema_version": JOB_SCHEMA_VERSION, "metrics": judge_metrics})
         bundles_root = Path(catalog.get_setting("managed_output_root", str(catalog.path.parent / "redundancy_bundles"))).expanduser().resolve() / "partitions" / partition / "redundancy_bundles"
         try:
-            with ManagedPartitionLock(bundles_root.parent) as publication_lock:
-                publication = publish_bundle(private_bundle, bundles_root, base_export=root, partition_lock=publication_lock)
+            publication = publish_bundle(
+                private_bundle,
+                bundles_root,
+                base_export=root,
+                partition_lock=ManagedPartitionLock(bundles_root.parent, run_id=job_id),
+            )
         except ManagedPartitionBusy as exc:
             raise ManagedContextError(str(exc)) from exc
         final_status = "completed_partial" if partial else "completed"

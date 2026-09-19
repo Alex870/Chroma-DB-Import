@@ -10,7 +10,7 @@ from unittest.mock import patch
 from chroma_db_import.desktop.bridge import ApplicationBridge
 from chroma_db_import.managed import ManagedCatalog, discover
 from chroma_db_import.workflow.managed_adapter import ManagedAdapter
-from chroma_db_import.workflow.models import BridgeError, DatabaseRecord, SelectionPolicy
+from chroma_db_import.workflow.models import BridgeError, DatabaseRecord, FrozenPreview, PreviewEffects, SelectionPolicy
 from chroma_db_import.workflow.service import WorkflowService
 from tests.test_managed_contexts import write_release
 
@@ -86,13 +86,60 @@ class GuiManagedWorkflowTests(unittest.TestCase):
             draft = {
                 "source_kind": "managed",
                 "source_ref": {"source_root": str(root), "partition_id": "podcast-one", "catalog_path": str(root / "catalog.sqlite3")},
-                "target": {"path": str(root / "exports")}, "display_name": "Podcast One",
+                "target": {"path": str(root / "exports" / "partitions" / "podcast-one"), "managed_output_root": str(root / "exports")}, "display_name": "Podcast One",
                 "selection_policy": SelectionPolicy().as_dict(),
+                "execution_options": {"embedding_device": "cpu"},
             }
             preview = ManagedAdapter().create_preview(None, draft, operation="create")
             self.assertEqual("release-01", preview.source_snapshot["release_id"])
             self.assertEqual(2, preview.effects.records_total)
             self.assertEqual(["record-one", "thesis-one"], preview.effects.insert_ids)
+            self.assertEqual(str(root / "exports" / "partitions" / "podcast-one"), preview.target_identity["path"])
+            self.assertEqual(str(root / "exports"), preview.target_identity["managed_output_root"])
+            self.assertEqual("cpu", preview.execution_options["embedding_device"])
+
+    def test_invalid_explicit_managed_target_is_rejected_without_retargeting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(BridgeError) as raised:
+                ManagedAdapter._validate_managed_target({"target": {"path": str(root / "exports" / "wrong"), "managed_output_root": str(root / "exports")}}, "podcast-one")
+            self.assertEqual("VALIDATION_FAILED", raised.exception.code)
+            self.assertIn("exact partition target", raised.exception.message)
+
+    def test_failed_empty_managed_registration_can_be_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "managed-source"
+            target = root / "exports" / "partitions" / "podcast-one"
+            source.mkdir()
+            target.mkdir(parents=True)
+            service = WorkflowService(root / "state")
+            try:
+                record = service.catalog.create_database(DatabaseRecord(
+                    id="db-failed-create", display_name="Podcast One", source_kind="managed",
+                    source_ref={"source_root": str(source), "partition_id": "podcast-one"},
+                    target={"path": str(target), "managed_output_root": str(root / "exports")},
+                    selection_policy=SelectionPolicy().as_dict(),
+                ).as_dict())
+                service.catalog.save_database_link({
+                    "database_id": record["id"], "connection_id": "connection-one", "partition_id": "podcast-one",
+                    "corpus_id": "podcast-one", "source_root": str(source), "target_key": str(target).casefold(),
+                    "origin": "created", "state": "update_failed",
+                })
+                preview = FrozenPreview(
+                    preview_id="preview-retry", operation="create", database_id=None, draft_id="draft-retry",
+                    created_at="2026-01-01T00:00:00Z", settings_revision=1, settings_hash="hash",
+                    source_snapshot={"source_root": str(source), "partition_id": "podcast-one"},
+                    target_identity={"path": str(target), "managed_output_root": str(root / "exports")},
+                    selection_policy=SelectionPolicy().as_dict(), representation={}, validation_findings=[],
+                    effects=PreviewEffects(),
+                )
+                reused = service._retryable_managed_creation(preview, {"source_kind": "managed"})
+                self.assertEqual(record["id"], reused["id"] if reused else None)
+                (target / "active-release.json").write_text("{}", encoding="utf-8")
+                self.assertIsNone(service._retryable_managed_creation(preview, {"source_kind": "managed"}))
+            finally:
+                service.shutdown()
 
     def test_managed_creation_runs_through_real_bridge_and_service(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -268,7 +315,7 @@ class GuiManagedWorkflowTests(unittest.TestCase):
             with ManagedCatalog(root / "catalog.sqlite3") as catalog:
                 discover(catalog, [root])
             source_ref = {"source_root": str(root), "partition_id": "podcast-one", "catalog_path": str(root / "catalog.sqlite3")}
-            target = {"path": str(root / "exports"), "managed_output_root": str(root / "exports")}
+            target = {"path": str(root / "exports" / "partitions" / "podcast-one"), "managed_output_root": str(root / "exports")}
             record = DatabaseRecord(
                 id="managed-db", display_name="Podcast One", source_kind="managed", source_ref=source_ref,
                 target=target, selection_policy=SelectionPolicy().as_dict(), downstream_identity=None,

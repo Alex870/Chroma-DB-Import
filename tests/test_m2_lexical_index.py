@@ -6,7 +6,7 @@ from tests.test_releases import DELTA,QWEN_EMBEDDING,ReleaseTests
 
 class LexicalIndexTests(unittest.TestCase):
  def corpus(self,path):
-   value={"contract_version":"representation-corpus-1.0","representations":{"lexical_text":"normalized-lexical-v1"},"documents":[{"document_id":"a","lexical_text":"Dr Amara Voss discussed podcast","metadata":{"stable_document_id":"a","speaker":"Host","episode_date":"2026-01-17"}},{"document_id":"b","lexical_text":"institutional trust and policy","metadata":{"stable_document_id":"b","speaker":"Guest","episode_date":"2025-01-01"}}]}; path.write_text(json.dumps(value),encoding="utf-8"); return path
+   value={"contract_version":"representation-corpus-1.0","representations":{"lexical_text":"normalized-lexical-v1"},"documents":[{"document_id":"a","lexical_text":"Dr Amara Voss discussed podcast","metadata":{"stable_document_id":"a","speaker":"Host","speaker_scope":"single","node_type":"leaf_chunk","episode_id":"episode-a","episode_uid":"episode-a","episode_date":"2026-01-17","episode_sort_key":"20260117","source_segment_id":"segment-a"}},{"document_id":"b","lexical_text":"institutional trust and policy","metadata":{"stable_document_id":"b","speaker":"Guest","speaker_scope":"single","node_type":"leaf_chunk","episode_id":"episode-b","episode_uid":"episode-b","episode_date":"2025-01-01","episode_sort_key":"20250101","source_segment_id":"segment-b"}}]}; path.write_text(json.dumps(value),encoding="utf-8"); return path
  def test_deterministic_bm25_filters_and_ties(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d); sidecar=build_sidecar(self.corpus(root/"corpus.json"),root/"lexical.json",parent_release_id="r")

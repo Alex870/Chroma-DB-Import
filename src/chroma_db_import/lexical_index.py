@@ -4,6 +4,7 @@ import hashlib, json, math, re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping
+from chroma_db_import.contract import temporal_record_eligibility, temporal_coverage_stats
 
 CONTRACT="lexical-index-v1"; TOKENIZER="unicode-word-casefold-v1"; IMPLEMENTATION="podcast-bm25-v1"
 class LexicalIndexError(ValueError): pass
@@ -25,11 +26,15 @@ def build_sidecar(corpus_path:str|Path,output_path:str|Path,*,parent_release_id:
  for item in sorted(corpus["documents"],key=lambda row:row["document_id"]):
   terms=Counter(tokenize(item["lexical_text"])); vocabulary.update(terms)
   metadata=item.get("metadata") or {}
-  rows.append({"document_id":item["document_id"],"source_hash":_hash({"id":item["document_id"],"lexical_text":item["lexical_text"]}),"length":sum(terms.values()),"terms":dict(sorted(terms.items())),"filters":{"speaker":metadata.get("speaker"),"speakers":metadata.get("speakers") or [],"episode_date":metadata.get("episode_date"),"episode_sort_key":metadata.get("episode_sort_key"),"node_type":metadata.get("node_type")}})
+  temporal=temporal_record_eligibility(metadata)
+  rows.append({"document_id":item["document_id"],"source_hash":_hash({"id":item["document_id"],"lexical_text":item["lexical_text"]}),"length":sum(terms.values()),"terms":dict(sorted(terms.items())),"filters":{"speaker":metadata.get("speaker"),"speakers":metadata.get("speakers") or [],"episode_date":metadata.get("episode_date"),"episode_date_source":metadata.get("episode_date_source"),"episode_sort_key":metadata.get("episode_sort_key"),"node_type":metadata.get("node_type"),"speaker_scope":metadata.get("speaker_scope"),"episode_id":metadata.get("episode_id"),"episode_uid":metadata.get("episode_uid"),"source_span_id":metadata.get("source_span_id"),"source_span_ids":metadata.get("source_span_ids"),"source_segment_id":metadata.get("source_segment_id"),"source_segment_ids":metadata.get("source_segment_ids"),"source_spans":metadata.get("source_spans"),"primary_evidence_id":metadata.get("primary_evidence_id"),"primary_evidence_ids":metadata.get("primary_evidence_ids"),"child_ids":metadata.get("child_ids"),"temporal_eligible":temporal["eligible"],"temporal_reasons":temporal["reasons"]}})
  smoke=[]
  for row in rows[:3]:
   term=next(iter(row["terms"]),"");smoke.append({"document_id":row["document_id"],"term":term,"passed":bool(term)})
  manifest={"contract_version":CONTRACT,"parent_corpus_release_id":parent_release_id,"representation_id":evidence["representation_id"],"tokenizer":{"id":TOKENIZER,"lowercase":True},"implementation":{"id":IMPLEMENTATION,"version":"1.0"},"field_weights":{"lexical_text":1.0},"document_count":len(rows),"ordered_document_ids":[row["document_id"] for row in rows],"document_ids_hash":evidence["document_ids_hash"],"source_corpus_hash":evidence["source_corpus_hash"],"work_estimate":evidence["work_estimate"],"build_diagnostics":{"total_terms":sum(row["length"] for row in rows),"unique_terms":len(vocabulary),"smoke_tests":smoke},"documents":rows}
+ manifest["temporal_coverage"]=temporal_coverage_stats([{"metadata":item.get("metadata") or {}} for item in corpus["documents"]])
+ manifest["temporal_capability"]=manifest["temporal_coverage"]["temporal_capability"]
+ manifest["temporal_coverage_sha256"]=_hash(manifest["temporal_coverage"])
  manifest["channel_id"]="lexical_"+_hash(manifest); manifest["checksum"]=_hash({k:v for k,v in manifest.items() if k!="checksum"})
  Path(output_path).write_text(json.dumps(manifest,sort_keys=True,indent=2,ensure_ascii=True)+"\n",encoding="utf-8"); return manifest
 
@@ -40,6 +45,12 @@ def validate_sidecar(value:Mapping[str,Any],*,release_id:str|None=None,expected:
  ids=list(value.get("ordered_document_ids") or []); rows=list(value.get("documents") or [])
  if ids!=[row.get("document_id") for row in rows] or len(ids)!=value.get("document_count"): raise LexicalIndexError("lexical sidecar document alignment mismatch")
  if not all(item.get("passed") for item in (value.get("build_diagnostics") or {}).get("smoke_tests") or []): raise LexicalIndexError("lexical sidecar smoke test failed")
+ if "temporal_coverage" in value:
+  coverage=value.get("temporal_coverage")
+  if not isinstance(coverage, Mapping) or value.get("temporal_capability") not in {"certified","partial","legacy"}: raise LexicalIndexError("lexical sidecar temporal coverage is invalid")
+  if value.get("temporal_coverage_sha256") != _hash(coverage): raise LexicalIndexError("lexical sidecar temporal coverage checksum mismatch")
+  actual=temporal_coverage_stats([{"metadata":row.get("filters") or {}} for row in rows])
+  if actual != dict(coverage): raise LexicalIndexError("lexical sidecar temporal coverage does not match its rows")
  if expected:
   for key in ("document_count","document_ids_hash","source_corpus_hash","representation_id"):
    if expected.get(key)!=value.get(key): raise LexicalIndexError(f"lexical sidecar {key} mismatch")
@@ -52,6 +63,7 @@ def search(value:Mapping[str,Any],query:str,*,limit:int=30,speaker:str="",date_s
  for row in rows:
   filters=row.get("filters") or {}; speakers=set(map(str,filters.get("speakers") or [])); speakers.add(str(filters.get("speaker") or "")); date=str(filters.get("episode_date") or "")
   if speaker and speaker not in speakers: continue
+  if (date_start or date_end) and not filters.get("temporal_eligible"): continue
   if date_start and (not date or date<date_start): continue
   if date_end and (not date or date>date_end): continue
   score=0.0

@@ -1,12 +1,12 @@
 import type { AppClient } from './client'
-import type { DatabaseRecord, JobRecord, Preview, SelectionPolicy } from './types'
+import type { ContentInventory, ContextSummary, DatabaseRecord, JobRecord, Preview, Report, SelectionPolicy, SourceConnection } from './types'
 
 const policy: SelectionPolicy = { speaker_mode: 'all', excluded_speakers: [], allowlist_speakers: [], episode_overrides: {}, excluded_episode_ids: [], asset_filter: 'reviewed', asset_pattern: '' }
 const now = new Date().toISOString()
 const database: DatabaseRecord = { id: 'mock-db', display_name: 'Example library', source_kind: 'folder', source_ref: { path: 'C:/processed' }, target: { path: 'C:/exports/example' }, downstream_identity: { collection_name: 'whisper_rag_v2', profile: 'qwen3-embedding-4b-shadow' }, selection_policy: policy, settings_revision: 1, archived: false, last_check: null, created_at: now, updated_at: now }
 const jobs: JobRecord[] = []
 let latestPreview: Preview | null = null
-const makeJob = (kind: string): JobRecord => ({ id: `mock-${Date.now()}`, kind, state: 'succeeded', stage: 'complete', database_id: null, preview_id: null, can_cancel: false, result: { episodes: 2, eligible_records: 24 }, error: null, created_at: now, started_at: now, completed_at: now })
+const makeJob = (kind: string): JobRecord => ({ id: `mock-${Date.now()}`, kind, state: 'succeeded', stage: 'complete', database_id: null, preview_id: null, can_cancel: false, result: { episodes: 2, eligible_records: 24 }, error: null, progress: { stage: 'complete', message: 'Completed.', percent: 100 }, created_at: now, started_at: now, completed_at: now })
 
 export const mockClient: AppClient = {
   async handshake() { return { api_version: 'gui-api-v1', backend_version: 'mock' } },
@@ -15,8 +15,13 @@ export const mockClient: AppClient = {
   async listDatabases() { return [database] },
   async getDatabase() { return database },
   async getDatabaseHistory() { return { database_id: database.id, target: database.target.path, active_state: 'active', jobs: [] } },
-  async getDatabaseContent() { return { database_id: database.id, target: database.target.path, speakers: ['Host', 'Guest'], shared_context_note: 'Shared context remains available when at least one selected speaker is included.', episodes: [{ episode_id: 'episode-1', title: 'Example episode', date: '2026-01-01', document_count: 24, speakers: ['Host', 'Guest'], excluded: false, override_speakers: [] }] } },
+  async getDatabaseContent() { return { database_id: database.id, target: database.target.path, speakers: ['Host', 'Guest'], shared_context_note: 'Shared context remains available when at least one selected speaker is included.', episodes: [{ episode_id: 'episode-1', title: 'Example episode', date: '2026-01-01', source_file: 'C:/processed/episode-1.processed_documents.json', source_document_count: 24, stored_document_count: 24, included_document_count: 24, node_counts: { leaf_chunk: 20, position_card: 2, cluster_summary: 1, episode_thesis: 1 }, speakers: ['Host', 'Guest'], override_mode: 'inherit', override_speakers: [], comparison: 'imported', checked_at: now }], total: 1, offset: 0, limit: 100, policy_fingerprint: 'mock-policy', source_available: true, stored_available: true, report: mockReport('content_inspection') } as ContentInventory },
+  async getDatabaseDetails() { return mockReport('database_details') },
+  async inspectContent() { const job = makeJob('inspection'); jobs.unshift(job); return job },
+  async validateDatabase() { const job = makeJob('validation'); jobs.unshift(job); return job },
   async environmentReport() { return { assets_ready: true, pywebview: 'mock', cuda: { available: false } } },
+  async previewEnvironmentRepair() { return { review_id: 'mock-repair-review', action: 'install_dependencies', args: [], impact: 'Mock repair' } },
+  async applyEnvironmentRepair(reviewId) { const job = makeJob('environment_repair'); job.id = reviewId; jobs.unshift(job); return job },
   async migrationCandidates() { return { candidates: [], originals_unchanged: true } },
   async listJobs() { return jobs },
   async getJob(id) { return jobs.find((job) => job.id === id) ?? jobs[0] },
@@ -24,6 +29,8 @@ export const mockClient: AppClient = {
   async cancelJob(id) { const job = await this.getJob(id); job.state = 'cancelled'; return job },
   async getJobEvents() { return [] },
   async pickFolder() { return 'C:/processed' },
+  async pickFile() { return null },
+  async pickSaveFile() { return null },
   async scanSource() { const job = makeJob('scan'); job.result = { episodes: 1, eligible_records: 2, excluded_files: [], date_range: { start: '2026-01-01', end: '2026-01-01' }, speakers: ['Host'], episode_inventory: [{ episode_id: 'episode-1', title: 'Example episode', date: '2026-01-01', document_count: 2, speakers: ['Host'] }] }; jobs.unshift(job); return job },
   async inspectExisting() { return { display_name: 'Existing library', target: { path: 'C:/exports/existing' }, identity_status: 'resolved', downstream_identity: { collection_name: 'whisper_rag_v2' } } },
   async registerExisting() { return database },
@@ -35,9 +42,48 @@ export const mockClient: AppClient = {
   async getPreview() { if (latestPreview) return latestPreview; const preview: Preview = { preview_id: 'mock-preview', operation: 'update', database_id: database.id, status: 'ready', source_snapshot: {}, target_identity: { path: database.target.path }, selection_policy: policy, representation: { profile: 'qwen3-embedding-4b-shadow' }, validation_findings: [], required_acknowledgments: [], effects: { episodes_total: 2, records_total: 24, writes: 24, insert_ids: { total: 24, items: [] }, replace_ids: { total: 0, items: [] }, metadata_only_ids: { total: 0, items: [] }, unchanged_ids: { total: 0, items: [] }, retained_missing_ids: { total: 0, items: [] }, delete_ids: { total: 0, items: [] }, episode_changes: [], delete_episodes: [], reasons: {} } }; latestPreview = preview; return preview },
   async applyPreview() { return this.scanSource({}) },
   async archiveDatabase() { database.archived = true; return database },
+  async restoreDatabase() { database.archived = false; return database },
   async renameDatabase(_id, name) { database.display_name = name; return database },
   async updateDatabaseSettings(_id, changes) { Object.assign(database, changes); return database },
   async startSourceAction() { return this.scanSource({}) },
   async openDatabaseFolder() { return database.target.path },
   async exportReport(report, reportId) { return { report_id: reportId ?? 'mock-report', path: 'C:/state/reports/mock-report.json', report } },
+  async saveReportCopy(reportId, outputPath) { return { report_id: reportId, path: outputPath, copied: true } },
+  async getAppDefaults() { return { key: 'creation_defaults', revision: 0, value: { output_parent: '', asset_filter: 'reviewed_speaker_transcript', asset_pattern: '', execution_options: { embedding_device: 'auto' } } } },
+  async saveAppDefaults(changes, baseRevision) { return { key: 'creation_defaults', revision: Number(baseRevision ?? 0) + 1, value: changes } },
+  async exportSettings() { return { schema_version: 'gui-settings-transfer-v1', scope_kind: 'app_defaults', identity: { application: 'Chroma DB Import' }, settings: {} } },
+  async saveSettingsTransfer(_transfer, outputPath) { return { path: outputPath, included_fields: [] } },
+  async previewSettingsImport() { return { schema_version: 'gui-settings-proposal-v1', review_id: 'mock-settings-review', compatibility: 'compatible', allowed_field_paths: [], changes: {} } },
+  async applySettingsImport(_path, _proposal, selectedFields) { return { applied_fields: selectedFields, skipped_fields: [] } },
+  async listSourceConnections() { return [] as SourceConnection[] },
+  async reconcileSources() { return { checked_at: now, connections: [], contexts: [] as ContextSummary[], source_observations: [] } },
+  async adoptDatabaseLink(payload) { return { ...payload, state: 'linked', origin: 'adopted' } },
+  async selectDatabaseLink(payload) { return { ...payload, selected: true, state: 'linked' } },
+  async linkSource(sourceRoot) { return { connection: { id: 'mock-connection', root: sourceRoot, catalog_path: 'C:/state/context_catalog.sqlite3', created_at: now, updated_at: now, archived: false }, discovery: { contexts: [], releases: [], rejected: [] } } },
+  async discoverContexts() { return { contexts: [], releases: [], rejected: [] } },
+  async listContexts() { return [] as ContextSummary[] },
+  async getContext(context) { return { ref: context, display_name: 'Mock context', context_type: 'podcast', corpus_id: 'mock', workflow_profile: 'podcast', local_status: 'active', producer_status: 'unknown', source_root: '', catalog_path: '', source_status: {}, active_database: {}, release_inventory: [], matching_database_ids: [], capabilities: { import: false, analyze: false, archive: true }, suggested_next_action: { action: 'refresh_status', reason: 'Mock context' }, tracking: { state: 'source_unavailable', recommended_action: 'refresh_status', reason: 'Mock context', checked_at: now, active_release_id: null, latest_release: null, last_applied_release_id: null, matching_databases: [], legacy_candidates: [], suggested_target: '', profile_fingerprint: null, history: [] } } },
+  async setContextArchived(context, archived) { const result = await this.getContext(context); return { ...result, local_status: archived ? 'archived' : 'active' } },
+  async saveContextImportDefaults(context, changes, baseRevision) { return { context, revision: Number(baseRevision ?? 0) + 1, settings: changes } },
+  async saveContextDefaults(context, _baseProfileFingerprint, profileChanges, executionOptions) { return { context, revision: 1, settings: { ...profileChanges, execution_options: executionOptions } } },
+  async previewContextDedup() { return mockReport('dedup_preview') },
+  async reviewContextDedup() { return mockReport('dedup_review') },
+  async getContextDedupSettings() { return { policy: { profile: 'safe' }, policy_fingerprint: 'mock-dedup', profile_fingerprint: 'mock-profile' } },
+  async saveContextDedupPolicy(_context, changes, baseProfileFingerprint) { return { policy: changes, profile_fingerprint: baseProfileFingerprint ?? 'mock-profile-2' } },
+  async openContextFolder() { return 'C:/exports/example' },
+  async repairPartitionLock(partitionRoot, confirm = false) { return { status: 'already_available', partition_path: partitionRoot, confirmed: confirm, lock_file_preserved: true } },
+  async getRedundancySettings() { return { policy: { lexical_enabled: true, structural_enabled: true, dense_enabled: true, vector_storage: 'full', retrieval_mode: 'ranked' }, policy_fingerprint: 'mock-policy', revision: 1 } },
+  async saveRedundancyPolicy(_context, changes, baseFingerprint) { return { policy: changes, policy_fingerprint: baseFingerprint ?? 'mock-policy-2', revision: 2 } },
+  async startRedundancyAction() { const job = makeJob('redundancy'); jobs.unshift(job); return job },
+  async saveJudgeConfig(_context, changes, baseFingerprint) { return { judge_config: changes, judge_config_fingerprint: baseFingerprint ?? 'mock-judge' } },
+  async reviewJudgePilot(context, upstreamReleaseId, channels) { return { review_id: 'mock-judge-review', context, upstream_release_id: upstreamReleaseId, channels } },
+  async probeJudge(_context, changes = {}) { return { reachable: true, configured_model: String(changes.model ?? 'mock-model'), model_available: true, models: [String(changes.model ?? 'mock-model')], base_url: String(changes.base_url ?? 'http://127.0.0.1:1234/v1'), checked_at: now } },
+  async openRedundancyBundle(path) { return { report: mockReport('redundancy_bundle'), artifact_id: `mock:${path}` } },
+  async getSourceSuggestions() { return [] },
+  async listSourceFolders() { return [] },
+  async inspectFolder(payload) { return { path: payload.path, selected_count: 1, eligible_records: 2, sample_files: [], ready: true } },
+}
+
+function mockReport(kind: string): Report {
+  return { schema_version: 'gui-report-v1', report_id: `mock-${kind}`, kind, scope: { database_id: database.id }, generated_at: now, status: 'pass', summary: {}, findings: [], details: {} }
 }

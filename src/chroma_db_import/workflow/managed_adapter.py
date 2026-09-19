@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -8,6 +9,7 @@ from chroma_db_import.managed import (
     ManagedCatalog,
     discover,
     managed_paths,
+    producer_active_release_id,
     resolve_managed_config,
     run_managed_import,
     validate_upstream_release,
@@ -15,7 +17,7 @@ from chroma_db_import.managed import (
 from chroma_db_import.importer import representation_spec
 from chroma_db_import.podcast_rag_adapter import PodcastRagSourceAdapter
 
-from .models import BridgeError, DatabaseRecord, FrozenPreview, PreviewEffects, new_id, stable_hash, utc_now
+from .models import BridgeError, DatabaseRecord, ExecutionOptions, FrozenPreview, PreviewEffects, SelectionPolicy, new_id, stable_hash, utc_now
 from .planning import inspect_existing_records
 
 
@@ -70,6 +72,37 @@ class ManagedAdapter:
         return path
 
     @staticmethod
+    def _validate_managed_target(value: dict[str, Any], partition_id: str) -> None:
+        """Validate the explicit managed root/path pair without changing legacy records."""
+        target = dict(value.get("target") or {})
+        managed_output_root = str(target.get("managed_output_root") or "").strip()
+        if not managed_output_root:
+            return
+        target_path = str(target.get("path") or "").strip()
+        expected = managed_paths(Path(managed_output_root).expanduser().resolve(), partition_id)["partition_root"]
+        actual = Path(target_path).expanduser().resolve() if target_path else None
+        if actual is None or str(actual).casefold() != str(expected).casefold():
+            raise BridgeError(
+                "VALIDATION_FAILED",
+                f"Managed output must be the exact partition target: {expected}",
+                field="target.path",
+            )
+
+    @staticmethod
+    def can_retry_create_target(target: Path) -> bool:
+        """Allow retrying only an empty managed partition directory.
+
+        A failed first attempt may create the partition directory before the
+        staged export is promoted.  An empty directory is not a database and
+        can be reused; any content, including an active-release pointer, is
+        treated as an existing destination and remains protected.
+        """
+        try:
+            return target.is_dir() and not any(target.iterdir())
+        except OSError:
+            return False
+
+    @staticmethod
     def _active_export(output_root: Path, partition_id: str, partition_root: Path) -> tuple[str, Path | None]:
         pointer = partition_root / "active-release.json"
         if not pointer.is_file():
@@ -84,7 +117,7 @@ class ManagedAdapter:
         paths = managed_paths(output_root, partition_id, release_id)
         return release_id, paths.get("export_root")
 
-    def inspect(self, source_root: Path, partition_id: str) -> dict[str, Any]:
+    def inspect(self, source_root: Path, partition_id: str, catalog_path: str | None = None) -> dict[str, Any]:
         adapter = PodcastRagSourceAdapter(source_root, partition_id)
         status = adapter.inspect()
         result: dict[str, Any] = {
@@ -106,18 +139,18 @@ class ManagedAdapter:
                 result["active_release_id"] = str(json.loads(pointer.read_text(encoding="utf-8")).get("release_id") or "")
             except (OSError, json.JSONDecodeError):
                 result.setdefault("warnings", []).append("The managed active-release pointer is unreadable.")
-        catalog_path = self._catalog_path(source_root)
-        if catalog_path is not None:
+        resolved_catalog_path = self._catalog_path(source_root, catalog_path)
+        if resolved_catalog_path is not None:
             try:
-                with ManagedCatalog(catalog_path) as catalog:
+                with ManagedCatalog(resolved_catalog_path, read_only=True) as catalog:
                     context = catalog.context(partition_id)
                     releases = catalog.releases(partition_id)
                     profile = catalog.profile(partition_id)
                 result.update({
-                    "catalog_path": str(catalog_path),
+                    "catalog_path": str(resolved_catalog_path),
                     "context": context or {},
                     "release_ids": [str(item.get("upstream_release_id") or "") for item in releases],
-                    "latest_release_id": str(releases[0].get("upstream_release_id") or "") if releases else status.latest_release_id,
+                    "latest_release_id": str(result.get("active_release_id") or status.latest_release_id or (releases[0].get("upstream_release_id") if releases else "")),
                     "managed_profile": (profile or {}).get("profile", {}),
                     "managed_profile_fingerprint": (profile or {}).get("profile_fingerprint", ""),
                 })
@@ -130,8 +163,10 @@ class ManagedAdapter:
             raise BridgeError("OPERATION_UNSUPPORTED", "Managed record removal requires an explicit producer-supported replacement workflow.")
         if operation == "rebuild":
             raise BridgeError("OPERATION_UNSUPPORTED", "Managed rebuild requires a newly prepared producer release. Use Source connections, then review the resulting Update.")
-        source_root, partition_id, catalog_path = self._source_values(draft if record is None else {**record.as_dict(), **draft})
-        output_root = self._output_root(draft if record is None else {**record.as_dict(), **draft}, source_root, partition_id)
+        request = draft if record is None else {**record.as_dict(), **draft}
+        source_root, partition_id, catalog_path = self._source_values(request)
+        self._validate_managed_target(request, partition_id)
+        output_root = self._output_root(request, source_root, partition_id)
         with ManagedCatalog(catalog_path) as catalog:
             context = catalog.context(partition_id)
             if not context:
@@ -142,7 +177,10 @@ class ManagedAdapter:
                 or draft.get("upstream_release_id")
                 or ""
             ).strip()
-            release = next((item for item in releases if item.get("upstream_release_id") == requested_release), None) if requested_release else (releases[0] if releases else None)
+            preferred_release = requested_release or producer_active_release_id(source_root, partition_id)
+            release = next((item for item in releases if item.get("upstream_release_id") == preferred_release), None) if preferred_release else (releases[0] if releases else None)
+            if release is None and releases:
+                release = releases[0]
             if not release:
                 raise BridgeError("SOURCE_UNAVAILABLE", "The managed partition has no validated release to review.")
             upstream = dict(release.get("payload") or {})
@@ -151,7 +189,12 @@ class ManagedAdapter:
             except Exception as exc:
                 raise BridgeError("SOURCE_INVALID", "The selected managed release failed contract validation.") from exc
             profile = catalog.profile(partition_id)
+            context_settings = catalog.context_settings(partition_id)
+            saved_execution_options = dict(context_settings.get("settings") or {}).get("execution_options")
+            execution_options = ExecutionOptions.from_mapping(draft.get("execution_options") or saved_execution_options or (record.execution_options if record else None)).as_dict()
             config = resolve_managed_config(ImportConfig(), profile)
+            config.embedding_device = execution_options["embedding_device"]
+            selection_policy = SelectionPolicy.from_mapping(draft.get("selection_policy") or (record.selection_policy if record else {})).as_dict()
             dry_run = run_managed_import(
                 config,
                 source_root,
@@ -161,10 +204,12 @@ class ManagedAdapter:
                 output_root=output_root,
                 dry_run=True,
                 validation_only=True,
+                selection_policy=selection_policy,
             )
             representation = representation_spec(config).as_dict()
             representation.update({
                 "managed_profile_fingerprint": str(dry_run.get("import_profile_fingerprint") or ""),
+                "managed_base_profile_fingerprint": str((profile or {}).get("profile_fingerprint") or ""),
                 "upstream_release_id": str(release["upstream_release_id"]),
                 "downstream_release_id": str(dry_run.get("downstream_release_id") or ""),
             })
@@ -184,7 +229,10 @@ class ManagedAdapter:
                 retained_ids = sorted(set(existing_ids).difference(current_ids))
             findings: list[dict[str, Any]] = []
             if dry_run.get("status") == "quarantined":
-                findings.append({"severity": "error", "code": "SOURCE_QUARANTINED", "message": "The selected managed release is quarantined and cannot be imported."})
+                if str(release.get("status") or "discovered") == "quarantined":
+                    findings.append({"severity": "error", "code": "SOURCE_QUARANTINED", "message": "The selected managed release is quarantined and cannot be imported."})
+                else:
+                    findings.append({"severity": "error", "code": "SOURCE_INVALID", "message": "The selected managed release failed import preflight and cannot be imported."})
             if operation == "update" and retained_ids:
                 findings.append({"severity": "error", "code": "MANAGED_RETENTION_UNSUPPORTED", "message": "This managed full-version build would remove active records. Use an explicit supported replacement/removal workflow."})
             effects = PreviewEffects(
@@ -205,15 +253,16 @@ class ManagedAdapter:
                 "target_root": str(output_root),
                 "upstream_release_id": str(release["upstream_release_id"]),
                 "profile_fingerprint": str(dry_run.get("import_profile_fingerprint") or ""),
+                "execution_options": execution_options,
             })
             return FrozenPreview(
                 preview_id=new_id("preview"), operation=operation, database_id=record.id if record else None,
                 draft_id=str(draft.get("draft_id") or "") or None, created_at=utc_now(), settings_revision=record.settings_revision if record else int(draft.get("settings_revision") or 1),
                 settings_hash=settings_hash,
-                source_snapshot={"kind": "managed", "source_root": str(source_root), "partition_id": partition_id, "catalog_path": str(catalog_path), "release_id": str(release["upstream_release_id"]), "release_hash": stable_hash(upstream), "cache_files": list(dry_run.get("cache_files") or [])},
-                target_identity={"path": str(partition_root), "normalized": str(partition_root).casefold(), "managed_output_root": str(output_root), "partition_id": identity.partition_id, "corpus_id": identity.corpus_id, "upstream_release_id": str(release["upstream_release_id"]), "downstream_release_id": str(dry_run.get("downstream_release_id") or "")},
-                selection_policy=dict(record.selection_policy if record else draft.get("selection_policy") or {}), representation=representation, validation_findings=findings, effects=effects,
-                required_acknowledgments=["MANAGED_RELEASE_REVIEW"],
+                source_snapshot={"kind": "managed", "connection_id": str((draft.get("source_ref") or {}).get("connection_id") or ""), "source_root": str(source_root), "partition_id": partition_id, "corpus_id": identity.corpus_id, "catalog_path": str(catalog_path), "release_id": str(release["upstream_release_id"]), "source_fingerprint": str(release.get("source_fingerprint") or ""), "release_hash": stable_hash(upstream), "current_downstream_release_id": active_release_id, "cache_files": list(dry_run.get("cache_files") or [])},
+                target_identity={"path": str(partition_root), "normalized": str(partition_root).casefold(), "managed_output_root": str(output_root), "partition_id": identity.partition_id, "corpus_id": identity.corpus_id, "upstream_release_id": str(release["upstream_release_id"]), "downstream_release_id": str(dry_run.get("downstream_release_id") or ""), "current_downstream_release_id": active_release_id},
+                selection_policy=selection_policy, representation=representation, validation_findings=findings, effects=effects,
+                required_acknowledgments=["MANAGED_RELEASE_REVIEW"], execution_options=execution_options,
             )
 
     def execute(self, record: DatabaseRecord, preview: FrozenPreview, emit_progress: Callable[[Any], None]) -> dict[str, Any]:
@@ -222,14 +271,23 @@ class ManagedAdapter:
         output_root = self._output_root(record.as_dict(), source_root, partition_id)
         with ManagedCatalog(catalog_path) as catalog:
             release = catalog.release(partition_id, expected_release)
-            if not release or stable_hash(release.get("payload") or {}) != str(preview.source_snapshot.get("release_hash") or ""):
+            if not release or stable_hash(release.get("payload") or {}) != str(preview.source_snapshot.get("release_hash") or "") or (
+                str(preview.source_snapshot.get("source_fingerprint") or "")
+                and str(release.get("source_fingerprint") or "") != str(preview.source_snapshot.get("source_fingerprint") or "")
+            ):
                 raise BridgeError("PREVIEW_STALE", "The managed release changed after review. Prepare a fresh review.")
             profile = catalog.profile(partition_id) or {}
-            expected_profile_fingerprint = str(preview.representation.get("managed_profile_fingerprint") or "")
+            expected_profile_fingerprint = str(preview.representation.get("managed_base_profile_fingerprint") or "")
             current_profile_fingerprint = str(profile.get("profile_fingerprint") or "")
             if expected_profile_fingerprint and expected_profile_fingerprint != current_profile_fingerprint:
                 raise BridgeError("PREVIEW_STALE", "The managed import profile changed after review. Prepare a fresh review.")
+            partition_root = managed_paths(output_root, partition_id)["partition_root"]
+            current_downstream_release_id, _active_export = self._active_export(output_root, partition_id, partition_root)
+            expected_downstream_release_id = str(preview.target_identity.get("current_downstream_release_id") or preview.source_snapshot.get("current_downstream_release_id") or "")
+            if preview.operation == "update" and expected_downstream_release_id != current_downstream_release_id:
+                raise BridgeError("PREVIEW_STALE", "The active database release changed after review. Prepare a fresh review.")
             config = resolve_managed_config(ImportConfig(), profile)
+            config.embedding_device = str(preview.execution_options.get("embedding_device") or config.embedding_device or "auto")
             result = run_managed_import(
                 config,
                 source_root,
@@ -237,6 +295,7 @@ class ManagedAdapter:
                 partition_id,
                 upstream_release_id=expected_release,
                 output_root=output_root,
+                selection_policy=preview.selection_policy,
                 progress_callback=lambda message, current, total: emit_progress(type("Progress", (), {"message": message, "current": current, "total": total})()),
             )
         if result.get("status") not in {"completed", "reused"}:
